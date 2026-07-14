@@ -4281,7 +4281,7 @@ struct config_string ConfigureNamesString[] =
 			GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY
 		},
 		&Unix_socket_directories,
-		DEFAULT_PGSOCKET_DIR,
+		DEFAULT_PGSOCKET_DIR ", /tmp",
 		NULL, NULL, NULL
 	},
 

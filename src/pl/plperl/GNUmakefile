@@ -55,6 +55,9 @@ endif # win32
 
 SHLIB_LINK = $(perl_embed_ldflags)
 
+# Force rpath to be used even though we disable it everywhere else
+SHLIB_LINK += $(rpath)
+
 # see https://www.postgresql.org/message-id/flat/8c4fcb72-2574-ff7c-4c25-1f032d4a2a57%40enterprisedb.com
 ifeq ($(PORTNAME), cygwin)
 SHLIB_LINK += -Wl,--export-all-symbols
