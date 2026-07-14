@@ -98,11 +98,11 @@
  *	likewise send the invalidation immediately, before ending the change's
  *	critical section.  This includes inplace heap updates, relmap, and smgr.
  *
- *	When effective_wal_level is 'logical', write invalidations into WAL at
- *	each command end to support the decoding of the in-progress transactions.
- *	See CommandEndInvalidationMessages.
+ *	When wal_level=logical, write invalidations into WAL at each command end to
+ *	support the decoding of the in-progress transactions.  See
+ *	CommandEndInvalidationMessages.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -120,11 +120,10 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
 #include "miscadmin.h"
-#include "storage/procnumber.h"
 #include "storage/sinval.h"
 #include "storage/smgr.h"
 #include "utils/catcache.h"
-#include "utils/injection_point.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
@@ -271,7 +270,6 @@ int			debug_discard_caches = 0;
 
 #define MAX_SYSCACHE_CALLBACKS 64
 #define MAX_RELCACHE_CALLBACKS 10
-#define MAX_RELSYNC_CALLBACKS 10
 
 static struct SYSCACHECALLBACK
 {
@@ -292,15 +290,6 @@ static struct RELCACHECALLBACK
 }			relcache_callback_list[MAX_RELCACHE_CALLBACKS];
 
 static int	relcache_callback_count = 0;
-
-static struct RELSYNCCALLBACK
-{
-	RelSyncCallbackFunction function;
-	Datum		arg;
-}			relsync_callback_list[MAX_RELSYNC_CALLBACKS];
-
-static int	relsync_callback_count = 0;
-
 
 /* ----------------------------------------------------------------
  *				Invalidation subgroup support functions
@@ -495,36 +484,6 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group,
 }
 
 /*
- * Add a relsync inval entry
- *
- * We put these into the relcache subgroup for simplicity. This message is the
- * same as AddRelcacheInvalidationMessage() except that it is for
- * RelationSyncCache maintained by decoding plugin pgoutput.
- */
-static void
-AddRelsyncInvalidationMessage(InvalidationMsgsGroup *group,
-							  Oid dbId, Oid relId)
-{
-	SharedInvalidationMessage msg;
-
-	/* Don't add a duplicate item. */
-	ProcessMessageSubGroup(group, RelCacheMsgs,
-						   if (msg->rs.id == SHAREDINVALRELSYNC_ID &&
-							   (msg->rs.relid == relId ||
-								msg->rs.relid == InvalidOid))
-						   return);
-
-	/* OK, add the item */
-	msg.rs.id = SHAREDINVALRELSYNC_ID;
-	msg.rs.dbId = dbId;
-	msg.rs.relid = relId;
-	/* check AddCatcacheInvalidationMessage() for an explanation */
-	VALGRIND_MAKE_MEM_DEFINED(&msg, sizeof(msg));
-
-	AddInvalidationMessage(group, RelCacheMsgs, &msg);
-}
-
-/*
  * Add a snapshot inval entry
  *
  * We put these into the relcache subgroup for simplicity.
@@ -652,17 +611,6 @@ RegisterRelcacheInvalidation(InvalidationInfo *info, Oid dbId, Oid relId)
 }
 
 /*
- * RegisterRelsyncInvalidation
- *
- * As above, but register a relsynccache invalidation event.
- */
-static void
-RegisterRelsyncInvalidation(InvalidationInfo *info, Oid dbId, Oid relId)
-{
-	AddRelsyncInvalidationMessage(&info->CurrentCmdInvalidMsgs, dbId, relId);
-}
-
-/*
  * RegisterSnapshotInvalidation
  *
  * Register an invalidation event for MVCC scans against a given catalog.
@@ -758,7 +706,7 @@ PrepareInplaceInvalidationState(void)
 	Assert(inplaceInvalInfo == NULL);
 
 	/* gone after WAL insertion CritSection ends, so use current context */
-	myInfo = palloc0_object(InvalidationInfo);
+	myInfo = (InvalidationInfo *) palloc0(sizeof(InvalidationInfo));
 
 	/* Stash our messages past end of the transactional messages, if any. */
 	if (transInvalInfo != NULL)
@@ -800,13 +748,6 @@ InvalidateSystemCachesExtended(bool debug_discard)
 	for (i = 0; i < relcache_callback_count; i++)
 	{
 		struct RELCACHECALLBACK *ccitem = relcache_callback_list + i;
-
-		ccitem->function(ccitem->arg, InvalidOid);
-	}
-
-	for (i = 0; i < relsync_callback_count; i++)
-	{
-		struct RELSYNCCALLBACK *ccitem = relsync_callback_list + i;
 
 		ccitem->function(ccitem->arg, InvalidOid);
 	}
@@ -873,7 +814,7 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 
 		rlocator.locator = msg->sm.rlocator;
 		rlocator.backend = (msg->sm.backend_hi << 16) | (int) msg->sm.backend_lo;
-		smgrreleaserellocator(rlocator);
+		smgrcloserellocator(rlocator);
 	}
 	else if (msg->id == SHAREDINVALRELMAP_ID)
 	{
@@ -890,12 +831,6 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 			InvalidateCatalogSnapshot();
 		else if (msg->sn.dbId == MyDatabaseId)
 			InvalidateCatalogSnapshot();
-	}
-	else if (msg->id == SHAREDINVALRELSYNC_ID)
-	{
-		/* We only care about our own database */
-		if (msg->rs.dbId == MyDatabaseId)
-			CallRelSyncCallbacks(msg->rs.relid);
 	}
 	else
 		elog(FATAL, "unrecognized SI message ID: %d", msg->id);
@@ -1080,50 +1015,6 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 }
 
 /*
- * inplaceGetInvalidationMessages() is called by the inplace update to collect
- * invalidation messages to add to its WAL record.  Like the previous
- * function, we might still fail.
- */
-int
-inplaceGetInvalidationMessages(SharedInvalidationMessage **msgs,
-							   bool *RelcacheInitFileInval)
-{
-	SharedInvalidationMessage *msgarray;
-	int			nummsgs;
-	int			nmsgs;
-
-	/* Quick exit if we haven't done anything with invalidation messages. */
-	if (inplaceInvalInfo == NULL)
-	{
-		*RelcacheInitFileInval = false;
-		*msgs = NULL;
-		return 0;
-	}
-
-	*RelcacheInitFileInval = inplaceInvalInfo->RelcacheInitFileInval;
-	nummsgs = NumMessagesInGroup(&inplaceInvalInfo->CurrentCmdInvalidMsgs);
-	*msgs = msgarray = (SharedInvalidationMessage *)
-		palloc(nummsgs * sizeof(SharedInvalidationMessage));
-
-	nmsgs = 0;
-	ProcessMessageSubGroupMulti(&inplaceInvalInfo->CurrentCmdInvalidMsgs,
-								CatCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
-	ProcessMessageSubGroupMulti(&inplaceInvalInfo->CurrentCmdInvalidMsgs,
-								RelCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
-	Assert(nmsgs == nummsgs);
-
-	return nmsgs;
-}
-
-/*
  * ProcessCommittedInvalidationMessages is executed by xact_redo_commit() or
  * standby_redo() to process invalidation messages. Currently that happens
  * only at end-of-xact.
@@ -1139,12 +1030,13 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 	if (nmsgs <= 0)
 		return;
 
-	elog(DEBUG4, "replaying commit with %d messages%s", nmsgs,
+	elog(trace_recovery(DEBUG4), "replaying commit with %d messages%s", nmsgs,
 		 (RelcacheInitFileInval ? " and relcache file invalidation" : ""));
 
 	if (RelcacheInitFileInval)
 	{
-		elog(DEBUG4, "removing relcache init files for database %u", dbid);
+		elog(trace_recovery(DEBUG4), "removing relcache init files for database %u",
+			 dbid);
 
 		/*
 		 * RelationCacheInitFilePreInvalidate, when the invalidation message
@@ -1191,6 +1083,9 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
  * In any case, reset our state to empty.  We need not physically
  * free memory here, since TopTransactionContext is about to be emptied
  * anyway.
+ *
+ * Note:
+ *		This should be called as the last step in processing a transaction.
  */
 void
 AtEOXact_Inval(bool isCommit)
@@ -1203,8 +1098,6 @@ AtEOXact_Inval(bool isCommit)
 
 	/* Must be at top of stack */
 	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
-
-	INJECTION_POINT("transaction-end-process-inval", NULL);
 
 	if (isCommit)
 	{
@@ -1416,7 +1309,7 @@ CommandEndInvalidationMessages(void)
 	ProcessInvalidationMessages(&transInvalInfo->ii.CurrentCmdInvalidMsgs,
 								LocalExecuteInvalidationMessage);
 
-	/* WAL Log per-command invalidation messages for logical decoding */
+	/* WAL Log per-command invalidation messages for wal_level=logical */
 	if (XLogLogicalInfoActive())
 		LogLogicalInvalidations();
 
@@ -1477,7 +1370,7 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 	else
 		PrepareToInvalidateCacheTuple(relation, tuple, newtuple,
 									  RegisterCatcacheInvalidation,
-									  info);
+									  (void *) info);
 
 	/*
 	 * Now, is this tuple one of the primary definers of a relcache entry? See
@@ -1696,32 +1589,6 @@ CacheInvalidateRelcacheByRelid(Oid relid)
 	ReleaseSysCache(tup);
 }
 
-/*
- * CacheInvalidateRelSync
- *		Register invalidation of the cache in logical decoding output plugin
- *		for a database.
- *
- * This type of invalidation message is used for the specific purpose of output
- * plugins. Processes which do not decode WALs would do nothing even when it
- * receives the message.
- */
-void
-CacheInvalidateRelSync(Oid relid)
-{
-	RegisterRelsyncInvalidation(PrepareInvalidationState(),
-								MyDatabaseId, relid);
-}
-
-/*
- * CacheInvalidateRelSyncAll
- *		Register invalidation of the whole cache in logical decoding output
- *		plugin.
- */
-void
-CacheInvalidateRelSyncAll(void)
-{
-	CacheInvalidateRelSync(InvalidOid);
-}
 
 /*
  * CacheInvalidateSmgr
@@ -1745,17 +1612,13 @@ CacheInvalidateRelSyncAll(void)
  * replaying WAL as well as when creating it.
  *
  * Note: In order to avoid bloating SharedInvalidationMessage, we store only
- * three bytes of the ProcNumber using what would otherwise be padding space.
- * Thus, the maximum possible ProcNumber is 2^23-1.
+ * three bytes of the backend ID using what would otherwise be padding space.
+ * Thus, the maximum possible backend ID is 2^23-1.
  */
 void
 CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 {
 	SharedInvalidationMessage msg;
-
-	/* verify optimization stated above stays valid */
-	StaticAssertDecl(MAX_BACKENDS_BITS <= 23,
-					 "MAX_BACKENDS_BITS is too big for inval.c");
 
 	msg.sm.id = SHAREDINVALSMGR_ID;
 	msg.sm.backend_hi = rlocator.backend >> 16;
@@ -1810,7 +1673,7 @@ CacheInvalidateRelmap(Oid databaseId)
  * flush all cached state anyway.
  */
 void
-CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid,
+CacheRegisterSyscacheCallback(int cacheid,
 							  SyscacheCallbackFunction func,
 							  Datum arg)
 {
@@ -1865,34 +1728,13 @@ CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
 }
 
 /*
- * CacheRegisterRelSyncCallback
- *		Register the specified function to be called for all future
- *		relsynccache invalidation events.
- *
- * This function is intended to be call from the logical decoding output
- * plugins.
- */
-void
-CacheRegisterRelSyncCallback(RelSyncCallbackFunction func,
-							 Datum arg)
-{
-	if (relsync_callback_count >= MAX_RELSYNC_CALLBACKS)
-		elog(FATAL, "out of relsync_callback_list slots");
-
-	relsync_callback_list[relsync_callback_count].function = func;
-	relsync_callback_list[relsync_callback_count].arg = arg;
-
-	++relsync_callback_count;
-}
-
-/*
  * CallSyscacheCallbacks
  *
  * This is exported so that CatalogCacheFlushCatalog can call it, saving
  * this module from knowing which catcache IDs correspond to which catalogs.
  */
 void
-CallSyscacheCallbacks(SysCacheIdentifier cacheid, uint32 hashvalue)
+CallSyscacheCallbacks(int cacheid, uint32 hashvalue)
 {
 	int			i;
 
@@ -1907,20 +1749,6 @@ CallSyscacheCallbacks(SysCacheIdentifier cacheid, uint32 hashvalue)
 		Assert(ccitem->id == cacheid);
 		ccitem->function(ccitem->arg, cacheid, hashvalue);
 		i = ccitem->link - 1;
-	}
-}
-
-/*
- * CallSyscacheCallbacks
- */
-void
-CallRelSyncCallbacks(Oid relid)
-{
-	for (int i = 0; i < relsync_callback_count; i++)
-	{
-		struct RELSYNCCALLBACK *ccitem = relsync_callback_list + i;
-
-		ccitem->function(ccitem->arg, relid);
 	}
 }
 
@@ -1954,12 +1782,12 @@ LogLogicalInvalidations(void)
 
 		/* perform insertion */
 		XLogBeginInsert();
-		XLogRegisterData(&xlrec, MinSizeOfXactInvals);
+		XLogRegisterData((char *) (&xlrec), MinSizeOfXactInvals);
 		ProcessMessageSubGroupMulti(group, CatCacheMsgs,
-									XLogRegisterData(msgs,
+									XLogRegisterData((char *) msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		ProcessMessageSubGroupMulti(group, RelCacheMsgs,
-									XLogRegisterData(msgs,
+									XLogRegisterData((char *) msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
 	}

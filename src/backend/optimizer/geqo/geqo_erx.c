@@ -8,13 +8,12 @@
 *-------------------------------------------------------------------------
 */
 
-/*
- * contributed by:
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
- * *  Martin Utesch				 * Institute of Automatic Control	   *
- * =							 = University of Mining and Technology =
- * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/* contributed by:
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+   *  Martin Utesch				 * Institute of Automatic Control	   *
+   =							 = University of Mining and Technology =
+   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* the edge recombination algorithm is adopted from Genitor : */
@@ -33,12 +32,10 @@
 
 
 #include "postgres.h"
-#include "optimizer/geqo.h"
-
-#if defined(ERX)
-
 #include "optimizer/geqo_random.h"
 #include "optimizer/geqo_recombination.h"
+
+#if defined(ERX)
 
 static int	gimme_edge(PlannerInfo *root, Gene gene1, Gene gene2, Edge *edge_table);
 static void remove_gene(PlannerInfo *root, Gene gene, Edge edge, Edge *edge_table);
@@ -47,8 +44,7 @@ static Gene gimme_gene(PlannerInfo *root, Edge edge, Edge *edge_table);
 static Gene edge_failure(PlannerInfo *root, Gene *gene, int index, Edge *edge_table, int num_gene);
 
 
-/*
- * alloc_edge_table
+/* alloc_edge_table
  *
  *	 allocate memory for edge table
  *
@@ -64,13 +60,12 @@ alloc_edge_table(PlannerInfo *root, int num_gene)
 	 * directly; 0 will not be used
 	 */
 
-	edge_table = palloc_array(Edge, num_gene + 1);
+	edge_table = (Edge *) palloc((num_gene + 1) * sizeof(Edge));
 
 	return edge_table;
 }
 
-/*
- * free_edge_table
+/* free_edge_table
  *
  *	  deallocate memory of edge table
  *
@@ -81,8 +76,7 @@ free_edge_table(PlannerInfo *root, Edge *edge_table)
 	pfree(edge_table);
 }
 
-/*
- * gimme_edge_table
+/* gimme_edge_table
  *
  *	 fills a data structure which represents the set of explicit
  *	 edges between points in the (2) input genes
@@ -140,8 +134,7 @@ gimme_edge_table(PlannerInfo *root, Gene *tour1, Gene *tour2,
 	return ((float) (edge_total * 2) / (float) num_gene);
 }
 
-/*
- * gimme_edge
+/* gimme_edge
  *
  *	  registers edge from city1 to city2 in input edge table
  *
@@ -189,8 +182,7 @@ gimme_edge(PlannerInfo *root, Gene gene1, Gene gene2, Edge *edge_table)
 	return 1;
 }
 
-/*
- * gimme_tour
+/* gimme_tour
  *
  *	  creates a new tour using edges from the edge table.
  *	  priority is given to "shared" edges (i.e. edges which
@@ -235,8 +227,7 @@ gimme_tour(PlannerInfo *root, Edge *edge_table, Gene *new_gene, int num_gene)
 	return edge_failures;
 }
 
-/*
- * remove_gene
+/* remove_gene
  *
  *	 removes input gene from edge_table.
  *	 input edge is used
@@ -279,8 +270,7 @@ remove_gene(PlannerInfo *root, Gene gene, Edge edge, Edge *edge_table)
 	}
 }
 
-/*
- * gimme_gene
+/* gimme_gene
  *
  *	  priority is given to "shared" edges
  *	  (i.e. edges which both genes possess)
@@ -371,8 +361,7 @@ gimme_gene(PlannerInfo *root, Edge edge, Edge *edge_table)
 	return 0;					/* to keep the compiler quiet */
 }
 
-/*
- * edge_failure
+/* edge_failure
  *
  *	  routine for handling edge failure
  *

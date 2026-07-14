@@ -7,7 +7,10 @@
 #include <limits.h>
 #include <math.h>
 
-#include "common/int.h"
+#ifdef __FAST_MATH__
+#error -ffast-math is known to break this code
+#endif
+
 #include "dt.h"
 #include "pgtypes_date.h"
 #include "pgtypes_timestamp.h"
@@ -26,8 +29,7 @@ dt2local(timestamp dt, int tz)
 	return dt;
 }								/* dt2local() */
 
-/*
- * tm2timestamp()
+/* tm2timestamp()
  * Convert a tm structure to a timestamp data type.
  * Note that year is _not_ 1900-based, but is an explicit full value.
  * Also, month is one-based, _not_ zero-based.
@@ -46,8 +48,14 @@ tm2timestamp(struct tm *tm, fsec_t fsec, int *tzp, timestamp * result)
 
 	dDate = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday) - date2j(2000, 1, 1);
 	time = time2t(tm->tm_hour, tm->tm_min, tm->tm_sec, fsec);
-	if (unlikely(pg_mul_s64_overflow(dDate, USECS_PER_DAY, result) ||
-				 pg_add_s64_overflow(*result, time, result)))
+	*result = (dDate * USECS_PER_DAY) + time;
+	/* check for major overflow */
+	if ((*result - time) / USECS_PER_DAY != dDate)
+		return -1;
+	/* check for just-barely overflow (okay except time-of-day wraps) */
+	/* caution: we want to allow 1999-12-31 24:00:00 */
+	if ((*result < 0 && dDate > 0) ||
+		(*result > 0 && dDate < -1))
 		return -1;
 	if (tzp != NULL)
 		*result = dt2local(*result, -(*tzp));
@@ -74,8 +82,7 @@ SetEpochTimestamp(void)
 	return dt;
 }								/* SetEpochTimestamp() */
 
-/*
- * timestamp2tm()
+/* timestamp2tm()
  * Convert timestamp data type to POSIX time structure.
  * Note that year is _not_ 1900-based, but is an explicit full value.
  * Also, month is one-based, _not_ zero-based.
@@ -127,12 +134,11 @@ timestamp2tm(timestamp dt, int *tzp, struct tm *tm, fsec_t *fsec, const char **t
 		if (IS_VALID_UTIME(tm->tm_year, tm->tm_mon, tm->tm_mday))
 		{
 #if defined(HAVE_STRUCT_TM_TM_ZONE) || defined(HAVE_INT_TIMEZONE)
-			struct tm	tmbuf;
 
 			utime = dt / USECS_PER_SEC +
 				((date0 - date2j(1970, 1, 1)) * INT64CONST(86400));
 
-			tx = localtime_r(&utime, &tmbuf);
+			tx = localtime(&utime);
 			tm->tm_year = tx->tm_year + 1900;
 			tm->tm_mon = tx->tm_mon + 1;
 			tm->tm_mday = tx->tm_mday;
@@ -182,11 +188,9 @@ timestamp2tm(timestamp dt, int *tzp, struct tm *tm, fsec_t *fsec, const char **t
 	return 0;
 }								/* timestamp2tm() */
 
-/*
- * EncodeSpecialTimestamp()
+/* EncodeSpecialTimestamp()
  *	* Convert reserved timestamp data type to string.
- *
- */
+ *	 */
 static void
 EncodeSpecialTimestamp(timestamp dt, char *str)
 {
@@ -845,14 +849,14 @@ PGTYPEStimestamp_defmt_asc(const char *str, const char *fmt, timestamp * d)
 }
 
 /*
- * add an interval to a time stamp
- *
- *	*tout = tin + span
- *
- *	 returns 0 if successful
- *	 returns -1 if it fails
- *
- */
+* add an interval to a time stamp
+*
+*	*tout = tin + span
+*
+*	 returns 0 if successful
+*	 returns -1 if it fails
+*
+*/
 
 int
 PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout)
@@ -900,14 +904,14 @@ PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout
 
 
 /*
- * subtract an interval from a time stamp
- *
- *	*tout = tin - span
- *
- *	 returns 0 if successful
- *	 returns -1 if it fails
- *
- */
+* subtract an interval from a time stamp
+*
+*	*tout = tin - span
+*
+*	 returns 0 if successful
+*	 returns -1 if it fails
+*
+*/
 
 int
 PGTYPEStimestamp_sub_interval(timestamp * tin, interval * span, timestamp * tout)

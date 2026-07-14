@@ -3,7 +3,7 @@
  * fe-secure-gssapi.c
  *   The front-end (client) encryption support for GSSAPI
  *
- * Portions Copyright (c) 2016-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *  src/interfaces/libpq/fe-secure-gssapi.c
@@ -471,13 +471,6 @@ gss_read(PGconn *conn, void *recv_buffer, size_t length, ssize_t *ret)
 	return PGRES_POLLING_OK;
 }
 
-ssize_t
-pg_GSS_bytes_pending(PGconn *conn)
-{
-	Assert(PqGSSResultLength >= PqGSSResultNext);
-	return (ssize_t) (PqGSSResultLength - PqGSSResultNext);
-}
-
 /*
  * Negotiate GSSAPI transport for a connection.  When complete, returns
  * PGRES_POLLING_OK.  Will return PGRES_POLLING_READING or
@@ -740,7 +733,7 @@ pqsecure_open_gss(PGconn *conn)
 	/* Queue the token for writing */
 	netlen = pg_hton32(output.length);
 
-	memcpy(PqGSSSendBuffer, &netlen, sizeof(uint32));
+	memcpy(PqGSSSendBuffer, (char *) &netlen, sizeof(uint32));
 	PqGSSSendLength += sizeof(uint32);
 
 	memcpy(PqGSSSendBuffer + PqGSSSendLength, output.value, output.length);

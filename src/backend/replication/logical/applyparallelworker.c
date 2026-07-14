@@ -2,7 +2,7 @@
  * applyparallelworker.c
  *	   Support routines for applying xact by parallel apply worker
  *
- * Copyright (c) 2023-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/applyparallelworker.c
@@ -166,14 +166,11 @@
 #include "replication/origin.h"
 #include "replication/worker_internal.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
 #include "storage/lmgr.h"
-#include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
-#include "utils/wait_event.h"
 
 #define PG_LOGICAL_APPLY_SHM_MAGIC 0x787ca067
 
@@ -228,11 +225,11 @@ typedef struct ParallelApplyWorkerEntry
 static HTAB *ParallelApplyTxnHash = NULL;
 
 /*
- * A list (pool) of active parallel apply workers. The information for
- * the new worker is added to the list after successfully launching it. The
- * list entry is removed if there are already enough workers in the worker
- * pool at the end of the transaction. For more information about the worker
- * pool, see comments atop this file.
+* A list (pool) of active parallel apply workers. The information for
+* the new worker is added to the list after successfully launching it. The
+* list entry is removed if there are already enough workers in the worker
+* pool at the end of the transaction. For more information about the worker
+* pool, see comments atop this file.
  */
 static List *ParallelApplyWorkerPool = NIL;
 
@@ -302,7 +299,7 @@ pa_can_start(void)
 	 * STREAM START message, and it doesn't seem worth sending the extra eight
 	 * bytes with the STREAM START to enable parallelism for this case.
 	 */
-	if (XLogRecPtrIsValid(MySubscription->skiplsn))
+	if (!XLogRecPtrIsInvalid(MySubscription->skiplsn))
 		return false;
 
 	/*
@@ -428,7 +425,7 @@ pa_launch_parallel_worker(void)
 	 */
 	oldcontext = MemoryContextSwitchTo(ApplyContext);
 
-	winfo = palloc0_object(ParallelApplyWorkerInfo);
+	winfo = (ParallelApplyWorkerInfo *) palloc0(sizeof(ParallelApplyWorkerInfo));
 
 	/* Setup shared memory. */
 	if (!pa_setup_dsm(winfo))
@@ -438,14 +435,12 @@ pa_launch_parallel_worker(void)
 		return NULL;
 	}
 
-	launched = logicalrep_worker_launch(WORKERTYPE_PARALLEL_APPLY,
-										MyLogicalRepWorker->dbid,
+	launched = logicalrep_worker_launch(MyLogicalRepWorker->dbid,
 										MySubscription->oid,
 										MySubscription->name,
 										MyLogicalRepWorker->userid,
 										InvalidOid,
-										dsm_segment_handle(winfo->dsm_seg),
-										false);
+										dsm_segment_handle(winfo->dsm_seg));
 
 	if (launched)
 	{
@@ -513,6 +508,7 @@ pa_allocate_worker(TransactionId xid)
 	winfo->in_use = true;
 	winfo->serialize_changes = false;
 	entry->winfo = winfo;
+	entry->xid = xid;
 }
 
 /*
@@ -643,7 +639,7 @@ pa_detach_all_error_mq(void)
  * Check if there are any pending spooled messages.
  */
 static bool
-pa_has_spooled_message_pending(void)
+pa_has_spooled_message_pending()
 {
 	PartialFileSetState fileset_state;
 
@@ -777,14 +773,17 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
 			if (len == 0)
 				elog(ERROR, "invalid message length");
 
-			initReadOnlyStringInfo(&s, data, len);
+			s.cursor = 0;
+			s.maxlen = -1;
+			s.data = (char *) data;
+			s.len = len;
 
 			/*
 			 * The first byte of messages sent from leader apply worker to
-			 * parallel apply workers can only be PqReplMsg_WALData.
+			 * parallel apply workers can only be 'w'.
 			 */
 			c = pq_getmsgbyte(&s);
-			if (c != PqReplMsg_WALData)
+			if (c != 'w')
 				elog(ERROR, "unexpected message \"%c\"", c);
 
 			/*
@@ -817,10 +816,10 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
 					ResetLatch(MyLatch);
 
 				/*
-				 * Force stats reporting to avoid long delays. There can be
-				 * long idle gaps before the leader assigns the next
-				 * transaction, and the only opportunity to report stats
-				 * during such gaps is here.
+				 * Force stats reporting to avoid long delays. There can be long
+				 * idle gaps before the leader assigns the next transaction, and
+				 * the only opportunity to report stats during such gaps is
+				 * here.
 				 */
 				if ((rc & WL_TIMEOUT) && !IsTransactionState())
 					pgstat_report_stat(true);
@@ -858,7 +857,7 @@ pa_shutdown(int code, Datum arg)
 {
 	SendProcSignal(MyLogicalRepWorker->leader_pid,
 				   PROCSIG_PARALLEL_APPLY_MESSAGE,
-				   INVALID_PROC_NUMBER);
+				   InvalidBackendId);
 
 	dsm_detach((dsm_segment *) DatumGetPointer(arg));
 }
@@ -876,7 +875,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	shm_mq	   *mq;
 	shm_mq_handle *mqh;
 	shm_mq_handle *error_mqh;
-	ReplOriginId originid;
+	RepOriginId originid;
 	int			worker_slot = DatumGetInt32(main_arg);
 	char		originname[NAMEDATALEN];
 
@@ -891,6 +890,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 * receiving SIGTERM.
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
 	pqsignal(SIGUSR2, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
 
@@ -953,12 +953,12 @@ ParallelApplyWorkerMain(Datum main_arg)
 
 	pq_redirect_to_shm_mq(seg, error_mqh);
 	pq_set_parallel_leader(MyLogicalRepWorker->leader_pid,
-						   INVALID_PROC_NUMBER);
+						   InvalidBackendId);
 
 	MyLogicalRepWorker->last_send_time = MyLogicalRepWorker->last_recv_time =
 		MyLogicalRepWorker->reply_time = 0;
 
-	InitializeLogRepWorker();
+	InitializeApplyWorker();
 
 	InitializingApplyWorker = false;
 
@@ -973,7 +973,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 * origin which was already acquired by its leader process.
 	 */
 	replorigin_session_setup(originid, MyLogicalRepWorker->leader_pid);
-	replorigin_xact_state.origin = originid;
+	replorigin_session_origin = originid;
 	CommitTransactionCommand();
 
 	/*
@@ -981,7 +981,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 * the subscription relation state.
 	 */
 	CacheRegisterSyscacheCallback(SUBSCRIPTIONRELMAP,
-								  InvalidateSyncingRelStates,
+								  invalidate_syncing_table_states,
 								  (Datum) 0);
 
 	set_apply_error_context_origin(originname);
@@ -1002,22 +1002,22 @@ ParallelApplyWorkerMain(Datum main_arg)
  *
  * Note: this is called within a signal handler! All we can do is set a flag
  * that will cause the next CHECK_FOR_INTERRUPTS() to invoke
- * ProcessParallelApplyMessages().
+ * HandleParallelApplyMessages().
  */
 void
 HandleParallelApplyMessageInterrupt(void)
 {
 	InterruptPending = true;
 	ParallelApplyMessagePending = true;
-	/* latch will be set by procsignal_sigusr1_handler */
+	SetLatch(MyLatch);
 }
 
 /*
- * Process a single protocol message received from a single parallel apply
+ * Handle a single protocol message received from a single parallel apply
  * worker.
  */
 static void
-ProcessParallelApplyMessage(StringInfo msg)
+HandleParallelApplyMessage(StringInfo msg)
 {
 	char		msgtype;
 
@@ -1025,7 +1025,7 @@ ProcessParallelApplyMessage(StringInfo msg)
 
 	switch (msgtype)
 	{
-		case PqMsg_ErrorResponse:
+		case 'E':				/* ErrorResponse */
 			{
 				ErrorData	edata;
 
@@ -1062,11 +1062,11 @@ ProcessParallelApplyMessage(StringInfo msg)
 
 			/*
 			 * Don't need to do anything about NoticeResponse and
-			 * NotificationResponse as the logical replication worker doesn't
-			 * need to send messages to the client.
+			 * NotifyResponse as the logical replication worker doesn't need
+			 * to send messages to the client.
 			 */
-		case PqMsg_NoticeResponse:
-		case PqMsg_NotificationResponse:
+		case 'N':
+		case 'A':
 			break;
 
 		default:
@@ -1079,7 +1079,7 @@ ProcessParallelApplyMessage(StringInfo msg)
  * Handle any queued protocol messages received from parallel apply workers.
  */
 void
-ProcessParallelApplyMessages(void)
+HandleParallelApplyMessages(void)
 {
 	ListCell   *lc;
 	MemoryContext oldcontext;
@@ -1102,7 +1102,7 @@ ProcessParallelApplyMessages(void)
 	 */
 	if (!hpam_context)			/* first time through? */
 		hpam_context = AllocSetContextCreate(TopMemoryContext,
-											 "ProcessParallelApplyMessages",
+											 "HandleParallelApplyMessages",
 											 ALLOCSET_DEFAULT_SIZES);
 	else
 		MemoryContextReset(hpam_context);
@@ -1137,7 +1137,7 @@ ProcessParallelApplyMessages(void)
 
 			initStringInfo(&msg);
 			appendBinaryStringInfo(&msg, data, nbytes);
-			ProcessParallelApplyMessage(&msg);
+			HandleParallelApplyMessage(&msg);
 			pfree(msg.data);
 		}
 		else
@@ -1441,8 +1441,8 @@ pa_stream_abort(LogicalRepStreamAbortData *abort_data)
 	 * Update origin state so we can restart streaming from correct position
 	 * in case of crash.
 	 */
-	replorigin_xact_state.origin_lsn = abort_data->abort_lsn;
-	replorigin_xact_state.origin_timestamp = abort_data->abort_time;
+	replorigin_session_origin_lsn = abort_data->abort_lsn;
+	replorigin_session_origin_timestamp = abort_data->abort_time;
 
 	/*
 	 * If the two XIDs are the same, it's in fact abort of toplevel xact, so
@@ -1651,7 +1651,7 @@ pa_xact_finish(ParallelApplyWorkerInfo *winfo, XLogRecPtr remote_lsn)
 	 */
 	pa_wait_for_xact_finish(winfo);
 
-	if (XLogRecPtrIsValid(remote_lsn))
+	if (!XLogRecPtrIsInvalid(remote_lsn))
 		store_flush_position(remote_lsn, winfo->shared->last_commit_end);
 
 	pa_free_worker(winfo);

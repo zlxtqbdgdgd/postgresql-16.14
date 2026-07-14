@@ -8,7 +8,7 @@
  * determined by the PG_CMDTAG macro, which is not defined in this file;
  * it can be defined by the caller for special purposes.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/cmdtaglist.h
@@ -48,7 +48,6 @@ PG_CMDTAG(CMDTAG_ALTER_OPERATOR_CLASS, "ALTER OPERATOR CLASS", true, false, fals
 PG_CMDTAG(CMDTAG_ALTER_OPERATOR_FAMILY, "ALTER OPERATOR FAMILY", true, false, false)
 PG_CMDTAG(CMDTAG_ALTER_POLICY, "ALTER POLICY", true, false, false)
 PG_CMDTAG(CMDTAG_ALTER_PROCEDURE, "ALTER PROCEDURE", true, false, false)
-PG_CMDTAG(CMDTAG_ALTER_PROPERTY_GRAPH, "ALTER PROPERTY GRAPH", true, false, false)
 PG_CMDTAG(CMDTAG_ALTER_PUBLICATION, "ALTER PUBLICATION", true, false, false)
 PG_CMDTAG(CMDTAG_ALTER_ROLE, "ALTER ROLE", false, false, false)
 PG_CMDTAG(CMDTAG_ALTER_ROUTINE, "ALTER ROUTINE", true, false, false)
@@ -104,7 +103,6 @@ PG_CMDTAG(CMDTAG_CREATE_OPERATOR_CLASS, "CREATE OPERATOR CLASS", true, false, fa
 PG_CMDTAG(CMDTAG_CREATE_OPERATOR_FAMILY, "CREATE OPERATOR FAMILY", true, false, false)
 PG_CMDTAG(CMDTAG_CREATE_POLICY, "CREATE POLICY", true, false, false)
 PG_CMDTAG(CMDTAG_CREATE_PROCEDURE, "CREATE PROCEDURE", true, false, false)
-PG_CMDTAG(CMDTAG_CREATE_PROPERTY_GRAPH, "CREATE PROPERTY GRAPH", true, false, false)
 PG_CMDTAG(CMDTAG_CREATE_PUBLICATION, "CREATE PUBLICATION", true, false, false)
 PG_CMDTAG(CMDTAG_CREATE_ROLE, "CREATE ROLE", false, false, false)
 PG_CMDTAG(CMDTAG_CREATE_ROUTINE, "CREATE ROUTINE", true, false, false)
@@ -158,7 +156,6 @@ PG_CMDTAG(CMDTAG_DROP_OPERATOR_FAMILY, "DROP OPERATOR FAMILY", true, false, fals
 PG_CMDTAG(CMDTAG_DROP_OWNED, "DROP OWNED", true, false, false)
 PG_CMDTAG(CMDTAG_DROP_POLICY, "DROP POLICY", true, false, false)
 PG_CMDTAG(CMDTAG_DROP_PROCEDURE, "DROP PROCEDURE", true, false, false)
-PG_CMDTAG(CMDTAG_DROP_PROPERTY_GRAPH, "DROP PROPERTY GRAPH", true, false, false)
 PG_CMDTAG(CMDTAG_DROP_PUBLICATION, "DROP PUBLICATION", true, false, false)
 PG_CMDTAG(CMDTAG_DROP_ROLE, "DROP ROLE", false, false, false)
 PG_CMDTAG(CMDTAG_DROP_ROUTINE, "DROP ROUTINE", true, false, false)
@@ -189,7 +186,6 @@ PG_CMDTAG(CMDTAG_INSERT, "INSERT", false, false, true)
 PG_CMDTAG(CMDTAG_LISTEN, "LISTEN", false, false, false)
 PG_CMDTAG(CMDTAG_LOAD, "LOAD", false, false, false)
 PG_CMDTAG(CMDTAG_LOCK_TABLE, "LOCK TABLE", false, false, false)
-PG_CMDTAG(CMDTAG_LOGIN, "LOGIN", true, false, false)
 PG_CMDTAG(CMDTAG_MERGE, "MERGE", false, false, true)
 PG_CMDTAG(CMDTAG_MOVE, "MOVE", false, false, true)
 PG_CMDTAG(CMDTAG_NOTIFY, "NOTIFY", false, false, false)
@@ -197,9 +193,8 @@ PG_CMDTAG(CMDTAG_PREPARE, "PREPARE", false, false, false)
 PG_CMDTAG(CMDTAG_PREPARE_TRANSACTION, "PREPARE TRANSACTION", false, false, false)
 PG_CMDTAG(CMDTAG_REASSIGN_OWNED, "REASSIGN OWNED", false, false, false)
 PG_CMDTAG(CMDTAG_REFRESH_MATERIALIZED_VIEW, "REFRESH MATERIALIZED VIEW", true, false, false)
-PG_CMDTAG(CMDTAG_REINDEX, "REINDEX", true, false, false)
+PG_CMDTAG(CMDTAG_REINDEX, "REINDEX", false, false, false)
 PG_CMDTAG(CMDTAG_RELEASE, "RELEASE", false, false, false)
-PG_CMDTAG(CMDTAG_REPACK, "REPACK", false, false, false)
 PG_CMDTAG(CMDTAG_RESET, "RESET", false, false, false)
 PG_CMDTAG(CMDTAG_REVOKE, "REVOKE", true, false, false)
 PG_CMDTAG(CMDTAG_REVOKE_ROLE, "REVOKE ROLE", false, false, false)
@@ -221,4 +216,3 @@ PG_CMDTAG(CMDTAG_TRUNCATE_TABLE, "TRUNCATE TABLE", false, false, false)
 PG_CMDTAG(CMDTAG_UNLISTEN, "UNLISTEN", false, false, false)
 PG_CMDTAG(CMDTAG_UPDATE, "UPDATE", false, false, true)
 PG_CMDTAG(CMDTAG_VACUUM, "VACUUM", false, false, false)
-PG_CMDTAG(CMDTAG_WAIT, "WAIT", false, false, false)

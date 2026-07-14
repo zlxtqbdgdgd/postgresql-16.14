@@ -3,7 +3,7 @@
  * float.c
  *	  Functions for the built-in floating-point types.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,30 +21,16 @@
 
 #include "catalog/pg_type.h"
 #include "common/int.h"
+#include "common/pg_prng.h"
 #include "common/shortest_dec.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
 #include "utils/sortsupport.h"
+#include "utils/timestamp.h"
 
-
-/*
- * Reject building with gcc's -ffast-math switch.  It breaks our handling of
- * float Infinity and NaN values (via -ffinite-math-only), causes results to
- * be less accurate than expected (via -funsafe-math-optimizations and
- * -fexcess-precision=fast), and causes some math error reports to be missed
- * (via -fno-math-errno).  Unfortunately we can't easily detect cases where
- * those options were given individually, but this at least catches the most
- * obvious case.
- *
- * We test this only here, not in any header file, to allow extensions to use
- * -ffast-math if they need to.  But the inline functions in float.h will
- * misbehave in such an extension, so its authors had better be careful.
- */
-#ifdef __FAST_MATH__
-#error -ffast-math is known to break this code
-#endif
 
 /*
  * Configurable GUC parameter
@@ -71,20 +57,16 @@ static float8 cot_45 = 0;
  * be referenced by other files, much less changed; but we don't want the
  * compiler to know that, else it might try to precompute expressions
  * involving them.  See comments for init_degree_constants().
- *
- * The additional extern declarations are to silence
- * -Wmissing-variable-declarations.
  */
-extern float8 degree_c_thirty;
-extern float8 degree_c_forty_five;
-extern float8 degree_c_sixty;
-extern float8 degree_c_one_half;
-extern float8 degree_c_one;
 float8		degree_c_thirty = 30.0;
 float8		degree_c_forty_five = 45.0;
 float8		degree_c_sixty = 60.0;
 float8		degree_c_one_half = 0.5;
 float8		degree_c_one = 1.0;
+
+/* State for drandom() and setseed() */
+static bool drandom_seed_set = false;
+static pg_prng_state drandom_seed;
 
 /* Local function prototypes */
 static double sind_q1(double x);
@@ -119,30 +101,6 @@ pg_noinline void
 float_zero_divide_error(void)
 {
 	ereport(ERROR,
-			(errcode(ERRCODE_DIVISION_BY_ZERO),
-			 errmsg("division by zero")));
-}
-
-float8
-float_overflow_error_ext(struct Node *escontext)
-{
-	ereturn(escontext, 0.0,
-			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-			errmsg("value out of range: overflow"));
-}
-
-float8
-float_underflow_error_ext(struct Node *escontext)
-{
-	ereturn(escontext, 0.0,
-			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-			errmsg("value out of range: underflow"));
-}
-
-float8
-float_zero_divide_error_ext(struct Node *escontext)
-{
-	ereturn(escontext, 0.0,
 			(errcode(ERRCODE_DIVISION_BY_ZERO),
 			 errmsg("division by zero")));
 }
@@ -1240,9 +1198,9 @@ dtof(PG_FUNCTION_ARGS)
 
 	result = (float4) num;
 	if (unlikely(isinf(result)) && !isinf(num))
-		float_overflow_error_ext(fcinfo->context);
+		float_overflow_error();
 	if (unlikely(result == 0.0f) && num != 0.0)
-		float_underflow_error_ext(fcinfo->context);
+		float_underflow_error();
 
 	PG_RETURN_FLOAT4(result);
 }
@@ -1265,7 +1223,7 @@ dtoi4(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT32(num)))
-		ereturn(fcinfo->context, (Datum) 0,
+		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
@@ -1290,7 +1248,7 @@ dtoi2(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT16(num)))
-		ereturn(fcinfo->context, (Datum) 0,
+		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -1339,7 +1297,7 @@ ftoi4(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT32(num)))
-		ereturn(fcinfo->context, (Datum) 0,
+		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
@@ -1364,7 +1322,7 @@ ftoi2(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT16(num)))
-		ereturn(fcinfo->context, (Datum) 0,
+		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -2827,97 +2785,92 @@ derfc(PG_FUNCTION_ARGS)
 }
 
 
-/* ========== GAMMA FUNCTIONS ========== */
+/* ========== RANDOM FUNCTIONS ========== */
 
 
 /*
- *		dgamma			- returns the gamma function of arg1
+ * initialize_drandom_seed - initialize drandom_seed if not yet done
  */
-Datum
-dgamma(PG_FUNCTION_ARGS)
+static void
+initialize_drandom_seed(void)
 {
-	float8		arg1 = PG_GETARG_FLOAT8(0);
-	float8		result;
-
-	/*
-	 * Handle NaN and Inf cases explicitly.  This simplifies the overflow
-	 * checks on platforms that do not set errno.
-	 */
-	if (isnan(arg1))
-		result = arg1;
-	else if (isinf(arg1))
-	{
-		/* Per POSIX, an input of -Inf causes a domain error */
-		if (arg1 < 0)
-		{
-			float_overflow_error();
-			result = get_float8_nan();	/* keep compiler quiet */
-		}
-		else
-			result = arg1;
-	}
-	else
+	/* Initialize random seed, if not done yet in this process */
+	if (unlikely(!drandom_seed_set))
 	{
 		/*
-		 * Note: the POSIX/C99 gamma function is called "tgamma", not "gamma".
-		 *
-		 * On some platforms, tgamma() will not set errno but just return Inf,
-		 * NaN, or zero to report overflow/underflow; therefore, test those
-		 * cases explicitly (note that, like the exponential function, the
-		 * gamma function has no zeros).
+		 * If possible, initialize the seed using high-quality random bits.
+		 * Should that fail for some reason, we fall back on a lower-quality
+		 * seed based on current time and PID.
 		 */
-		errno = 0;
-		result = tgamma(arg1);
-
-		if (errno != 0 || isinf(result) || isnan(result))
+		if (unlikely(!pg_prng_strong_seed(&drandom_seed)))
 		{
-			if (result != 0.0)
-				float_overflow_error();
-			else
-				float_underflow_error();
+			TimestampTz now = GetCurrentTimestamp();
+			uint64		iseed;
+
+			/* Mix the PID with the most predictable bits of the timestamp */
+			iseed = (uint64) now ^ ((uint64) MyProcPid << 32);
+			pg_prng_seed(&drandom_seed, iseed);
 		}
-		else if (result == 0.0)
-			float_underflow_error();
+		drandom_seed_set = true;
 	}
+}
+
+/*
+ *		drandom		- returns a random number
+ */
+Datum
+drandom(PG_FUNCTION_ARGS)
+{
+	float8		result;
+
+	initialize_drandom_seed();
+
+	/* pg_prng_double produces desired result range [0.0 - 1.0) */
+	result = pg_prng_double(&drandom_seed);
 
 	PG_RETURN_FLOAT8(result);
 }
 
-
 /*
- *		dlgamma			- natural logarithm of absolute value of gamma of arg1
+ *		drandom_normal	- returns a random number from a normal distribution
  */
 Datum
-dlgamma(PG_FUNCTION_ARGS)
+drandom_normal(PG_FUNCTION_ARGS)
 {
-	float8		arg1 = PG_GETARG_FLOAT8(0);
-	float8		result;
+	float8		mean = PG_GETARG_FLOAT8(0);
+	float8		stddev = PG_GETARG_FLOAT8(1);
+	float8		result,
+				z;
 
-	/* On some versions of AIX, lgamma(NaN) fails with ERANGE */
-#if defined(_AIX)
-	if (isnan(arg1))
-		PG_RETURN_FLOAT8(arg1);
-#endif
+	initialize_drandom_seed();
 
-	/*
-	 * Note: lgamma may not be thread-safe because it may write to a global
-	 * variable signgam, which may not be thread-local. However, this doesn't
-	 * matter to us, since we don't use signgam.
-	 */
-	errno = 0;
-	result = lgamma(arg1);
-
-	/*
-	 * If an ERANGE error occurs, it means there was an overflow or a pole
-	 * error (which happens for zero and negative integer inputs).
-	 *
-	 * On some platforms, lgamma() will not set errno but just return infinity
-	 * to report overflow, but it should never underflow.
-	 */
-	if (errno == ERANGE || (isinf(result) && !isinf(arg1)))
-		float_overflow_error();
+	/* Get random value from standard normal(mean = 0.0, stddev = 1.0) */
+	z = pg_prng_double_normal(&drandom_seed);
+	/* Transform the normal standard variable (z) */
+	/* using the target normal distribution parameters */
+	result = (stddev * z) + mean;
 
 	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		setseed		- set seed for the random number generator
+ */
+Datum
+setseed(PG_FUNCTION_ARGS)
+{
+	float8		seed = PG_GETARG_FLOAT8(0);
+
+	if (seed < -1 || seed > 1 || isnan(seed))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("setseed parameter %g is out of allowed range [-1,1]",
+						seed)));
+
+	pg_prng_fseed(&drandom_seed, seed);
+	drandom_seed_set = true;
+
+	PG_RETURN_VOID();
 }
 
 
@@ -3080,7 +3033,9 @@ float8_combine(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
+		result = construct_array(transdatums, 3,
+								 FLOAT8OID,
+								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3161,7 +3116,9 @@ float8_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
+		result = construct_array(transdatums, 3,
+								 FLOAT8OID,
+								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3244,7 +3201,9 @@ float4_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
+		result = construct_array(transdatums, 3,
+								 FLOAT8OID,
+								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3366,21 +3325,9 @@ float8_stddev_samp(PG_FUNCTION_ARGS)
  * As with the preceding aggregates, we use the Youngs-Cramer algorithm to
  * reduce rounding errors in the aggregate final functions.
  *
- * The transition datatype for all these aggregates is an 8-element array of
+ * The transition datatype for all these aggregates is a 6-element array of
  * float8, holding the values N, Sx=sum(X), Sxx=sum((X-Sx/N)^2), Sy=sum(Y),
- * Syy=sum((Y-Sy/N)^2), Sxy=sum((X-Sx/N)*(Y-Sy/N)), commonX, and commonY
- * in that order.
- *
- * commonX is defined as the common X value if all the X values were the same,
- * else NaN; likewise for commonY.  This is useful for deciding whether corr()
- * and related functions should return NULL.  This representation cannot
- * distinguish the-values-were-all-NaN from the-values-were-not-all-the-same,
- * but that's okay because for this purpose we use the IEEE float arithmetic
- * principle that two NaNs are never equal.  The SQL standard doesn't mention
- * NaNs, but it says that NULL is to be returned when N*sum(X*X) equals
- * sum(X)*sum(X) (etc), and that shouldn't be considered true for NaNs.
- * Testing this as written in the spec would be highly subject to roundoff
- * error, so instead we directly track whether all the inputs are equal.
+ * Syy=sum((Y-Sy/N)^2), Sxy=sum((X-Sx/N)*(Y-Sy/N)) in that order.
  *
  * Note that Y is the first argument to all these aggregates!
  *
@@ -3404,21 +3351,17 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 				Sy,
 				Syy,
 				Sxy,
-				commonX,
-				commonY,
 				tmpX,
 				tmpY,
 				scale;
 
-	transvalues = check_float8_array(transarray, "float8_regr_accum", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_accum", 6);
 	N = transvalues[0];
 	Sx = transvalues[1];
 	Sxx = transvalues[2];
 	Sy = transvalues[3];
 	Syy = transvalues[4];
 	Sxy = transvalues[5];
-	commonX = transvalues[6];
-	commonY = transvalues[7];
 
 	/*
 	 * Use the Youngs-Cramer algorithm to incorporate the new values into the
@@ -3429,33 +3372,12 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 	Sy += newvalY;
 	if (transvalues[0] > 0.0)
 	{
-		/*
-		 * Check to see if we have seen distinct inputs.  We can use a test
-		 * that's a bit cheaper than float8_ne() because if commonX is already
-		 * NaN, it does not matter whether the != test returns true or not.
-		 */
-		if (newvalX != commonX || isnan(newvalX))
-			commonX = get_float8_nan();
-		if (newvalY != commonY || isnan(newvalY))
-			commonY = get_float8_nan();
-
 		tmpX = newvalX * N - Sx;
 		tmpY = newvalY * N - Sy;
 		scale = 1.0 / (N * transvalues[0]);
-
-		/*
-		 * If we have not seen distinct inputs, then Sxx, Syy, and/or Sxy
-		 * should remain zero (since Sx's exact value would be N * commonX,
-		 * etc).  Updating them would just create the possibility of injecting
-		 * roundoff error, and we need exact zero results so that the final
-		 * functions will return NULL in the right cases.
-		 */
-		if (isnan(commonX))
-			Sxx += tmpX * tmpX * scale;
-		if (isnan(commonY))
-			Syy += tmpY * tmpY * scale;
-		if (isnan(commonX) && isnan(commonY))
-			Sxy += tmpX * tmpY * scale;
+		Sxx += tmpX * tmpX * scale;
+		Syy += tmpY * tmpY * scale;
+		Sxy += tmpX * tmpY * scale;
 
 		/*
 		 * Overflow check.  We only report an overflow error when finite
@@ -3494,9 +3416,6 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 			Sxx = Sxy = get_float8_nan();
 		if (isnan(newvalY) || isinf(newvalY))
 			Syy = Sxy = get_float8_nan();
-
-		commonX = newvalX;
-		commonY = newvalY;
 	}
 
 	/*
@@ -3512,14 +3431,12 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transvalues[3] = Sy;
 		transvalues[4] = Syy;
 		transvalues[5] = Sxy;
-		transvalues[6] = commonX;
-		transvalues[7] = commonY;
 
 		PG_RETURN_ARRAYTYPE_P(transarray);
 	}
 	else
 	{
-		Datum		transdatums[8];
+		Datum		transdatums[6];
 		ArrayType  *result;
 
 		transdatums[0] = Float8GetDatumFast(N);
@@ -3528,10 +3445,10 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transdatums[3] = Float8GetDatumFast(Sy);
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
-		transdatums[6] = Float8GetDatumFast(commonX);
-		transdatums[7] = Float8GetDatumFast(commonY);
 
-		result = construct_array_builtin(transdatums, 8, FLOAT8OID);
+		result = construct_array(transdatums, 6,
+								 FLOAT8OID,
+								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3540,7 +3457,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 /*
  * float8_regr_combine
  *
- * An aggregate combine function used to combine two 8-fields
+ * An aggregate combine function used to combine two 6 fields
  * aggregate transition data into a single transition data.
  * This function is used only in two stage aggregation and
  * shouldn't be called outside aggregate context.
@@ -3558,16 +3475,12 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 				Sy1,
 				Syy1,
 				Sxy1,
-				Cx1,
-				Cy1,
 				N2,
 				Sx2,
 				Sxx2,
 				Sy2,
 				Syy2,
 				Sxy2,
-				Cx2,
-				Cy2,
 				tmp1,
 				tmp2,
 				N,
@@ -3575,12 +3488,10 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 				Sxx,
 				Sy,
 				Syy,
-				Sxy,
-				Cx,
-				Cy;
+				Sxy;
 
-	transvalues1 = check_float8_array(transarray1, "float8_regr_combine", 8);
-	transvalues2 = check_float8_array(transarray2, "float8_regr_combine", 8);
+	transvalues1 = check_float8_array(transarray1, "float8_regr_combine", 6);
+	transvalues2 = check_float8_array(transarray2, "float8_regr_combine", 6);
 
 	N1 = transvalues1[0];
 	Sx1 = transvalues1[1];
@@ -3588,8 +3499,6 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 	Sy1 = transvalues1[3];
 	Syy1 = transvalues1[4];
 	Sxy1 = transvalues1[5];
-	Cx1 = transvalues1[6];
-	Cy1 = transvalues1[7];
 
 	N2 = transvalues2[0];
 	Sx2 = transvalues2[1];
@@ -3597,8 +3506,6 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 	Sy2 = transvalues2[3];
 	Syy2 = transvalues2[4];
 	Sxy2 = transvalues2[5];
-	Cx2 = transvalues2[6];
-	Cy2 = transvalues2[7];
 
 	/*--------------------
 	 * The transition values combine using a generalization of the
@@ -3624,8 +3531,6 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sy = Sy2;
 		Syy = Syy2;
 		Sxy = Sxy2;
-		Cx = Cx2;
-		Cy = Cy2;
 	}
 	else if (N2 == 0.0)
 	{
@@ -3635,8 +3540,6 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sy = Sy1;
 		Syy = Syy1;
 		Sxy = Sxy1;
-		Cx = Cx1;
-		Cy = Cy1;
 	}
 	else
 	{
@@ -3654,14 +3557,6 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sxy = Sxy1 + Sxy2 + N1 * N2 * tmp1 * tmp2 / N;
 		if (unlikely(isinf(Sxy)) && !isinf(Sxy1) && !isinf(Sxy2))
 			float_overflow_error();
-		if (float8_eq(Cx1, Cx2))
-			Cx = Cx1;
-		else
-			Cx = get_float8_nan();
-		if (float8_eq(Cy1, Cy2))
-			Cy = Cy1;
-		else
-			Cy = get_float8_nan();
 	}
 
 	/*
@@ -3677,14 +3572,12 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transvalues1[3] = Sy;
 		transvalues1[4] = Syy;
 		transvalues1[5] = Sxy;
-		transvalues1[6] = Cx;
-		transvalues1[7] = Cy;
 
 		PG_RETURN_ARRAYTYPE_P(transarray1);
 	}
 	else
 	{
-		Datum		transdatums[8];
+		Datum		transdatums[6];
 		ArrayType  *result;
 
 		transdatums[0] = Float8GetDatumFast(N);
@@ -3693,10 +3586,10 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transdatums[3] = Float8GetDatumFast(Sy);
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
-		transdatums[6] = Float8GetDatumFast(Cx);
-		transdatums[7] = Float8GetDatumFast(Cy);
 
-		result = construct_array_builtin(transdatums, 8, FLOAT8OID);
+		result = construct_array(transdatums, 6,
+								 FLOAT8OID,
+								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3711,7 +3604,7 @@ float8_regr_sxx(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx;
 
-	transvalues = check_float8_array(transarray, "float8_regr_sxx", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_sxx", 6);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 
@@ -3732,7 +3625,7 @@ float8_regr_syy(PG_FUNCTION_ARGS)
 	float8		N,
 				Syy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_syy", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_syy", 6);
 	N = transvalues[0];
 	Syy = transvalues[4];
 
@@ -3753,7 +3646,7 @@ float8_regr_sxy(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_sxy", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_sxy", 6);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3772,21 +3665,15 @@ float8_regr_avgx(PG_FUNCTION_ARGS)
 	ArrayType  *transarray = PG_GETARG_ARRAYTYPE_P(0);
 	float8	   *transvalues;
 	float8		N,
-				Sx,
-				commonX;
+				Sx;
 
-	transvalues = check_float8_array(transarray, "float8_regr_avgx", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_avgx", 6);
 	N = transvalues[0];
 	Sx = transvalues[1];
-	commonX = transvalues[6];
 
 	/* if N is 0 we should return NULL */
 	if (N < 1.0)
 		PG_RETURN_NULL();
-
-	/* if all inputs were the same just return that, avoiding roundoff error */
-	if (!isnan(commonX))
-		PG_RETURN_FLOAT8(commonX);
 
 	PG_RETURN_FLOAT8(Sx / N);
 }
@@ -3797,21 +3684,15 @@ float8_regr_avgy(PG_FUNCTION_ARGS)
 	ArrayType  *transarray = PG_GETARG_ARRAYTYPE_P(0);
 	float8	   *transvalues;
 	float8		N,
-				Sy,
-				commonY;
+				Sy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_avgy", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_avgy", 6);
 	N = transvalues[0];
 	Sy = transvalues[3];
-	commonY = transvalues[7];
 
 	/* if N is 0 we should return NULL */
 	if (N < 1.0)
 		PG_RETURN_NULL();
-
-	/* if all inputs were the same just return that, avoiding roundoff error */
-	if (!isnan(commonY))
-		PG_RETURN_FLOAT8(commonY);
 
 	PG_RETURN_FLOAT8(Sy / N);
 }
@@ -3824,7 +3705,7 @@ float8_covar_pop(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_covar_pop", 8);
+	transvalues = check_float8_array(transarray, "float8_covar_pop", 6);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3843,7 +3724,7 @@ float8_covar_samp(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_covar_samp", 8);
+	transvalues = check_float8_array(transarray, "float8_covar_samp", 6);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3862,12 +3743,9 @@ float8_corr(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx,
 				Syy,
-				Sxy,
-				product,
-				sqrtproduct,
-				result;
+				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_corr", 8);
+	transvalues = check_float8_array(transarray, "float8_corr", 6);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Syy = transvalues[4];
@@ -3883,29 +3761,7 @@ float8_corr(PG_FUNCTION_ARGS)
 	if (Sxx == 0 || Syy == 0)
 		PG_RETURN_NULL();
 
-	/*
-	 * The product Sxx * Syy might underflow or overflow.  If so, we can
-	 * recover by computing sqrt(Sxx) * sqrt(Syy) instead of sqrt(Sxx * Syy).
-	 * However, the double sqrt() calculation is a bit slower and less
-	 * accurate, so don't do it if we don't have to.
-	 */
-	product = Sxx * Syy;
-	if (product == 0 || isinf(product))
-		sqrtproduct = sqrt(Sxx) * sqrt(Syy);
-	else
-		sqrtproduct = sqrt(product);
-	result = Sxy / sqrtproduct;
-
-	/*
-	 * Despite all these precautions, this formula can yield results outside
-	 * [-1, 1] due to roundoff error.  Clamp it to the expected range.
-	 */
-	if (result < -1)
-		result = -1;
-	else if (result > 1)
-		result = 1;
-
-	PG_RETURN_FLOAT8(result);
+	PG_RETURN_FLOAT8(Sxy / sqrt(Sxx * Syy));
 }
 
 Datum
@@ -3916,14 +3772,9 @@ float8_regr_r2(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx,
 				Syy,
-				Sxy,
-				numerator,
-				denominator,
-				sqrtdenominator,
-				sqrtresult,
-				result;
+				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_r2", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_r2", 6);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Syy = transvalues[4];
@@ -3943,35 +3794,7 @@ float8_regr_r2(PG_FUNCTION_ARGS)
 	if (Syy == 0)
 		PG_RETURN_FLOAT8(1.0);
 
-	/*
-	 * The products Sxy * Sxy and/or Sxx * Syy might underflow or overflow. If
-	 * so, we can recover by computing Sxy / (sqrt(Sxx) * sqrt(Syy)) and
-	 * squaring it instead.  However, the double sqrt() calculation is a bit
-	 * slower and less accurate, so don't do it if we don't have to.
-	 */
-	numerator = Sxy * Sxy;
-	denominator = Sxx * Syy;
-	if (numerator == 0 || isinf(numerator) ||
-		denominator == 0 || isinf(denominator))
-	{
-		sqrtdenominator = sqrt(Sxx) * sqrt(Syy);
-		sqrtresult = Sxy / sqrtdenominator;
-		result = sqrtresult * sqrtresult;
-	}
-	else
-		result = numerator / denominator;
-
-	/*
-	 * Despite all these precautions, this formula can yield results outside
-	 * [0, 1] due to roundoff error.  Clamp it to the expected range.
-	 *
-	 * Note that result is guaranteed to be non-negative because Sxx and Syy
-	 * are non-negative, so we only need to clamp the upper end of the range.
-	 */
-	if (result > 1)
-		result = 1;
-
-	PG_RETURN_FLOAT8(result);
+	PG_RETURN_FLOAT8((Sxy * Sxy) / (Sxx * Syy));
 }
 
 Datum
@@ -3983,7 +3806,7 @@ float8_regr_slope(PG_FUNCTION_ARGS)
 				Sxx,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_slope", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_slope", 6);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Sxy = transvalues[5];
@@ -4010,10 +3833,9 @@ float8_regr_intercept(PG_FUNCTION_ARGS)
 				Sx,
 				Sxx,
 				Sy,
-				Sxy,
-				dy;
+				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_intercept", 8);
+	transvalues = check_float8_array(transarray, "float8_regr_intercept", 6);
 	N = transvalues[0];
 	Sx = transvalues[1];
 	Sxx = transvalues[2];
@@ -4030,41 +3852,7 @@ float8_regr_intercept(PG_FUNCTION_ARGS)
 	if (Sxx == 0)
 		PG_RETURN_NULL();
 
-	/*
-	 * The intercept is given by (Sy - dy) / N, where dy = Sx * Sxy / Sxx.
-	 * However, when computing dy, the intermediate product Sx * Sxy might
-	 * underflow or overflow.  If so, we can recover by decomposing Sx, Sxy,
-	 * and Sxx into normalized mantissa and integer power-of-two components,
-	 * computing the corresponding components of dy, and then recomposing dy.
-	 * We avoid doing this if Sx, Sxy, or Sxx are infinite or NaN, since the
-	 * exponent returned by frexp() is unspecified in those cases (and the
-	 * final result would be the same in any case).
-	 */
-	dy = Sx * Sxy / Sxx;
-	if ((dy == 0 || isinf(dy)) &&
-		!(isinf(Sx) || isinf(Sxy) || isinf(Sxx) ||
-		  isnan(Sx) || isnan(Sxy) || isnan(Sxx)))
-	{
-		float8		m_Sx,
-					m_Sxy,
-					m_Sxx,
-					m_dy;
-		int			n_Sx,
-					n_Sxy,
-					n_Sxx,
-					n_dy;
-
-		m_Sx = frexp(Sx, &n_Sx);
-		m_Sxy = frexp(Sxy, &n_Sxy);
-		m_Sxx = frexp(Sxx, &n_Sxx);
-
-		m_dy = m_Sx * m_Sxy / m_Sxx;
-		n_dy = n_Sx + n_Sxy - n_Sxx;
-
-		dy = ldexp(m_dy, n_dy);
-	}
-
-	PG_RETURN_FLOAT8((Sy - dy) / N);
+	PG_RETURN_FLOAT8((Sy - Sx * Sxy / Sxx) / N);
 }
 
 
@@ -4289,9 +4077,8 @@ float84ge(PG_FUNCTION_ARGS)
  * with the specified characteristics. An operand smaller than the
  * lower bound is assigned to bucket 0. An operand greater than or equal
  * to the upper bound is assigned to an additional bucket (with number
- * count+1). We don't allow the histogram bounds to be NaN or +/- infinity,
- * but we do allow those values for the operand (taking NaN to be larger
- * than any other value, as we do in comparisons).
+ * count+1). We don't allow "NaN" for any of the float8 inputs, and we
+ * don't allow either of the histogram bounds to be +/- infinity.
  */
 Datum
 width_bucket_float8(PG_FUNCTION_ARGS)
@@ -4307,11 +4094,12 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
 				 errmsg("count must be greater than zero")));
 
-	if (isnan(bound1) || isnan(bound2))
+	if (isnan(operand) || isnan(bound1) || isnan(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
-				 errmsg("lower and upper bounds cannot be NaN")));
+				 errmsg("operand, lower bound, and upper bound cannot be NaN")));
 
+	/* Note that we allow "operand" to be infinite */
 	if (isinf(bound1) || isinf(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
@@ -4319,15 +4107,15 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 
 	if (bound1 < bound2)
 	{
-		if (isnan(operand) || operand >= bound2)
+		if (operand < bound1)
+			result = 0;
+		else if (operand >= bound2)
 		{
 			if (pg_add_s32_overflow(count, 1, &result))
 				ereport(ERROR,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("integer out of range")));
 		}
-		else if (operand < bound1)
-			result = 0;
 		else
 		{
 			if (!isinf(bound2 - bound1))
@@ -4357,7 +4145,7 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 	}
 	else if (bound1 > bound2)
 	{
-		if (isnan(operand) || operand > bound1)
+		if (operand > bound1)
 			result = 0;
 		else if (operand <= bound2)
 		{

@@ -746,36 +746,6 @@ savings  |    600|    1200
 (2 rows)
 
 
-starting permutation: read wx2 wb1 c2 c1 read
-step read: SELECT * FROM accounts ORDER BY accountid;
-accountid|balance|balance2
----------+-------+--------
-checking |    600|    1200
-savings  |    600|    1200
-(2 rows)
-
-step wx2: UPDATE accounts SET balance = balance + 450 WHERE accountid = 'checking' RETURNING balance;
-balance
--------
-   1050
-(1 row)
-
-step wb1: DELETE FROM accounts WHERE balance = 600 RETURNING *; <waiting ...>
-step c2: COMMIT;
-step wb1: <... completed>
-accountid|balance|balance2
----------+-------+--------
-savings  |    600|    1200
-(1 row)
-
-step c1: COMMIT;
-step read: SELECT * FROM accounts ORDER BY accountid;
-accountid|balance|balance2
----------+-------+--------
-checking |   1050|    2100
-(1 row)
-
-
 starting permutation: upsert1 upsert2 c1 c2 read
 step upsert1: 
 	WITH upsert AS
@@ -1457,39 +1427,3 @@ step sysmerge2:
 step c1: COMMIT;
 step sysmerge2: <... completed>
 step c2: COMMIT;
-
-starting permutation: s1pp1 s2pp1 s2pp2 s2pp3 c1 c2
-step s1pp1: UPDATE another_parttbl SET b = b + 1 WHERE a = 1;
-step s2pp1: SET plan_cache_mode TO force_generic_plan;
-step s2pp2: PREPARE epd AS DELETE FROM another_parttbl WHERE a = $1;
-step s2pp3: EXECUTE epd(1); <waiting ...>
-step c1: COMMIT;
-step s2pp3: <... completed>
-step c2: COMMIT;
-
-starting permutation: s1pp1 s2pp4 c1 c2
-step s1pp1: UPDATE another_parttbl SET b = b + 1 WHERE a = 1;
-step s2pp4: DELETE FROM another_parttbl WHERE a = (SELECT 1); <waiting ...>
-step c1: COMMIT;
-step s2pp4: <... completed>
-step c2: COMMIT;
-
-starting permutation: updateformergevalues mergevalues c1 c2 read
-step updateformergevalues: UPDATE accounts SET balance = balance + 100;
-step mergevalues: 
-	MERGE INTO accounts
-	USING (VALUES ('checking', 610), ('savings', 620)) v(accountid, balance)
-	ON v.accountid = accounts.accountid
-	WHEN MATCHED THEN UPDATE SET balance = v.balance
-	WHEN NOT MATCHED THEN INSERT VALUES ('unmatched', -1);
- <waiting ...>
-step c1: COMMIT;
-step mergevalues: <... completed>
-step c2: COMMIT;
-step read: SELECT * FROM accounts ORDER BY accountid;
-accountid|balance|balance2
----------+-------+--------
-checking |    610|    1220
-savings  |    620|    1240
-(2 rows)
-

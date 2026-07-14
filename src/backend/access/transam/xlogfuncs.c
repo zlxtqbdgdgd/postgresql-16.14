@@ -7,7 +7,7 @@
  * This file contains WAL control and information functions.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogfuncs.c
@@ -22,21 +22,23 @@
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
-#include "catalog/pg_authid.h"
+#include "access/xlogutils.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "utils/acl.h"
 #include "replication/walreceiver.h"
 #include "storage/fd.h"
-#include "storage/latch.h"
+#include "storage/ipc.h"
+#include "storage/smgr.h"
 #include "storage/standby.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
-#include "utils/wait_event.h"
+#include "utils/tuplestore.h"
 
 /*
  * Backup-related variables.
@@ -46,33 +48,6 @@ static StringInfo tablespace_map = NULL;
 
 /* Session-level context for the SQL-callable backup functions */
 static MemoryContext backupcontext = NULL;
-
-
-/*
- * Return a string constant representing the recovery pause state. This is
- * used in system functions and views, and should *not* be translated.
- */
-static const char *
-GetRecoveryPauseStateString(RecoveryPauseState pause_state)
-{
-	const char *statestr = NULL;
-
-	switch (pause_state)
-	{
-		case RECOVERY_NOT_PAUSED:
-			statestr = "not paused";
-			break;
-		case RECOVERY_PAUSE_REQUESTED:
-			statestr = "pause requested";
-			break;
-		case RECOVERY_PAUSED:
-			statestr = "paused";
-			break;
-	}
-
-	Assert(statestr != NULL);
-	return statestr;
-}
 
 /*
  * pg_backup_start: set up for taking an on-line backup dump
@@ -120,7 +95,7 @@ pg_backup_start(PG_FUNCTION_ARGS)
 	}
 
 	oldcontext = MemoryContextSwitchTo(backupcontext);
-	backup_state = palloc0_object(BackupState);
+	backup_state = (BackupState *) palloc0(sizeof(BackupState));
 	tablespace_map = makeStringInfo();
 	MemoryContextSwitchTo(oldcontext);
 
@@ -243,7 +218,7 @@ pg_log_standby_snapshot(PG_FUNCTION_ARGS)
 	if (!XLogStandbyInfoActive())
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_log_standby_snapshot() can only be used if \"wal_level\" >= \"replica\"")));
+				 errmsg("pg_log_standby_snapshot() can only be used if wal_level >= replica")));
 
 	recptr = LogStandbySnapshot();
 
@@ -276,7 +251,7 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("WAL level not sufficient for creating a restore point"),
-				 errhint("\"wal_level\" must be set to \"replica\" or \"logical\" at server start.")));
+				 errhint("wal_level must be set to \"replica\" or \"logical\" at server start.")));
 
 	restore_name_str = text_to_cstring(restore_name);
 
@@ -371,7 +346,7 @@ pg_last_wal_receive_lsn(PG_FUNCTION_ARGS)
 
 	recptr = GetWalRcvFlushRecPtr(NULL, NULL);
 
-	if (!XLogRecPtrIsValid(recptr))
+	if (recptr == 0)
 		PG_RETURN_NULL();
 
 	PG_RETURN_LSN(recptr);
@@ -390,7 +365,7 @@ pg_last_wal_replay_lsn(PG_FUNCTION_ARGS)
 
 	recptr = GetXLogReplayRecPtr(NULL);
 
-	if (!XLogRecPtrIsValid(recptr))
+	if (recptr == 0)
 		PG_RETURN_NULL();
 
 	PG_RETURN_LSN(recptr);
@@ -399,6 +374,10 @@ pg_last_wal_replay_lsn(PG_FUNCTION_ARGS)
 /*
  * Compute an xlog file name and decimal byte offset given a WAL location,
  * such as is returned by pg_backup_stop() or pg_switch_wal().
+ *
+ * Note that a location exactly at a segment boundary is taken to be in
+ * the previous segment.  This is usually the right thing, since the
+ * expected usage is to determine which xlog file(s) are ready to archive.
  */
 Datum
 pg_walfile_name_offset(PG_FUNCTION_ARGS)
@@ -430,13 +409,12 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(resultTupleDesc, (AttrNumber) 2, "file_offset",
 					   INT4OID, -1, 0);
 
-	TupleDescFinalize(resultTupleDesc);
 	resultTupleDesc = BlessTupleDesc(resultTupleDesc);
 
 	/*
 	 * xlogfilename
 	 */
-	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
+	XLByteToPrevSeg(locationpoint, xlogsegno, wal_segment_size);
 	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
 				 wal_segment_size);
 
@@ -448,7 +426,7 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 	 */
 	xrecoff = XLogSegmentOffset(locationpoint, wal_segment_size);
 
-	values[1] = Int32GetDatum(xrecoff);
+	values[1] = UInt32GetDatum(xrecoff);
 	isnull[1] = false;
 
 	/*
@@ -479,7 +457,7 @@ pg_walfile_name(PG_FUNCTION_ARGS)
 				 errhint("%s cannot be executed during recovery.",
 						 "pg_walfile_name()")));
 
-	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
+	XLByteToPrevSeg(locationpoint, xlogsegno, wal_segment_size);
 	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
 				 wal_segment_size);
 
@@ -510,7 +488,7 @@ pg_split_walfile_name(PG_FUNCTION_ARGS)
 
 	/* Capitalize WAL file name. */
 	for (p = fname_upper; *p; p++)
-		*p = pg_ascii_toupper((unsigned char) *p);
+		*p = pg_toupper((unsigned char) *p);
 
 	if (!IsXLogFileName(fname_upper))
 		ereport(ERROR,
@@ -623,7 +601,7 @@ pg_is_wal_replay_paused(PG_FUNCTION_ARGS)
 Datum
 pg_get_wal_replay_pause_state(PG_FUNCTION_ARGS)
 {
-	RecoveryPauseState state;
+	char	   *statestr = NULL;
 
 	if (!RecoveryInProgress())
 		ereport(ERROR,
@@ -631,10 +609,22 @@ pg_get_wal_replay_pause_state(PG_FUNCTION_ARGS)
 				 errmsg("recovery is not in progress"),
 				 errhint("Recovery control functions can only be executed during recovery.")));
 
-	state = GetRecoveryPauseState();
-
 	/* get the recovery pause state */
-	PG_RETURN_TEXT_P(cstring_to_text(GetRecoveryPauseStateString(state)));
+	switch (GetRecoveryPauseState())
+	{
+		case RECOVERY_NOT_PAUSED:
+			statestr = "not paused";
+			break;
+		case RECOVERY_PAUSE_REQUESTED:
+			statestr = "pause requested";
+			break;
+		case RECOVERY_PAUSED:
+			statestr = "paused";
+			break;
+	}
+
+	Assert(statestr != NULL);
+	PG_RETURN_TEXT_P(cstring_to_text(statestr));
 }
 
 /*
@@ -691,7 +681,7 @@ pg_promote(PG_FUNCTION_ARGS)
 	bool		wait = PG_GETARG_BOOL(0);
 	int			wait_seconds = PG_GETARG_INT32(1);
 	FILE	   *promote_file;
-	TimestampTz end_time;
+	int			i;
 
 	if (!RecoveryInProgress())
 		ereport(ERROR,
@@ -721,10 +711,10 @@ pg_promote(PG_FUNCTION_ARGS)
 	/* signal the postmaster */
 	if (kill(PostmasterPid, SIGUSR1) != 0)
 	{
+		ereport(WARNING,
+				(errmsg("failed to send signal to postmaster: %m")));
 		(void) unlink(PROMOTE_SIGNAL_FILE);
-		ereport(ERROR,
-				(errcode(ERRCODE_SYSTEM_ERROR),
-				 errmsg("failed to send signal to postmaster: %m")));
+		PG_RETURN_BOOL(false);
 	}
 
 	/* return immediately if waiting was not requested */
@@ -732,8 +722,8 @@ pg_promote(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(true);
 
 	/* wait for the amount of time wanted until promotion */
-	end_time = TimestampTzPlusSeconds(GetCurrentTimestamp(), wait_seconds);
-	while (GetCurrentTimestamp() < end_time)
+#define WAITS_PER_SECOND 10
+	for (i = 0; i < WAITS_PER_SECOND * wait_seconds; i++)
 	{
 		int			rc;
 
@@ -746,7 +736,7 @@ pg_promote(PG_FUNCTION_ARGS)
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   100L,
+					   1000L / WAITS_PER_SECOND,
 					   WAIT_EVENT_PROMOTE);
 
 		/*
@@ -754,10 +744,7 @@ pg_promote(PG_FUNCTION_ARGS)
 		 * necessity for manual cleanup of all postmaster children.
 		 */
 		if (rc & WL_POSTMASTER_DEATH)
-			ereport(FATAL,
-					(errcode(ERRCODE_ADMIN_SHUTDOWN),
-					 errmsg("terminating connection due to unexpected postmaster exit"),
-					 errcontext("while waiting on promotion")));
+			PG_RETURN_BOOL(false);
 	}
 
 	ereport(WARNING,
@@ -766,95 +753,4 @@ pg_promote(PG_FUNCTION_ARGS)
 						   wait_seconds,
 						   wait_seconds)));
 	PG_RETURN_BOOL(false);
-}
-
-/*
- * pg_stat_get_recovery - returns information about WAL recovery state
- *
- * Returns NULL when not in recovery or when the caller lacks
- * pg_read_all_stats privileges; one row otherwise.
- */
-Datum
-pg_stat_get_recovery(PG_FUNCTION_ARGS)
-{
-	TupleDesc	tupdesc;
-	Datum	   *values;
-	bool	   *nulls;
-
-	/* Local copies of shared state */
-	bool		promote_triggered;
-	XLogRecPtr	last_replayed_read_lsn;
-	XLogRecPtr	last_replayed_end_lsn;
-	TimeLineID	last_replayed_tli;
-	XLogRecPtr	replay_end_lsn;
-	TimeLineID	replay_end_tli;
-	TimestampTz recovery_last_xact_time;
-	TimestampTz current_chunk_start_time;
-	RecoveryPauseState pause_state;
-
-	if (!RecoveryInProgress())
-		PG_RETURN_NULL();
-
-	if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
-		PG_RETURN_NULL();
-
-	/* Take a lock to ensure value consistency */
-	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	promote_triggered = XLogRecoveryCtl->SharedPromoteIsTriggered;
-	last_replayed_read_lsn = XLogRecoveryCtl->lastReplayedReadRecPtr;
-	last_replayed_end_lsn = XLogRecoveryCtl->lastReplayedEndRecPtr;
-	last_replayed_tli = XLogRecoveryCtl->lastReplayedTLI;
-	replay_end_lsn = XLogRecoveryCtl->replayEndRecPtr;
-	replay_end_tli = XLogRecoveryCtl->replayEndTLI;
-	recovery_last_xact_time = XLogRecoveryCtl->recoveryLastXTime;
-	current_chunk_start_time = XLogRecoveryCtl->currentChunkStartTime;
-	pause_state = XLogRecoveryCtl->recoveryPauseState;
-	SpinLockRelease(&XLogRecoveryCtl->info_lck);
-
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	values = palloc0_array(Datum, tupdesc->natts);
-	nulls = palloc0_array(bool, tupdesc->natts);
-
-	values[0] = BoolGetDatum(promote_triggered);
-
-	if (XLogRecPtrIsValid(last_replayed_read_lsn))
-		values[1] = LSNGetDatum(last_replayed_read_lsn);
-	else
-		nulls[1] = true;
-
-	if (XLogRecPtrIsValid(last_replayed_end_lsn))
-		values[2] = LSNGetDatum(last_replayed_end_lsn);
-	else
-		nulls[2] = true;
-
-	if (XLogRecPtrIsValid(last_replayed_end_lsn))
-		values[3] = Int32GetDatum(last_replayed_tli);
-	else
-		nulls[3] = true;
-
-	if (XLogRecPtrIsValid(replay_end_lsn))
-		values[4] = LSNGetDatum(replay_end_lsn);
-	else
-		nulls[4] = true;
-
-	if (XLogRecPtrIsValid(replay_end_lsn))
-		values[5] = Int32GetDatum(replay_end_tli);
-	else
-		nulls[5] = true;
-
-	if (recovery_last_xact_time != 0)
-		values[6] = TimestampTzGetDatum(recovery_last_xact_time);
-	else
-		nulls[6] = true;
-
-	if (current_chunk_start_time != 0)
-		values[7] = TimestampTzGetDatum(current_chunk_start_time);
-	else
-		nulls[7] = true;
-
-	values[8] = CStringGetTextDatum(GetRecoveryPauseStateString(pause_state));
-
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

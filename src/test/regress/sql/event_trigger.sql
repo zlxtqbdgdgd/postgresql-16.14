@@ -143,21 +143,6 @@ create user mapping for regress_evt_user server useless_server;
 alter default privileges for role regress_evt_user
  revoke delete on tables from regress_evt_user;
 
--- DROP PROPERTY GRAPH should work with event trigger in place
-CREATE TABLE tv1 (a int PRIMARY KEY, b text);
-CREATE TABLE tv2 (i int PRIMARY KEY, j text);
-CREATE TABLE te1 (p int PRIMARY KEY, a int REFERENCES tv1(a), b int REFERENCES tv2(i), q text);
-
-CREATE PROPERTY GRAPH gx
-	VERTEX TABLES (
-		tv1 LABEL l1 PROPERTIES (b AS p1),
-		tv2 LABEL l2 PROPERTIES (j AS p1))
-  EDGE TABLES (te1 SOURCE tv1 DESTINATION tv2 LABEL e1 PROPERTIES (q as p1));
-
-ALTER PROPERTY GRAPH gx ALTER EDGE TABLE te1 ALTER LABEL e1 DROP PROPERTIES (p1);
-DROP PROPERTY GRAPH gx;
-DROP TABLE tv1, tv2, te1;
-
 -- alter owner to non-superuser should fail
 alter event trigger regress_event_trigger owner to regress_evt_user;
 
@@ -339,12 +324,7 @@ CREATE SCHEMA evttrig
 	CREATE TABLE one (col_a SERIAL PRIMARY KEY, col_b text DEFAULT 'forty two', col_c SERIAL)
 	CREATE INDEX one_idx ON one (col_b)
 	CREATE TABLE two (col_c INTEGER CHECK (col_c > 0) REFERENCES one DEFAULT 42)
-	CREATE TABLE id (col_d int NOT NULL GENERATED ALWAYS AS IDENTITY)
-	CREATE VIEW one_view AS SELECT * FROM two;
-
--- View with column additions
-CREATE OR REPLACE VIEW evttrig.one_view AS SELECT * FROM evttrig.two, evttrig.id;
-DROP VIEW evttrig.one_view;
+	CREATE TABLE id (col_d int NOT NULL GENERATED ALWAYS AS IDENTITY);
 
 -- Partitioned tables with a partitioned index
 CREATE TABLE evttrig.parted (
@@ -491,96 +471,6 @@ drop table rewriteme;
 drop event trigger no_rewrite_allowed;
 drop function test_evtrig_no_rewrite();
 
--- Tests for REINDEX
-CREATE OR REPLACE FUNCTION reindex_start_command()
-RETURNS event_trigger AS $$
-BEGIN
-    RAISE NOTICE 'REINDEX START: % %', tg_event, tg_tag;
-END;
-$$ LANGUAGE plpgsql;
-CREATE EVENT TRIGGER regress_reindex_start ON ddl_command_start
-    WHEN TAG IN ('REINDEX')
-    EXECUTE PROCEDURE reindex_start_command();
-CREATE FUNCTION reindex_end_command()
-RETURNS event_trigger AS $$
-DECLARE
-    obj record;
-BEGIN
-    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
-    LOOP
-        RAISE NOTICE 'REINDEX END: command_tag=% type=% identity=%',
-	    obj.command_tag, obj.object_type, obj.object_identity;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-CREATE EVENT TRIGGER regress_reindex_end ON ddl_command_end
-    WHEN TAG IN ('REINDEX')
-    EXECUTE PROCEDURE reindex_end_command();
--- Extra event to force the use of a snapshot.
-CREATE FUNCTION reindex_end_command_snap() RETURNS EVENT_TRIGGER
-    AS $$ BEGIN PERFORM 1; END $$ LANGUAGE plpgsql;
-CREATE EVENT TRIGGER regress_reindex_end_snap ON ddl_command_end
-    EXECUTE FUNCTION reindex_end_command_snap();
-
--- With simple relation
-CREATE TABLE concur_reindex_tab (c1 int);
-CREATE INDEX concur_reindex_ind ON concur_reindex_tab (c1);
--- Both start and end triggers enabled.
-REINDEX INDEX concur_reindex_ind;
-REINDEX TABLE concur_reindex_tab;
-REINDEX INDEX CONCURRENTLY concur_reindex_ind;
-REINDEX TABLE CONCURRENTLY concur_reindex_tab;
--- with start trigger disabled.
-ALTER EVENT TRIGGER regress_reindex_start DISABLE;
-REINDEX INDEX concur_reindex_ind;
-REINDEX INDEX CONCURRENTLY concur_reindex_ind;
--- without an index
-DROP INDEX concur_reindex_ind;
-REINDEX TABLE concur_reindex_tab;
-REINDEX TABLE CONCURRENTLY concur_reindex_tab;
-
--- With a Schema
-CREATE SCHEMA concur_reindex_schema;
--- No indexes
-REINDEX SCHEMA concur_reindex_schema;
-REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
-CREATE TABLE concur_reindex_schema.tab (a int);
-CREATE INDEX ind ON concur_reindex_schema.tab (a);
--- One index reported
-REINDEX SCHEMA concur_reindex_schema;
-REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
--- One table on schema but no indexes
-DROP INDEX concur_reindex_schema.ind;
-REINDEX SCHEMA concur_reindex_schema;
-REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
-DROP SCHEMA concur_reindex_schema CASCADE;
-
--- With a partitioned table, and nothing else.
-CREATE TABLE concur_reindex_part (id int) PARTITION BY RANGE (id);
-REINDEX TABLE concur_reindex_part;
-REINDEX TABLE CONCURRENTLY concur_reindex_part;
--- Partition that would be reindexed, still nothing.
-CREATE TABLE concur_reindex_child PARTITION OF concur_reindex_part
-  FOR VALUES FROM (0) TO (10);
-REINDEX TABLE concur_reindex_part;
-REINDEX TABLE CONCURRENTLY concur_reindex_part;
--- Now add some indexes.
-CREATE INDEX concur_reindex_partidx ON concur_reindex_part (id);
-REINDEX INDEX concur_reindex_partidx;
-REINDEX INDEX CONCURRENTLY concur_reindex_partidx;
-REINDEX TABLE concur_reindex_part;
-REINDEX TABLE CONCURRENTLY concur_reindex_part;
-DROP TABLE concur_reindex_part;
-
--- Clean up
-DROP EVENT TRIGGER regress_reindex_start;
-DROP EVENT TRIGGER regress_reindex_end;
-DROP EVENT TRIGGER regress_reindex_end_snap;
-DROP FUNCTION reindex_end_command();
-DROP FUNCTION reindex_end_command_snap();
-DROP FUNCTION reindex_start_command();
-DROP TABLE concur_reindex_tab;
-
 -- test Row Security Event Trigger
 RESET SESSION AUTHORIZATION;
 CREATE TABLE event_trigger_test (a integer, b text);
@@ -634,27 +524,3 @@ SELECT
 DROP EVENT TRIGGER start_rls_command;
 DROP EVENT TRIGGER end_rls_command;
 DROP EVENT TRIGGER sql_drop_command;
-
--- Check the GUC for disabling event triggers
-CREATE FUNCTION test_event_trigger_guc() RETURNS event_trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-	obj record;
-BEGIN
-	FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
-	LOOP
-		RAISE NOTICE '% dropped %', tg_tag, obj.object_type;
-	END LOOP;
-END;
-$$;
-CREATE EVENT TRIGGER test_event_trigger_guc
-	ON sql_drop
-	WHEN TAG IN ('DROP POLICY') EXECUTE FUNCTION test_event_trigger_guc();
-
-SET event_triggers = 'on';
-CREATE POLICY pguc ON event_trigger_test USING (FALSE);
-DROP POLICY pguc ON event_trigger_test;
-
-CREATE POLICY pguc ON event_trigger_test USING (FALSE);
-SET event_triggers = 'off';
-DROP POLICY pguc ON event_trigger_test;

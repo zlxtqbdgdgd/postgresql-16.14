@@ -3,7 +3,7 @@
  * hashutil.c
  *	  Utility code for Postgres hash implementation.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "port/pg_bitutils.h"
+#include "storage/buf_internals.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -316,7 +317,7 @@ _hash_get_indextuple_hashkey(IndexTuple itup)
  */
 bool
 _hash_convert_tuple(Relation index,
-					const Datum *user_values, const bool *user_isnull,
+					Datum *user_values, bool *user_isnull,
 					Datum *index_values, bool *index_isnull)
 {
 	uint32		hashkey;
@@ -593,17 +594,6 @@ _hash_kill_items(IndexScanDesc scan)
 
 			if (ItemPointerEquals(&ituple->t_tid, &currItem->heapTid))
 			{
-				if (!killedsomething)
-				{
-					/*
-					 * Use the hint bit infrastructure to check if we can
-					 * update the page while just holding a share lock. If we
-					 * are not allowed, there's no point continuing.
-					 */
-					if (!BufferBeginSetHintBits(buf))
-						goto unlock_page;
-				}
-
 				/* found the item */
 				ItemIdMarkDead(iid);
 				killedsomething = true;
@@ -621,11 +611,11 @@ _hash_kill_items(IndexScanDesc scan)
 	if (killedsomething)
 	{
 		opaque->hasho_flag |= LH_PAGE_HAS_DEAD_TUPLES;
-		BufferFinishSetHintBits(buf, true, true);
+		MarkBufferDirtyHint(buf, true);
 	}
 
-unlock_page:
-	if (havePin)
+	if (so->hashso_bucket_buf == so->currPos.buf ||
+		havePin)
 		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
 	else
 		_hash_relbuf(rel, buf);

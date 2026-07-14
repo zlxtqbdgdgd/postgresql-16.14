@@ -3,7 +3,7 @@
  * findtimezone.c
  *	  Functions for determining the default timezone to use.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/initdb/findtimezone.c
@@ -96,10 +96,23 @@ pg_load_tz(const char *name)
 		return NULL;			/* not going to fit */
 
 	/*
-	 * Let the IANA tzdb code interpret the time zone name.
+	 * "GMT" is always sent to tzparse(); see comments for pg_tzset().
 	 */
-	if (!pg_tzload(name, NULL, &tz.state))
-		return NULL;			/* unknown timezone */
+	if (strcmp(name, "GMT") == 0)
+	{
+		if (!tzparse(name, &tz.state, true))
+		{
+			/* This really, really should not happen ... */
+			return NULL;
+		}
+	}
+	else if (tzload(name, NULL, &tz.state, true) != 0)
+	{
+		if (name[0] == ':' || !tzparse(name, &tz.state, false))
+		{
+			return NULL;		/* unknown timezone */
+		}
+	}
 
 	strcpy(tz.TZname, name);
 
@@ -667,8 +680,8 @@ scan_available_timezones(char *tzdir, char *tzdirsub, struct tztry *tt,
 		if (stat(tzdir, &statbuf) != 0)
 		{
 #ifdef DEBUG_IDENTIFY_TIMEZONE
-			fprintf(stderr, "could not stat \"%s\": %m\n",
-					tzdir);
+			fprintf(stderr, "could not stat \"%s\": %s\n",
+					tzdir, strerror(errno));
 #endif
 			tzdir[tzdir_orig_len] = '\0';
 			continue;

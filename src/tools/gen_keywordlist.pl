@@ -21,7 +21,7 @@
 # Note that case folding works correctly only for all-ASCII keywords!
 #
 #
-# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/tools/gen_keywordlist.pl
@@ -29,7 +29,7 @@
 #----------------------------------------------------------------------
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use Getopt::Long;
 
 use FindBin;
@@ -71,7 +71,7 @@ printf $kwdef <<EOM, $base_filename, uc $base_filename, uc $base_filename;
  * %s.h
  *    List of keywords represented as a ScanKeywordList.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -169,16 +169,7 @@ printf $kwdef qq|static %s\n|, $f;
 
 # Emit the struct that wraps all this lookup info into one variable.
 
-if ($extern)
-{
-	# redundant declaration to silence -Wmissing-variable-declarations
-	printf $kwdef "extern PGDLLIMPORT const ScanKeywordList %s;\n\n",
-	  $varname;
-}
-else
-{
-	printf $kwdef "static ";
-}
+printf $kwdef "static " if !$extern;
 printf $kwdef "const ScanKeywordList %s = {\n", $varname;
 printf $kwdef qq|\t%s_kw_string,\n|, $varname;
 printf $kwdef qq|\t%s_kw_offsets,\n|, $varname;

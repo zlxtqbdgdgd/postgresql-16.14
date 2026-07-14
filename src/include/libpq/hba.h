@@ -11,7 +11,7 @@
 #ifndef HBA_H
 #define HBA_H
 
-#include "libpq/pqcomm.h"		/* needed for NetBSD */
+#include "libpq/pqcomm.h"	/* pgrminclude ignore */	/* needed for NetBSD */
 #include "nodes/pg_list.h"
 #include "regex/regex.h"
 
@@ -37,9 +37,9 @@ typedef enum UserAuth
 	uaBSD,
 	uaLDAP,
 	uaCert,
-	uaPeer,
-	uaOAuth,
-#define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
+	uaRADIUS,
+	uaPeer
+#define USER_AUTH_LAST uaPeer	/* Must be last value of this enum */
 } UserAuth;
 
 /*
@@ -51,7 +51,7 @@ typedef enum IPCompareMethod
 	ipCmpMask,
 	ipCmpSameHost,
 	ipCmpSameNet,
-	ipCmpAll,
+	ipCmpAll
 } IPCompareMethod;
 
 typedef enum ConnType
@@ -68,13 +68,13 @@ typedef enum ClientCertMode
 {
 	clientCertOff,
 	clientCertCA,
-	clientCertFull,
+	clientCertFull
 } ClientCertMode;
 
 typedef enum ClientCertName
 {
 	clientCertCN,
-	clientCertDN,
+	clientCertDN
 } ClientCertName;
 
 /*
@@ -127,12 +127,14 @@ typedef struct HbaLine
 	bool		include_realm;
 	bool		compat_realm;
 	bool		upn_username;
-	char	   *oauth_issuer;
-	char	   *oauth_scope;
-	char	   *oauth_validator;
-	bool		oauth_skip_usermap;
-	List	   *oauth_opt_keys;
-	List	   *oauth_opt_vals;
+	List	   *radiusservers;
+	char	   *radiusservers_s;
+	List	   *radiussecrets;
+	char	   *radiussecrets_s;
+	List	   *radiusidentifiers;
+	char	   *radiusidentifiers_s;
+	List	   *radiusports;
+	char	   *radiusports_s;
 } HbaLine;
 
 typedef struct IdentLine
@@ -143,27 +145,6 @@ typedef struct IdentLine
 	AuthToken  *system_user;
 	AuthToken  *pg_user;
 } IdentLine;
-
-typedef struct HostsLine
-{
-	int			linenumber;
-
-	char	   *sourcefile;
-	char	   *rawline;
-
-	/* Required fields */
-	List	   *hostnames;
-	char	   *ssl_key;
-	char	   *ssl_cert;
-
-	/* Optional fields */
-	char	   *ssl_ca;
-	char	   *ssl_passphrase_cmd;
-	bool		ssl_passphrase_reload;
-
-	/* Internal bookkeeping */
-	void	   *ssl_ctx;		/* associated SSL_CTX* for the above settings */
-} HostsLine;
 
 /*
  * TokenizedAuthLine represents one line lexed from an authentication
@@ -183,18 +164,19 @@ typedef struct TokenizedAuthLine
 	char	   *err_msg;		/* Error message if any */
 } TokenizedAuthLine;
 
-/* avoid including libpq/libpq-be.h here */
-typedef struct Port Port;
+/* kluge to avoid including libpq/libpq-be.h here */
+typedef struct Port hbaPort;
 
 extern bool load_hba(void);
 extern bool load_ident(void);
 extern const char *hba_authname(UserAuth auth_method);
-extern void hba_getauthmethod(Port *port);
+extern void hba_getauthmethod(hbaPort *port);
 extern int	check_usermap(const char *usermap_name,
 						  const char *pg_user, const char *system_user,
 						  bool case_insensitive);
 extern HbaLine *parse_hba_line(TokenizedAuthLine *tok_line, int elevel);
 extern IdentLine *parse_ident_line(TokenizedAuthLine *tok_line, int elevel);
+extern bool pg_isblank(const char c);
 extern FILE *open_auth_file(const char *filename, int elevel, int depth,
 							char **err_msg);
 extern void free_auth_file(FILE *file, int depth);

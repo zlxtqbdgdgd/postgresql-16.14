@@ -3,7 +3,7 @@
  * basebackup_zstd.c
  *	  Basebackup sink implementing zstd compression.
  *
- * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_zstd.c
@@ -34,7 +34,7 @@ typedef struct bbsink_zstd
 
 static void bbsink_zstd_begin_backup(bbsink *sink);
 static void bbsink_zstd_begin_archive(bbsink *sink, const char *archive_name);
-static void bbsink_zstd_archive_contents(bbsink *sink, size_t len);
+static void bbsink_zstd_archive_contents(bbsink *sink, size_t avail_in);
 static void bbsink_zstd_manifest_contents(bbsink *sink, size_t len);
 static void bbsink_zstd_end_archive(bbsink *sink);
 static void bbsink_zstd_cleanup(bbsink *sink);
@@ -70,7 +70,7 @@ bbsink_zstd_new(bbsink *next, pg_compress_specification *compress)
 
 	Assert(next != NULL);
 
-	sink = palloc0_object(bbsink_zstd);
+	sink = palloc0(sizeof(bbsink_zstd));
 	*((const bbsink_ops **) &sink->base.bbs_ops) = &bbsink_zstd_ops;
 	sink->base.bbs_next = next;
 	sink->compress = compress;

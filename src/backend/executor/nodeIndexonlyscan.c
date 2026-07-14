@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,14 +36,14 @@
 #include "access/tupdesc.h"
 #include "access/visibilitymap.h"
 #include "catalog/pg_type.h"
-#include "executor/executor.h"
-#include "executor/instrument.h"
+#include "executor/execdebug.h"
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 
@@ -93,11 +93,8 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->ioss_RelationDesc,
 								   estate->es_snapshot,
-								   node->ioss_Instrument,
 								   node->ioss_NumScanKeys,
-								   node->ioss_NumOrderByKeys,
-								   ScanRelIsReadOnly(&node->ss) ?
-								   SO_HINT_REL_READ_ONLY : SO_NONE);
+								   node->ioss_NumOrderByKeys);
 
 		node->ioss_ScanDesc = scandesc;
 
@@ -418,25 +415,20 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
 	}
 
 	/*
-	 * When ending a parallel worker, copy the statistics gathered by the
-	 * worker back into shared memory so that it can be picked up by the main
-	 * process to report in EXPLAIN ANALYZE
+	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
 	 */
-	if (node->ioss_SharedInfo != NULL && IsParallelWorker())
-	{
-		IndexScanInstrumentation *winstrument;
+#ifdef NOT_USED
+	ExecFreeExprContext(&node->ss.ps);
+	if (node->ioss_RuntimeContext)
+		FreeExprContext(node->ioss_RuntimeContext, true);
+#endif
 
-		Assert(ParallelWorkerNumber < node->ioss_SharedInfo->num_workers);
-		winstrument = &node->ioss_SharedInfo->winstrument[ParallelWorkerNumber];
-
-		/*
-		 * We have to accumulate the stats rather than performing a memcpy.
-		 * When a Gather/GatherMerge node finishes it will perform planner
-		 * shutdown on the workers.  On rescan it will spin up new workers
-		 * which will have a new IndexOnlyScanState and zeroed stats.
-		 */
-		winstrument->nsearches += node->ioss_Instrument->nsearches;
-	}
+	/*
+	 * clear out tuple table slots
+	 */
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
 	 * close the index relation (no-op if we didn't open it)
@@ -570,8 +562,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 */
 	tupDesc = ExecTypeFromTL(node->indextlist);
 	ExecInitScanTupleSlot(estate, &indexstate->ss, tupDesc,
-						  &TTSOpsVirtual,
-						  0);
+						  &TTSOpsVirtual);
 
 	/*
 	 * We need another slot, in a format that's suitable for the table AM, for
@@ -580,7 +571,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	indexstate->ioss_TableSlot =
 		ExecAllocTableSlot(&estate->es_tupleTable,
 						   RelationGetDescr(currentRelation),
-						   table_slot_callbacks(currentRelation), 0);
+						   table_slot_callbacks(currentRelation));
 
 	/*
 	 * Initialize result type and projection info.  The node's targetlist will
@@ -607,10 +598,6 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return indexstate;
-
-	/* Set up instrumentation of index-only scans if requested */
-	if (estate->es_instrument)
-		indexstate->ioss_Instrument = palloc0_object(IndexScanInstrumentation);
 
 	/* Open the index relation. */
 	lockmode = exec_rt_fetch(node->scan.scanrelid, estate)->rellockmode;
@@ -688,7 +675,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	/* First, count the number of such index keys */
 	for (int attnum = 0; attnum < indnkeyatts; attnum++)
 	{
-		if (TupleDescAttr(indexRelation->rd_att, attnum)->atttypid == CSTRINGOID &&
+		if (indexRelation->rd_att->attrs[attnum].atttypid == CSTRINGOID &&
 			indexRelation->rd_opcintype[attnum] == NAMEOID)
 			namecount++;
 	}
@@ -701,11 +688,12 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 		 * Now create an array to mark the attribute numbers of the keys that
 		 * need to be converted from cstring to name.
 		 */
-		indexstate->ioss_NameCStringAttNums = palloc_array(AttrNumber, namecount);
+		indexstate->ioss_NameCStringAttNums = (AttrNumber *)
+									palloc(sizeof(AttrNumber) * namecount);
 
 		for (int attnum = 0; attnum < indnkeyatts; attnum++)
 		{
-			if (TupleDescAttr(indexRelation->rd_att, attnum)->atttypid == CSTRINGOID &&
+			if (indexRelation->rd_att->attrs[attnum].atttypid == CSTRINGOID &&
 				indexRelation->rd_opcintype[attnum] == NAMEOID)
 				indexstate->ioss_NameCStringAttNums[idx++] = (AttrNumber) attnum;
 		}
@@ -738,8 +726,6 @@ ExecIndexOnlyScanEstimate(IndexOnlyScanState *node,
 	EState	   *estate = node->ss.ps.state;
 
 	node->ioss_PscanLen = index_parallelscan_estimate(node->ioss_RelationDesc,
-													  node->ioss_NumScanKeys,
-													  node->ioss_NumOrderByKeys,
 													  estate->es_snapshot);
 	shm_toc_estimate_chunk(&pcxt->estimator, node->ioss_PscanLen);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
@@ -764,16 +750,12 @@ ExecIndexOnlyScanInitializeDSM(IndexOnlyScanState *node,
 								  estate->es_snapshot,
 								  piscan);
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, piscan);
-
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
-								 node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
-								 piscan,
-								 ScanRelIsReadOnly(&node->ss) ?
-								 SO_HINT_REL_READ_ONLY : SO_NONE);
+								 piscan);
 	node->ioss_ScanDesc->xs_want_itup = true;
 	node->ioss_VMBuffer = InvalidBuffer;
 
@@ -797,7 +779,6 @@ void
 ExecIndexOnlyScanReInitializeDSM(IndexOnlyScanState *node,
 								 ParallelContext *pcxt)
 {
-	Assert(node->ss.ps.plan->parallel_aware);
 	index_parallelrescan(node->ioss_ScanDesc);
 }
 
@@ -814,16 +795,12 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 	ParallelIndexScanDesc piscan;
 
 	piscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
-
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
-								 node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
-								 piscan,
-								 ScanRelIsReadOnly(&node->ss) ?
-								 SO_HINT_REL_READ_ONLY : SO_NONE);
+								 piscan);
 	node->ioss_ScanDesc->xs_want_itup = true;
 
 	/*
@@ -834,93 +811,4 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 		index_rescan(node->ioss_ScanDesc,
 					 node->ioss_ScanKeys, node->ioss_NumScanKeys,
 					 node->ioss_OrderByKeys, node->ioss_NumOrderByKeys);
-}
-
-/*
- * Compute the amount of space we'll need for the shared instrumentation and
- * inform pcxt->estimator.
- */
-void
-ExecIndexOnlyScanInstrumentEstimate(IndexOnlyScanState *node,
-									ParallelContext *pcxt)
-{
-	Size		size;
-
-	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
-		return;
-
-	/*
-	 * This size calculation is trivial enough that we don't bother saving it
-	 * in the IndexOnlyScanState. We'll recalculate the needed size in
-	 * ExecIndexOnlyScanInstrumentInitDSM().
-	 */
-	size = add_size(offsetof(SharedIndexScanInstrumentation, winstrument),
-					mul_size(pcxt->nworkers, sizeof(IndexScanInstrumentation)));
-	shm_toc_estimate_chunk(&pcxt->estimator, size);
-	shm_toc_estimate_keys(&pcxt->estimator, 1);
-}
-
-/*
- * Set up parallel index-only scan instrumentation.
- */
-void
-ExecIndexOnlyScanInstrumentInitDSM(IndexOnlyScanState *node,
-								   ParallelContext *pcxt)
-{
-	Size		size;
-
-	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
-		return;
-
-	size = add_size(offsetof(SharedIndexScanInstrumentation, winstrument),
-					mul_size(pcxt->nworkers, sizeof(IndexScanInstrumentation)));
-	node->ioss_SharedInfo =
-		(SharedIndexScanInstrumentation *) shm_toc_allocate(pcxt->toc, size);
-
-	/* Each per-worker area must start out as zeroes */
-	memset(node->ioss_SharedInfo, 0, size);
-	node->ioss_SharedInfo->num_workers = pcxt->nworkers;
-	shm_toc_insert(pcxt->toc,
-				   node->ss.ps.plan->plan_node_id +
-				   PARALLEL_KEY_SCAN_INSTRUMENT_OFFSET,
-				   node->ioss_SharedInfo);
-}
-
-/*
- * Look up and save the location of the shared instrumentation.
- */
-void
-ExecIndexOnlyScanInstrumentInitWorker(IndexOnlyScanState *node,
-									  ParallelWorkerContext *pwcxt)
-{
-	if (!node->ss.ps.instrument)
-		return;
-
-	node->ioss_SharedInfo = (SharedIndexScanInstrumentation *)
-		shm_toc_lookup(pwcxt->toc,
-					   node->ss.ps.plan->plan_node_id +
-					   PARALLEL_KEY_SCAN_INSTRUMENT_OFFSET,
-					   false);
-}
-
-/* ----------------------------------------------------------------
- *		ExecIndexOnlyScanRetrieveInstrumentation
- *
- *		Transfer index-only scan statistics from DSM to private memory.
- * ----------------------------------------------------------------
- */
-void
-ExecIndexOnlyScanRetrieveInstrumentation(IndexOnlyScanState *node)
-{
-	SharedIndexScanInstrumentation *SharedInfo = node->ioss_SharedInfo;
-	size_t		size;
-
-	if (SharedInfo == NULL)
-		return;
-
-	/* Create a copy of SharedInfo in backend-local memory */
-	size = offsetof(SharedIndexScanInstrumentation, winstrument) +
-		SharedInfo->num_workers * sizeof(IndexScanInstrumentation);
-	node->ioss_SharedInfo = palloc(size);
-	memcpy(node->ioss_SharedInfo, SharedInfo, size);
 }

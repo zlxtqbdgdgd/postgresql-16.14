@@ -66,17 +66,6 @@ ALTER TABLE has_volatile ADD col2 int DEFAULT 1;
 ALTER TABLE has_volatile ADD col3 timestamptz DEFAULT current_timestamp;
 ALTER TABLE has_volatile ADD col4 int DEFAULT (random() * 10000)::int;
 
--- virtual generated columns don't need a rewrite
-ALTER TABLE has_volatile ADD col5 int GENERATED ALWAYS AS (tableoid::int + col2) VIRTUAL;
-ALTER TABLE has_volatile ALTER COLUMN col5 TYPE float8;
-ALTER TABLE has_volatile ALTER COLUMN col5 TYPE numeric;
-ALTER TABLE has_volatile ALTER COLUMN col5 TYPE numeric;
--- here, we do need a rewrite
-ALTER TABLE has_volatile ALTER COLUMN col1 SET DATA TYPE float8,
-  ADD COLUMN col6 float8 GENERATED ALWAYS AS (col1 * 4) VIRTUAL;
--- stored generated columns need a rewrite
-ALTER TABLE has_volatile ADD col7 int GENERATED ALWAYS AS (55) stored;
-
 
 
 -- Test a large sample of different datatypes
@@ -250,7 +239,7 @@ DROP TABLE T;
 
 -- Test domains with default value for table rewrite.
 CREATE DOMAIN domain1 AS int DEFAULT 11;  -- constant
-CREATE DOMAIN domain2 AS int DEFAULT random(min=>10, max=>100);  -- volatile
+CREATE DOMAIN domain2 AS int DEFAULT 10 + (random() * 10)::int;  -- volatile
 CREATE DOMAIN domain3 AS text DEFAULT foo(4);  -- stable
 CREATE DOMAIN domain4 AS text[]
   DEFAULT ('{"This", "is", "' || foo(4) || '","the", "real", "world"}')::TEXT[];
@@ -324,7 +313,7 @@ SELECT attname, atthasmissing, attmissingval FROM pg_attribute
 DROP TABLE T;
 DROP FUNCTION foolme(timestamptz);
 
--- Simple queries
+-- Simple querie
 CREATE TABLE T (pk INT NOT NULL PRIMARY KEY);
 
 SELECT set('t');
@@ -601,22 +590,6 @@ SELECT count(*)
   FROM pg_attribute
   WHERE attrelid = 'ft1'::regclass AND
     (attmissingval IS NOT NULL OR atthasmissing);
-
--- Verify that table-rewriting maintenance commands preserve attmissingval
--- columns.
-CREATE TABLE t (id int PRIMARY KEY);
-INSERT INTO t SELECT generate_series(1, 3);
-ALTER TABLE t ADD COLUMN a int DEFAULT 42;
-ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT 7 CHECK (b > 0);
-VACUUM FULL t;
-SELECT * FROM t ORDER BY id;
-ALTER TABLE t ADD COLUMN c text DEFAULT 'hello';
-CLUSTER t USING t_pkey;
-SELECT * FROM t ORDER BY id;
-ALTER TABLE t ADD COLUMN d int DEFAULT 99;
-REPACK t;
-SELECT * FROM t ORDER BY id;
-DROP TABLE t;
 
 -- cleanup
 DROP FOREIGN TABLE ft1;

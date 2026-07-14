@@ -17,10 +17,7 @@
 #include "utils/array.h"
 #include "utils/float.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "cube",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /*
  * Taken from the intarray contrib header
@@ -29,8 +26,8 @@ PG_MODULE_MAGIC_EXT(
 #define ARRNELEMS(x)  ArrayGetNItems( ARR_NDIM(x), ARR_DIMS(x))
 
 /*
- * Input/Output routines
- */
+** Input/Output routines
+*/
 PG_FUNCTION_INFO_V1(cube_in);
 PG_FUNCTION_INFO_V1(cube_a_f8_f8);
 PG_FUNCTION_INFO_V1(cube_a_f8);
@@ -49,8 +46,8 @@ PG_FUNCTION_INFO_V1(cube_coord_llur);
 PG_FUNCTION_INFO_V1(cube_subset);
 
 /*
- * GiST support methods
- */
+** GiST support methods
+*/
 
 PG_FUNCTION_INFO_V1(g_cube_consistent);
 PG_FUNCTION_INFO_V1(g_cube_compress);
@@ -62,8 +59,8 @@ PG_FUNCTION_INFO_V1(g_cube_same);
 PG_FUNCTION_INFO_V1(g_cube_distance);
 
 /*
- * B-tree support functions
- */
+** B-tree support functions
+*/
 PG_FUNCTION_INFO_V1(cube_eq);
 PG_FUNCTION_INFO_V1(cube_ne);
 PG_FUNCTION_INFO_V1(cube_lt);
@@ -73,8 +70,8 @@ PG_FUNCTION_INFO_V1(cube_ge);
 PG_FUNCTION_INFO_V1(cube_cmp);
 
 /*
- * R-tree support functions
- */
+** R-tree support functions
+*/
 
 PG_FUNCTION_INFO_V1(cube_contains);
 PG_FUNCTION_INFO_V1(cube_contained);
@@ -84,8 +81,8 @@ PG_FUNCTION_INFO_V1(cube_inter);
 PG_FUNCTION_INFO_V1(cube_size);
 
 /*
- * miscellaneous
- */
+** miscellaneous
+*/
 PG_FUNCTION_INFO_V1(distance_taxicab);
 PG_FUNCTION_INFO_V1(cube_distance);
 PG_FUNCTION_INFO_V1(distance_chebyshev);
@@ -93,8 +90,8 @@ PG_FUNCTION_INFO_V1(cube_is_point);
 PG_FUNCTION_INFO_V1(cube_enlarge);
 
 /*
- * For internal use only
- */
+** For internal use only
+*/
 int32		cube_cmp_v0(NDBOX *a, NDBOX *b);
 bool		cube_contains_v0(NDBOX *a, NDBOX *b);
 bool		cube_overlap_v0(NDBOX *a, NDBOX *b);
@@ -105,8 +102,8 @@ bool		g_cube_leaf_consistent(NDBOX *key, NDBOX *query, StrategyNumber strategy);
 bool		g_cube_internal_consistent(NDBOX *key, NDBOX *query, StrategyNumber strategy);
 
 /*
- * Auxiliary functions
- */
+** Auxiliary functions
+*/
 static double distance_1D(double a1, double a2, double b1, double b2);
 static bool cube_is_point_internal(NDBOX *cube);
 
@@ -123,22 +120,21 @@ cube_in(PG_FUNCTION_ARGS)
 	char	   *str = PG_GETARG_CSTRING(0);
 	NDBOX	   *result;
 	Size		scanbuflen;
-	yyscan_t	scanner;
 
-	cube_scanner_init(str, &scanbuflen, &scanner);
+	cube_scanner_init(str, &scanbuflen);
 
-	cube_yyparse(&result, scanbuflen, fcinfo->context, scanner);
+	cube_yyparse(&result, scanbuflen, fcinfo->context);
 
 	/* We might as well run this even on failure. */
-	cube_scanner_finish(scanner);
+	cube_scanner_finish();
 
 	PG_RETURN_NDBOX_P(result);
 }
 
 
 /*
- * Allows the construction of a cube from 2 float[]'s
- */
+** Allows the construction of a cube from 2 float[]'s
+*/
 Datum
 cube_a_f8_f8(PG_FUNCTION_ARGS)
 {
@@ -204,8 +200,8 @@ cube_a_f8_f8(PG_FUNCTION_ARGS)
 }
 
 /*
- * Allows the construction of a zero-volume cube from a float[]
- */
+** Allows the construction of a zero-volume cube from a float[]
+*/
 Datum
 cube_a_f8(PG_FUNCTION_ARGS)
 {
@@ -386,20 +382,19 @@ cube_recv(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /*
- * The GiST Consistent method for boxes
- * Should return false if for all data items x below entry,
- * the predicate x op query == false, where op is the oper
- * corresponding to strategy in the pg_amop table.
- */
+** The GiST Consistent method for boxes
+** Should return false if for all data items x below entry,
+** the predicate x op query == false, where op is the oper
+** corresponding to strategy in the pg_amop table.
+*/
 Datum
 g_cube_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	NDBOX	   *query = PG_GETARG_NDBOX_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-#ifdef NOT_USED
-	Oid			subtype = PG_GETARG_OID(3);
-#endif
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		res;
 
@@ -423,9 +418,9 @@ g_cube_consistent(PG_FUNCTION_ARGS)
 
 
 /*
- * The GiST Union method for boxes
- * returns the minimal bounding box that encloses all the entries in entryvec
- */
+** The GiST Union method for boxes
+** returns the minimal bounding box that encloses all the entries in entryvec
+*/
 Datum
 g_cube_union(PG_FUNCTION_ARGS)
 {
@@ -454,9 +449,9 @@ g_cube_union(PG_FUNCTION_ARGS)
 }
 
 /*
- * GiST Compress and Decompress methods for boxes
- * do not do anything.
- */
+** GiST Compress and Decompress methods for boxes
+** do not do anything.
+*/
 
 Datum
 g_cube_compress(PG_FUNCTION_ARGS)
@@ -472,7 +467,7 @@ g_cube_decompress(PG_FUNCTION_ARGS)
 
 	if (key != DatumGetNDBOXP(entry->key))
 	{
-		GISTENTRY  *retval = palloc_object(GISTENTRY);
+		GISTENTRY  *retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
@@ -484,9 +479,9 @@ g_cube_decompress(PG_FUNCTION_ARGS)
 
 
 /*
- * The GiST Penalty method for boxes
- * As in the R-tree paper, we use change in area as our penalty metric
- */
+** The GiST Penalty method for boxes
+** As in the R-tree paper, we use change in area as our penalty metric
+*/
 Datum
 g_cube_penalty(PG_FUNCTION_ARGS)
 {
@@ -509,9 +504,9 @@ g_cube_penalty(PG_FUNCTION_ARGS)
 
 
 /*
- * The GiST PickSplit method for boxes
- * We use Guttman's poly time split algorithm
- */
+** The GiST PickSplit method for boxes
+** We use Guttman's poly time split algorithm
+*/
 Datum
 g_cube_picksplit(PG_FUNCTION_ARGS)
 {
@@ -660,8 +655,8 @@ g_cube_picksplit(PG_FUNCTION_ARGS)
 }
 
 /*
- * Equality method
- */
+** Equality method
+*/
 Datum
 g_cube_same(PG_FUNCTION_ARGS)
 {
@@ -678,8 +673,8 @@ g_cube_same(PG_FUNCTION_ARGS)
 }
 
 /*
- * SUPPORT ROUTINES
- */
+** SUPPORT ROUTINES
+*/
 bool
 g_cube_leaf_consistent(NDBOX *key,
 					   NDBOX *query,
@@ -719,16 +714,16 @@ g_cube_internal_consistent(NDBOX *key,
 	switch (strategy)
 	{
 		case RTOverlapStrategyNumber:
-			retval = cube_overlap_v0(key, query);
+			retval = (bool) cube_overlap_v0(key, query);
 			break;
 		case RTSameStrategyNumber:
 		case RTContainsStrategyNumber:
 		case RTOldContainsStrategyNumber:
-			retval = cube_contains_v0(key, query);
+			retval = (bool) cube_contains_v0(key, query);
 			break;
 		case RTContainedByStrategyNumber:
 		case RTOldContainedByStrategyNumber:
-			retval = cube_overlap_v0(key, query);
+			retval = (bool) cube_overlap_v0(key, query);
 			break;
 		default:
 			retval = false;
@@ -936,10 +931,8 @@ rt_cube_size(NDBOX *a, double *size)
 	*size = result;
 }
 
-/*
- * make up a metric in which one box will be 'lower' than the other
- * -- this can be useful for sorting and to determine uniqueness
- */
+/* make up a metric in which one box will be 'lower' than the other
+   -- this can be useful for sorting and to determine uniqueness */
 int32
 cube_cmp_v0(NDBOX *a, NDBOX *b)
 {
@@ -1252,12 +1245,10 @@ cube_overlap(PG_FUNCTION_ARGS)
 
 
 /* Distance */
-/*
- * The distance is computed as a per axis sum of the squared distances
- * between 1D projections of the boxes onto Cartesian axes. Assuming zero
- * distance between overlapping projections, this metric coincides with the
- * "common sense" geometric distance
- */
+/* The distance is computed as a per axis sum of the squared distances
+   between 1D projections of the boxes onto Cartesian axes. Assuming zero
+   distance between overlapping projections, this metric coincides with the
+   "common sense" geometric distance */
 Datum
 cube_distance(PG_FUNCTION_ARGS)
 {
@@ -1821,10 +1812,8 @@ cube_f8_f8(PG_FUNCTION_ARGS)
 	PG_RETURN_NDBOX_P(result);
 }
 
-/*
- * Add a dimension to an existing cube with the same values for the new
- * coordinate
- */
+/* Add a dimension to an existing cube with the same values for the new
+   coordinate */
 Datum
 cube_c_f8(PG_FUNCTION_ARGS)
 {

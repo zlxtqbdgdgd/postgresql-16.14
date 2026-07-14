@@ -1,9 +1,7 @@
 #!/usr/bin/perl
 
-# Copyright (c) 2024-2026, PostgreSQL Global Development Group
-
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use Getopt::Long;
 
 my $outdir_path = '';
@@ -19,8 +17,6 @@ our @languages = qw(
   danish
   dutch
   english
-  esperanto
-  estonian
   finnish
   french
   german
@@ -33,7 +29,6 @@ our @languages = qw(
   lithuanian
   nepali
   norwegian
-  polish
   portuguese
   romanian
   russian

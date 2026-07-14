@@ -6,7 +6,7 @@
  *	   including date, and time.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/datetime.h
@@ -228,8 +228,7 @@ typedef struct DynamicZoneAbbrev
 } DynamicZoneAbbrev;
 
 
-/*
- * FMODULO()
+/* FMODULO()
  * Macro to replace modf(), which is broken on some platforms.
  * t = input and remainder
  * q = integer part
@@ -241,8 +240,7 @@ do { \
 	if ((q) != 0) (t) -= rint((q) * (u)); \
 } while(0)
 
-/*
- * TMODULO()
+/* TMODULO()
  * Like FMODULO(), but work on the timestamp datatype (now always int64).
  * We assume that int64 follows the C99 semantics for division (negative
  * quotients truncate towards zero).
@@ -349,11 +347,6 @@ extern int	DecodeUnits(int field, const char *lowtoken, int *val);
 
 extern int	DecodeTimezoneName(const char *tzname, int *offset, pg_tz **tz);
 extern pg_tz *DecodeTimezoneNameToTz(const char *tzname);
-
-extern int	DecodeTimezoneAbbrevPrefix(const char *str,
-									   int *offset, pg_tz **tz);
-
-extern void ClearTimeZoneAbbrevCache(void);
 
 extern int	j2day(int date);
 

@@ -2,7 +2,7 @@
  * SQL Information Schema
  * as defined in ISO/IEC 9075-11:2023
  *
- * Copyright (c) 2003-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2023, PostgreSQL Global Development Group
  *
  * src/backend/catalog/information_schema.sql
  *
@@ -43,8 +43,11 @@ SET search_path TO information_schema;
 CREATE FUNCTION _pg_expandarray(IN anyarray, OUT x anyelement, OUT n int)
     RETURNS SETOF RECORD
     LANGUAGE sql STRICT IMMUTABLE PARALLEL SAFE
-    ROWS 100 SUPPORT pg_catalog.array_unnest_support
-    AS 'SELECT * FROM pg_catalog.unnest($1) WITH ORDINALITY';
+    AS 'select $1[s],
+        s operator(pg_catalog.-) pg_catalog.array_lower($1,1) operator(pg_catalog.+) 1
+        from pg_catalog.generate_series(pg_catalog.array_lower($1,1),
+                                        pg_catalog.array_upper($1,1),
+                                        1) as g(s)';
 
 /* Given an index's OID and an underlying-table column number, return the
  * column's position in the index (NULL if not there) */
@@ -432,7 +435,8 @@ CREATE VIEW check_constraints AS
     SELECT CAST(current_database() AS sql_identifier) AS constraint_catalog,
            CAST(rs.nspname AS sql_identifier) AS constraint_schema,
            CAST(con.conname AS sql_identifier) AS constraint_name,
-           CAST(pg_get_expr(con.conbin, coalesce(c.oid, 0)) AS character_data) AS check_clause
+           CAST(substring(pg_get_constraintdef(con.oid) from 7) AS character_data)
+             AS check_clause
     FROM pg_constraint con
            LEFT OUTER JOIN pg_namespace rs ON (rs.oid = con.connamespace)
            LEFT OUTER JOIN pg_class c ON (c.oid = con.conrelid)
@@ -440,19 +444,22 @@ CREATE VIEW check_constraints AS
     WHERE pg_has_role(coalesce(c.relowner, t.typowner), 'USAGE')
       AND con.contype = 'c'
 
-    UNION ALL
+    UNION
     -- not-null constraints
-    SELECT current_database()::information_schema.sql_identifier AS constraint_catalog,
-           rs.nspname::information_schema.sql_identifier AS constraint_schema,
-           con.conname::information_schema.sql_identifier AS constraint_name,
-           pg_catalog.format('%s IS NOT NULL', coalesce(at.attname, 'VALUE'))::information_schema.character_data AS check_clause
-     FROM pg_constraint con
-            LEFT JOIN pg_namespace rs ON rs.oid = con.connamespace
-            LEFT JOIN pg_class c ON c.oid = con.conrelid
-            LEFT JOIN pg_type t ON t.oid = con.contypid
-            LEFT JOIN pg_attribute at ON (con.conrelid = at.attrelid AND con.conkey[1] = at.attnum)
-     WHERE pg_has_role(coalesce(c.relowner, t.typowner), 'USAGE'::text)
-       AND con.contype = 'n';
+
+    SELECT CAST(current_database() AS sql_identifier) AS constraint_catalog,
+           CAST(n.nspname AS sql_identifier) AS constraint_schema,
+           CAST(CAST(n.oid AS text) || '_' || CAST(r.oid AS text) || '_' || CAST(a.attnum AS text) || '_not_null' AS sql_identifier) AS constraint_name, -- XXX
+           CAST(a.attname || ' IS NOT NULL' AS character_data)
+             AS check_clause
+    FROM pg_namespace n, pg_class r, pg_attribute a
+    WHERE n.oid = r.relnamespace
+      AND r.oid = a.attrelid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attnotnull
+      AND r.relkind IN ('r', 'p')
+      AND pg_has_role(r.relowner, 'USAGE');
 
 GRANT SELECT ON check_constraints TO PUBLIC;
 
@@ -818,20 +825,6 @@ CREATE VIEW constraint_column_usage AS
             AND c.contype = 'c'
             AND r.relkind IN ('r', 'p')
             AND NOT a.attisdropped
-
-        UNION ALL
-
-        /* not-null constraints */
-        SELECT DISTINCT nr.nspname, r.relname, r.relowner, a.attname, nc.nspname, c.conname
-          FROM pg_namespace nr, pg_class r, pg_attribute a, pg_namespace nc, pg_constraint c
-          WHERE nr.oid = r.relnamespace
-            AND r.oid = a.attrelid
-            AND r.oid = c.conrelid
-            AND a.attnum = c.conkey[1]
-            AND c.connamespace = nc.oid
-            AND c.contype = 'n'
-            AND r.relkind in ('r', 'p')
-            AND not a.attisdropped
 
         UNION ALL
 
@@ -1835,7 +1828,6 @@ CREATE VIEW table_constraints AS
            CAST(r.relname AS sql_identifier) AS table_name,
            CAST(
              CASE c.contype WHEN 'c' THEN 'CHECK'
-                            WHEN 'n' THEN 'CHECK'
                             WHEN 'f' THEN 'FOREIGN KEY'
                             WHEN 'p' THEN 'PRIMARY KEY'
                             WHEN 'u' THEN 'UNIQUE' END
@@ -1844,7 +1836,7 @@ CREATE VIEW table_constraints AS
              AS is_deferrable,
            CAST(CASE WHEN c.condeferred THEN 'YES' ELSE 'NO' END AS yes_or_no)
              AS initially_deferred,
-           CAST(CASE WHEN c.conenforced THEN 'YES' ELSE 'NO' END AS yes_or_no) AS enforced,
+           CAST('YES' AS yes_or_no) AS enforced,
            CAST(CASE WHEN c.contype = 'u'
                      THEN CASE WHEN (SELECT NOT indnullsnotdistinct FROM pg_index WHERE indexrelid = conindid) THEN 'YES' ELSE 'NO' END
                      END
@@ -1858,6 +1850,38 @@ CREATE VIEW table_constraints AS
     WHERE nc.oid = c.connamespace AND nr.oid = r.relnamespace
           AND c.conrelid = r.oid
           AND c.contype NOT IN ('t', 'x')  -- ignore nonstandard constraints
+          AND r.relkind IN ('r', 'p')
+          AND (NOT pg_is_other_temp_schema(nr.oid))
+          AND (pg_has_role(r.relowner, 'USAGE')
+               -- SELECT privilege omitted, per SQL standard
+               OR has_table_privilege(r.oid, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+               OR has_any_column_privilege(r.oid, 'INSERT, UPDATE, REFERENCES') )
+
+    UNION ALL
+
+    -- not-null constraints
+
+    SELECT CAST(current_database() AS sql_identifier) AS constraint_catalog,
+           CAST(nr.nspname AS sql_identifier) AS constraint_schema,
+           CAST(CAST(nr.oid AS text) || '_' || CAST(r.oid AS text) || '_' || CAST(a.attnum AS text) || '_not_null' AS sql_identifier) AS constraint_name, -- XXX
+           CAST(current_database() AS sql_identifier) AS table_catalog,
+           CAST(nr.nspname AS sql_identifier) AS table_schema,
+           CAST(r.relname AS sql_identifier) AS table_name,
+           CAST('CHECK' AS character_data) AS constraint_type,
+           CAST('NO' AS yes_or_no) AS is_deferrable,
+           CAST('NO' AS yes_or_no) AS initially_deferred,
+           CAST('YES' AS yes_or_no) AS enforced,
+           CAST(NULL AS yes_or_no) AS nulls_distinct
+
+    FROM pg_namespace nr,
+         pg_class r,
+         pg_attribute a
+
+    WHERE nr.oid = r.relnamespace
+          AND r.oid = a.attrelid
+          AND a.attnotnull
+          AND a.attnum > 0
+          AND NOT a.attisdropped
           AND r.relkind IN ('r', 'p')
           AND (NOT pg_is_other_temp_schema(nr.oid))
           AND (pg_has_role(r.relowner, 'USAGE')
@@ -2717,6 +2741,8 @@ CREATE VIEW element_types AS
            CAST(null AS character_data) AS interval_type,
            CAST(null AS cardinal_number) AS interval_precision,
 
+           CAST(null AS character_data) AS domain_default, -- XXX maybe a bug in the standard
+
            CAST(current_database() AS sql_identifier) AS udt_catalog,
            CAST(nbt.nspname AS sql_identifier) AS udt_schema,
            CAST(bt.typname AS sql_identifier) AS udt_name,
@@ -3009,369 +3035,3 @@ CREATE VIEW user_mappings AS
     FROM _pg_user_mappings;
 
 GRANT SELECT ON user_mappings TO PUBLIC;
-
-
--- SQL/PGQ views; these use section numbers from part 16 of the standard.
-
-/*
- * 15.2
- * PG_DEFINED_LABEL_SETS view
- */
-
--- TODO
-
-
-/*
- * 15.3
- * PG_DEFINED_LABEL_SET_LABELS view
- */
-
--- TODO
-
-
-/*
- * 15.4
- * PG_EDGE_DEFINED_LABEL_SETS view
- */
-
--- TODO
-
-
-/*
- * 15.5
- * PG_EDGE_TABLE_COMPONENTS view
- */
-
-CREATE VIEW pg_edge_table_components AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(eg.pgealias AS sql_identifier) AS edge_table_alias,
-           CAST(v.pgealias AS sql_identifier) AS vertex_table_alias,
-           CAST(CASE eg.end WHEN 'src' THEN 'SOURCE' WHEN 'dest' THEN 'DESTINATION' END AS character_data) AS edge_end,
-           CAST(ae.attname AS sql_identifier) AS edge_table_column_name,
-           CAST(av.attname AS sql_identifier) AS vertex_table_column_name,
-           CAST((eg.egkey).n AS cardinal_number) AS ordinal_position
-    FROM pg_namespace npg
-         JOIN
-         (SELECT * FROM pg_class WHERE relkind = 'g') AS pg
-           ON npg.oid = pg.relnamespace
-         JOIN
-         (SELECT pgepgid, pgealias, pgerelid, 'src' AS end, pgesrcvertexid AS vertexid, _pg_expandarray(pgesrckey) AS egkey, _pg_expandarray(pgesrcref) AS egref FROM pg_propgraph_element WHERE pgekind = 'e'
-          UNION ALL
-          SELECT pgepgid, pgealias, pgerelid, 'dest' AS end, pgedestvertexid AS vertexid, _pg_expandarray(pgedestkey) AS egkey, _pg_expandarray(pgedestref) AS egref FROM pg_propgraph_element WHERE pgekind = 'e'
-         ) AS eg
-           ON pg.oid = eg.pgepgid
-         JOIN
-         (SELECT * FROM pg_propgraph_element WHERE pgekind = 'v') AS v
-           ON eg.vertexid = v.oid
-         JOIN
-         (SELECT * FROM pg_attribute WHERE NOT attisdropped) AS ae
-           ON eg.pgerelid = ae.attrelid AND (eg.egkey).x = ae.attnum
-         JOIN
-         (SELECT * FROM pg_attribute WHERE NOT attisdropped) AS av
-           ON v.pgerelid = av.attrelid AND (eg.egref).x = av.attnum
-    WHERE NOT pg_is_other_temp_schema(npg.oid)
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_edge_table_components TO PUBLIC;
-
-
-/*
- * 15.6
- * PG_EDGE_TRIPLETS view
- */
-
--- TODO
-
-
-/*
- * 15.7
- * PG_ELEMENT_TABLE_KEY_COLUMNS view
- */
-
-CREATE VIEW pg_element_table_key_columns AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(pgealias AS sql_identifier) AS element_table_alias,
-           CAST(a.attname AS sql_identifier) AS column_name,
-           CAST((el.ekey).n AS cardinal_number) AS ordinal_position
-    FROM pg_namespace npg
-         JOIN
-         (SELECT * FROM pg_class WHERE relkind = 'g') AS pg
-           ON npg.oid = pg.relnamespace
-         JOIN
-         (SELECT pgepgid, pgealias, pgerelid, _pg_expandarray(pgekey) AS ekey FROM pg_propgraph_element) AS el
-           ON pg.oid = el.pgepgid
-         JOIN
-         (SELECT * FROM pg_attribute WHERE NOT attisdropped) AS a
-           ON el.pgerelid = a.attrelid AND (el.ekey).x = a.attnum
-    WHERE NOT pg_is_other_temp_schema(npg.oid)
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_element_table_key_columns TO PUBLIC;
-
-
-/*
- * 15.8
- * PG_ELEMENT_TABLE_LABELS view
- */
-
-CREATE VIEW pg_element_table_labels AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(e.pgealias AS sql_identifier) AS element_table_alias,
-           CAST(l.pgllabel AS sql_identifier) AS label_name
-    FROM pg_namespace npg, pg_class pg, pg_propgraph_element e, pg_propgraph_element_label el, pg_propgraph_label l
-    WHERE pg.relnamespace = npg.oid
-          AND e.pgepgid = pg.oid
-          AND el.pgelelid = e.oid
-          AND el.pgellabelid = l.oid
-          AND pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_element_table_labels TO PUBLIC;
-
-
-/*
- * 15.9
- * PG_ELEMENT_TABLE_PROPERTIES view
- */
-
-CREATE VIEW pg_element_table_properties AS
-    SELECT DISTINCT
-           CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(e.pgealias AS sql_identifier) AS element_table_alias,
-           CAST(pr.pgpname AS sql_identifier) AS property_name,
-           CAST(pg_get_expr(plp.plpexpr, e.pgerelid) AS character_data) AS property_expression
-    FROM pg_namespace npg, pg_class pg, pg_propgraph_element e, pg_propgraph_element_label el, pg_propgraph_label_property plp, pg_propgraph_property pr
-    WHERE pg.relnamespace = npg.oid
-          AND e.pgepgid = pg.oid
-          AND el.pgelelid = e.oid
-          AND plp.plpellabelid = el.oid
-          AND pr.oid = plp.plppropid
-          AND pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_element_table_properties TO PUBLIC;
-
-
-/*
- * 15.10
- * PG_ELEMENT_TABLES view
- */
-
-CREATE VIEW pg_element_tables AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(e.pgealias AS sql_identifier) AS element_table_alias,
-           CAST(CASE e.pgekind WHEN 'e' THEN 'EDGE' WHEN 'v' THEN 'VERTEX' END AS character_data) AS element_table_kind,
-           CAST(current_database() AS sql_identifier) AS table_catalog,
-           CAST(nt.nspname AS sql_identifier) AS table_schema,
-           CAST(t.relname AS sql_identifier) AS table_name,
-           CAST(NULL AS character_data) AS element_table_definition
-    FROM pg_namespace npg, pg_class pg, pg_propgraph_element e, pg_class t, pg_namespace nt
-    WHERE pg.relnamespace = npg.oid
-          AND e.pgepgid = pg.oid
-          AND e.pgerelid = t.oid
-          AND t.relnamespace = nt.oid
-          AND pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_element_tables TO PUBLIC;
-
-
-/*
- * 15.11
- * PG_LABEL_PROPERTIES view
- */
-
-CREATE VIEW pg_label_properties AS
-    SELECT DISTINCT
-           CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(l.pgllabel AS sql_identifier) AS label_name,
-           CAST(pr.pgpname AS sql_identifier) AS property_name
-    FROM pg_namespace npg, pg_class pg, pg_propgraph_element e, pg_propgraph_label l, pg_propgraph_element_label el, pg_propgraph_label_property plp, pg_propgraph_property pr
-    WHERE pg.relnamespace = npg.oid
-          AND e.pgepgid = pg.oid
-          AND el.pgelelid = e.oid
-          AND plp.plpellabelid = el.oid
-          AND pr.oid = plp.plppropid
-          AND el.pgellabelid = l.oid
-          AND pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_label_properties TO PUBLIC;
-
-
-/*
- * 15.12
- * PG_LABELS view
- */
-
-CREATE VIEW pg_labels AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(l.pgllabel AS sql_identifier) AS label_name
-    FROM pg_namespace npg, pg_class pg, pg_propgraph_label l
-    WHERE pg.relnamespace = npg.oid
-          AND l.pglpgid = pg.oid
-          AND pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_labels TO PUBLIC;
-
-
-/*
- * 15.13
- * PG_PROPERTY_DATA_TYPES view
- */
-
-CREATE VIEW pg_property_data_types AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(npg.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(pg.relname AS sql_identifier) AS property_graph_name,
-           CAST(pgp.pgpname AS sql_identifier) AS property_name,
-
-           CAST(
-             CASE WHEN t.typtype = 'd' THEN
-               CASE WHEN bt.typelem <> 0 AND bt.typlen = -1 THEN 'ARRAY'
-                    WHEN nbt.nspname = 'pg_catalog' THEN format_type(t.typbasetype, null)
-                    ELSE 'USER-DEFINED' END
-             ELSE
-               CASE WHEN t.typelem <> 0 AND t.typlen = -1 THEN 'ARRAY'
-                    WHEN nt.nspname = 'pg_catalog' THEN format_type(pgp.pgptypid, null)
-                    ELSE 'USER-DEFINED' END
-             END
-             AS character_data)
-             AS data_type,
-
-           CAST(null AS cardinal_number) AS character_maximum_length,
-           CAST(null AS cardinal_number) AS character_octet_length,
-           CAST(null AS sql_identifier) AS character_set_catalog,
-           CAST(null AS sql_identifier) AS character_set_schema,
-           CAST(null AS sql_identifier) AS character_set_name,
-           CAST(current_database() AS sql_identifier) AS collation_catalog,
-           CAST(nc.nspname AS sql_identifier) AS collation_schema,
-           CAST(c.collname AS sql_identifier) AS collation_name,
-           CAST(null AS cardinal_number) AS numeric_precision,
-           CAST(null AS cardinal_number) AS numeric_precision_radix,
-           CAST(null AS cardinal_number) AS numeric_scale,
-           CAST(null AS cardinal_number) AS datetime_precision,
-           CAST(null AS character_data) AS interval_type,
-           CAST(null AS cardinal_number) AS interval_precision,
-
-           CAST(current_database() AS sql_identifier) AS user_defined_type_catalog,
-           CAST(coalesce(nbt.nspname, nt.nspname) AS sql_identifier) AS user_defined_type_schema,
-           CAST(coalesce(bt.typname, t.typname) AS sql_identifier) AS user_defined_type_name,
-
-           CAST(null AS sql_identifier) AS scope_catalog,
-           CAST(null AS sql_identifier) AS scope_schema,
-           CAST(null AS sql_identifier) AS scope_name,
-
-           CAST(null AS cardinal_number) AS maximum_cardinality,
-           CAST(pgp.pgpname AS sql_identifier) AS dtd_identifier
-
-    FROM pg_propgraph_property pgp
-         JOIN (pg_class pg JOIN pg_namespace npg ON (pg.relnamespace = npg.oid)) ON pgp.pgppgid = pg.oid
-         JOIN (pg_type t JOIN pg_namespace nt ON (t.typnamespace = nt.oid)) ON pgp.pgptypid = t.oid
-         LEFT JOIN (pg_type bt JOIN pg_namespace nbt ON (bt.typnamespace = nbt.oid))
-           ON (t.typtype = 'd' AND t.typbasetype = bt.oid)
-         LEFT JOIN (pg_collation c JOIN pg_namespace nc ON (c.collnamespace = nc.oid))
-           ON pgp.pgpcollation = c.oid AND (nc.nspname, c.collname) <> ('pg_catalog', 'default')
-
-    WHERE pg.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(npg.oid))
-          AND (pg_has_role(pg.relowner, 'USAGE')
-               OR has_table_privilege(pg.oid, 'SELECT'));
-
-GRANT SELECT ON pg_property_data_types TO PUBLIC;
-
-
-/*
- * 15.14
- * PG_PROPERTY_GRAPH_PRIVILEGES view
- */
-
-CREATE VIEW pg_property_graph_privileges AS
-    SELECT CAST(u_grantor.rolname AS sql_identifier) AS grantor,
-           CAST(grantee.rolname AS sql_identifier) AS grantee,
-           CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(nc.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(c.relname AS sql_identifier) AS property_graph_name,
-           CAST(c.prtype AS character_data) AS privilege_type,
-           CAST(
-             CASE WHEN
-                  -- object owner always has grant options
-                  pg_has_role(grantee.oid, c.relowner, 'USAGE')
-                  OR c.grantable
-                  THEN 'YES' ELSE 'NO' END AS yes_or_no) AS is_grantable
-
-    FROM (
-            SELECT oid, relname, relnamespace, relkind, relowner, (aclexplode(coalesce(relacl, acldefault('g', relowner)))).* FROM pg_class
-         ) AS c (oid, relname, relnamespace, relkind, relowner, grantor, grantee, prtype, grantable),
-         pg_namespace nc,
-         pg_authid u_grantor,
-         (
-           SELECT oid, rolname FROM pg_authid
-           UNION ALL
-           SELECT 0::oid, 'PUBLIC'
-         ) AS grantee (oid, rolname)
-
-    WHERE c.relnamespace = nc.oid
-          AND c.relkind IN ('g')
-          AND c.grantee = grantee.oid
-          AND c.grantor = u_grantor.oid
-          AND c.prtype IN ('SELECT')
-          AND (pg_has_role(u_grantor.oid, 'USAGE')
-               OR pg_has_role(grantee.oid, 'USAGE')
-               OR grantee.rolname = 'PUBLIC');
-
-GRANT SELECT ON pg_property_graph_privileges TO PUBLIC;
-
-
-/*
- * 15.15
- * PG_VERTEX_DEFINED_LABEL_SETS view
- */
-
--- TODO
-
-
-/*
- * 15.16
- * PROPERTY_GRAPHS view
- */
-
-CREATE VIEW property_graphs AS
-    SELECT CAST(current_database() AS sql_identifier) AS property_graph_catalog,
-           CAST(nc.nspname AS sql_identifier) AS property_graph_schema,
-           CAST(c.relname AS sql_identifier) AS property_graph_name
-    FROM pg_namespace nc, pg_class c
-    WHERE c.relnamespace = nc.oid
-          AND c.relkind = 'g'
-          AND (NOT pg_is_other_temp_schema(nc.oid))
-          AND (pg_has_role(c.relowner, 'USAGE')
-               OR has_table_privilege(c.oid, 'SELECT'));
-
-GRANT SELECT ON property_graphs TO PUBLIC;

@@ -3,7 +3,7 @@
  * dict_xsyn.c
  *	  Extended synonym dictionary
  *
- * Copyright (c) 2007-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/dict_xsyn/dict_xsyn.c
@@ -14,16 +14,11 @@
 
 #include <ctype.h>
 
-#include "catalog/pg_collation_d.h"
 #include "commands/defrem.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_public.h"
-#include "utils/formatting.h"
+#include "tsearch/ts_utils.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "dict_xsyn",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 typedef struct
 {
@@ -53,14 +48,14 @@ find_word(char *in, char **end)
 	char	   *start;
 
 	*end = NULL;
-	while (*in && isspace((unsigned char) *in))
+	while (*in && t_isspace_cstr(in))
 		in += pg_mblen_cstr(in);
 
 	if (!*in || *in == '#')
 		return NULL;
 	start = in;
 
-	while (*in && !isspace((unsigned char) *in))
+	while (*in && !t_isspace_cstr(in))
 		in += pg_mblen_cstr(in);
 
 	*end = in;
@@ -98,7 +93,7 @@ read_dictionary(DictSyn *d, const char *filename)
 		if (*line == '\0')
 			continue;
 
-		value = str_tolower(line, strlen(line), DEFAULT_COLLATION_OID);
+		value = lowerstr(line);
 		pfree(line);
 
 		pos = value;
@@ -109,9 +104,9 @@ read_dictionary(DictSyn *d, const char *filename)
 			{
 				d->len = (d->len > 0) ? 2 * d->len : 16;
 				if (d->syn)
-					d->syn = repalloc_array(d->syn, Syn, d->len);
+					d->syn = (Syn *) repalloc(d->syn, sizeof(Syn) * d->len);
 				else
-					d->syn = palloc_array(Syn, d->len);
+					d->syn = (Syn *) palloc(sizeof(Syn) * d->len);
 			}
 
 			/* Save first word only if we will match it */
@@ -150,7 +145,7 @@ dxsyn_init(PG_FUNCTION_ARGS)
 	ListCell   *l;
 	char	   *filename = NULL;
 
-	d = palloc0_object(DictSyn);
+	d = (DictSyn *) palloc0(sizeof(DictSyn));
 	d->len = 0;
 	d->syn = NULL;
 	d->matchorig = true;
@@ -212,8 +207,13 @@ dxsyn_lexize(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(NULL);
 
 	/* Create search pattern */
-	word.key = str_tolower(in, length, DEFAULT_COLLATION_OID);
-	word.value = NULL;
+	{
+		char	   *temp = pnstrdup(in, length);
+
+		word.key = lowerstr(temp);
+		pfree(temp);
+		word.value = NULL;
+	}
 
 	/* Look for matching syn */
 	found = (Syn *) bsearch(&word, d->syn, d->len, sizeof(Syn), compare_syn);
@@ -230,7 +230,7 @@ dxsyn_lexize(PG_FUNCTION_ARGS)
 		char	   *end;
 		int			nsyns = 0;
 
-		res = palloc_object(TSLexeme);
+		res = palloc(sizeof(TSLexeme));
 
 		pos = value;
 		while ((syn = find_word(pos, &end)) != NULL)

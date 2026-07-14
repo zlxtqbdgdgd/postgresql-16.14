@@ -2072,8 +2072,7 @@ declare
   p2 int4 := 1006;
   n int4;
 begin
-  -- use both supported syntaxes for named arguments
-  open c1 (p1 := p1, p2 => p2, debug => 2);
+  open c1 (p1 := p1, p2 := p2, debug := 2);
   fetch c1 into n;
   return n;
 end $$ language plpgsql;
@@ -2935,8 +2934,7 @@ begin
     raise notice '% from %', r.i, c;
   end loop;
   -- again, to test if cursor was closed properly
-  -- (and while we're at it, test named-parameter notation)
-  for r in c(r2 := 10, r1 => 9) loop
+  for r in c(9,10) loop
     raise notice '% from %', r.i, c;
   end loop;
   -- and test a parameterless cursor
@@ -3356,7 +3354,7 @@ declare v int := 0;
 begin
   return 10 / v;
 end;
-$$ language plpgsql parallel safe;
+$$ language plpgsql;
 
 create or replace function raise_test() returns void as $$
 begin
@@ -3417,28 +3415,8 @@ $$ language plpgsql;
 
 select stacked_diagnostics_test();
 
-drop function stacked_diagnostics_test();
-
--- Test that an error recovery subtransaction is parallel safe
-
-create function error_trap_test() returns text as $$
-begin
-  perform zero_divide();
-  return 'no error detected!';
-exception when division_by_zero then
-  return 'division_by_zero detected';
-end;
-$$ language plpgsql parallel safe;
-
-set debug_parallel_query to on;
-
-explain (verbose, costs off) select error_trap_test();
-select error_trap_test();
-
-reset debug_parallel_query;
-
-drop function error_trap_test();
 drop function zero_divide();
+drop function stacked_diagnostics_test();
 
 -- check cases where implicit SQLSTATE variable could be confused with
 -- SQLSTATE as a keyword, cf bug #5524
@@ -3772,6 +3750,28 @@ select fail();
 drop function fail();
 
 -- Test handling of string literals.
+
+set standard_conforming_strings = off;
+
+create or replace function strtest() returns text as $$
+begin
+  raise notice 'foo\\bar\041baz';
+  return 'foo\\bar\041baz';
+end
+$$ language plpgsql;
+
+select strtest();
+
+create or replace function strtest() returns text as $$
+begin
+  raise notice E'foo\\bar\041baz';
+  return E'foo\\bar\041baz';
+end
+$$ language plpgsql;
+
+select strtest();
+
+set standard_conforming_strings = on;
 
 create or replace function strtest() returns text as $$
 begin
@@ -4732,12 +4732,12 @@ END; $$ LANGUAGE plpgsql;
 SELECT * FROM get_from_partitioned_table(1) AS t;
 
 CREATE OR REPLACE FUNCTION list_partitioned_table()
-RETURNS SETOF public.partitioned_table.a%TYPE AS $$
+RETURNS SETOF partitioned_table.a%TYPE AS $$
 DECLARE
-    row public.partitioned_table%ROWTYPE;
-    a_val public.partitioned_table.a%TYPE;
+    row partitioned_table%ROWTYPE;
+    a_val partitioned_table.a%TYPE;
 BEGIN
-    FOR row IN SELECT * FROM public.partitioned_table ORDER BY a LOOP
+    FOR row IN SELECT * FROM partitioned_table ORDER BY a LOOP
         a_val := row.a;
         RETURN NEXT a_val;
     END LOOP;

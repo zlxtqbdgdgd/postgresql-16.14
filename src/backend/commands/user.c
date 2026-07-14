@@ -3,7 +3,7 @@
  * user.c
  *	  Commands for manipulating roles (formerly called users).
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/commands/user.c
@@ -32,13 +32,13 @@
 #include "commands/user.h"
 #include "libpq/crypt.h"
 #include "miscadmin.h"
-#include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 /*
@@ -64,7 +64,7 @@ typedef enum
 	RRG_REMOVE_ADMIN_OPTION,
 	RRG_REMOVE_INHERIT_OPTION,
 	RRG_REMOVE_SET_OPTION,
-	RRG_DELETE_GRANT,
+	RRG_DELETE_GRANT
 } RevokeRoleGrantAction;
 
 /* Potentially set by pg_upgrade_support functions */
@@ -85,8 +85,8 @@ typedef struct
 /* GUC parameters */
 int			Password_encryption = PASSWORD_TYPE_SCRAM_SHA_256;
 char	   *createrole_self_grant = "";
-static bool createrole_self_grant_enabled = false;
-static GrantRoleOptions createrole_self_grant_options;
+bool		createrole_self_grant_enabled = false;
+GrantRoleOptions createrole_self_grant_options;
 
 /* Hook to check passwords in CreateRole() and AlterRole() */
 check_password_hook_type check_password_hook = NULL;
@@ -170,12 +170,6 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	DefElem    *dvalidUntil = NULL;
 	DefElem    *dbypassRLS = NULL;
 	GrantRoleOptions popt;
-
-	/* Report error if name has \n or \r character. */
-	if (strpbrk(stmt->role, "\n\r"))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("role name \"%s\" contains a newline or carriage return character", stmt->role)));
 
 	/* The defaults can vary depending on the original statement type */
 	switch (stmt->stmt_type)
@@ -874,7 +868,7 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("permission denied to alter role"),
-					 errdetail("The bootstrap superuser must have the %s attribute.",
+					 errdetail("The bootstrap user must have the %s attribute.",
 							   "SUPERUSER")));
 
 		new_record[Anum_pg_authid_rolsuper - 1] = BoolGetDatum(should_be_super);
@@ -1354,12 +1348,6 @@ RenameRole(const char *oldname, const char *newname)
 	ObjectAddress address;
 	Form_pg_authid authform;
 
-	/* Report error if name has \n or \r character. */
-	if (strpbrk(newname, "\n\r"))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("role name \"%s\" contains a newline or carriage return character", newname)));
-
 	rel = table_open(AuthIdRelationId, RowExclusiveLock);
 	dsc = RelationGetDescr(rel);
 
@@ -1743,7 +1731,6 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 		 */
 		if (memberid == ROLE_PG_DATABASE_OWNER)
 			ereport(ERROR,
-					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("role \"%s\" cannot be a member of any role",
 						   get_rolespec_name(memberRole)));
 
@@ -1917,7 +1904,7 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 		else
 		{
 			Oid			objectId;
-			Oid		   *newmembers = palloc_object(Oid);
+			Oid		   *newmembers = palloc(sizeof(Oid));
 
 			/*
 			 * The values for these options can be taken directly from 'popt'.
@@ -1936,25 +1923,25 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 			 */
 			if ((popt->specified & GRANT_ROLE_SPECIFIED_INHERIT) != 0)
 				new_record[Anum_pg_auth_members_inherit_option - 1] =
-					BoolGetDatum(popt->inherit);
+					popt->inherit;
 			else
 			{
 				HeapTuple	mrtup;
 				Form_pg_authid mrform;
 
-				mrtup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(memberid));
+				mrtup = SearchSysCache1(AUTHOID, memberid);
 				if (!HeapTupleIsValid(mrtup))
 					elog(ERROR, "cache lookup failed for role %u", memberid);
 				mrform = (Form_pg_authid) GETSTRUCT(mrtup);
 				new_record[Anum_pg_auth_members_inherit_option - 1] =
-					BoolGetDatum(mrform->rolinherit);
+					mrform->rolinherit;
 				ReleaseSysCache(mrtup);
 			}
 
 			/* get an OID for the new row and insert it */
 			objectId = GetNewOidWithIndex(pg_authmem_rel, AuthMemOidIndexId,
 										  Anum_pg_auth_members_oid);
-			new_record[Anum_pg_auth_members_oid - 1] = ObjectIdGetDatum(objectId);
+			new_record[Anum_pg_auth_members_oid - 1] = objectId;
 			tuple = heap_form_tuple(pg_authmem_dsc,
 									new_record, new_record_nulls);
 			CatalogTupleInsert(pg_authmem_rel, tuple);
@@ -2135,7 +2122,6 @@ check_role_membership_authorization(Oid currentUserId, Oid roleid,
 	 */
 	if (is_grant && roleid == ROLE_PG_DATABASE_OWNER)
 		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("role \"%s\" cannot have explicit members",
 					   GetUserNameFromId(roleid, false)));
 
@@ -2308,7 +2294,7 @@ initialize_revoke_actions(CatCList *memlist)
 	if (memlist->n_members == 0)
 		return NULL;
 
-	result = palloc_array(RevokeRoleGrantAction, memlist->n_members);
+	result = palloc(sizeof(RevokeRoleGrantAction) * memlist->n_members);
 	for (i = 0; i < memlist->n_members; i++)
 		result[i] = RRG_NOOP;
 	return result;

@@ -4,7 +4,7 @@
  *	  PostgreSQL type definitions for ISNs (ISBN, ISMN, ISSN, EAN13, UPC)
  *
  * Author:	German Mendez Bravo (Kronuz)
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/isn/isn.c
@@ -21,12 +21,9 @@
 #include "UPC.h"
 #include "fmgr.h"
 #include "isn.h"
-#include "utils/guc.h"
+#include "utils/builtins.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "isn",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 #ifdef USE_ASSERT_CHECKING
 #define ISN_DEBUG 1
@@ -43,7 +40,6 @@ enum isn_type
 
 static const char *const isn_names[] = {"EAN13/UPC/ISxN", "EAN13/UPC/ISxN", "EAN13", "ISBN", "ISMN", "ISSN", "UPC"};
 
-/* GUC value */
 static bool g_weak = false;
 
 
@@ -423,10 +419,19 @@ eanwrongtype:
 
 eantoobig:
 	if (!errorOK)
+	{
+		char		eanbuf[64];
+
+		/*
+		 * Format the number separately to keep the machine-dependent format
+		 * code out of the translatable message text
+		 */
+		snprintf(eanbuf, sizeof(eanbuf), EAN13_FORMAT, ean);
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value \"%" PRIu64 "\" is out of range for %s type",
-						ean, isn_names[type])));
+				 errmsg("value \"%s\" is out of range for %s type",
+						eanbuf, isn_names[type])));
+	}
 	return false;
 }
 
@@ -651,10 +656,19 @@ okay:
 
 eantoobig:
 	if (!errorOK)
+	{
+		char		eanbuf[64];
+
+		/*
+		 * Format the number separately to keep the machine-dependent format
+		 * code out of the translatable message text
+		 */
+		snprintf(eanbuf, sizeof(eanbuf), EAN13_FORMAT, ean);
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value \"%" PRIu64 "\" is out of range for %s type",
-						ean, isn_names[type])));
+				 errmsg("value \"%s\" is out of range for %s type",
+						eanbuf, isn_names[type])));
+	}
 	return false;
 }
 
@@ -708,7 +722,7 @@ string2ean(const char *str, struct Node *escontext, ean13 *result,
 			if (type != INVALID)
 				goto eaninvalid;
 			type = ISSN;
-			*aux1++ = pg_ascii_toupper((unsigned char) *aux2);
+			*aux1++ = toupper((unsigned char) *aux2);
 			length++;
 		}
 		else if (length == 9 && (digit || *aux2 == 'X' || *aux2 == 'x') && last)
@@ -718,7 +732,7 @@ string2ean(const char *str, struct Node *escontext, ean13 *result,
 				goto eaninvalid;
 			if (type == INVALID)
 				type = ISBN;	/* ISMN must start with 'M' */
-			*aux1++ = pg_ascii_toupper((unsigned char) *aux2);
+			*aux1++ = toupper((unsigned char) *aux2);
 			length++;
 		}
 		else if (length == 11 && digit && last)
@@ -837,7 +851,6 @@ string2ean(const char *str, struct Node *escontext, ean13 *result,
 		case UPC:
 			buf[2] = '0';
 			valid = (valid && ((rcheck = checkdig(buf + 2, 13)) == check || magic));
-			break;
 		default:
 			break;
 	}
@@ -917,24 +930,9 @@ _PG_init(void)
 		if (!check_table(UPC_range, UPC_index))
 			elog(ERROR, "UPC failed check");
 	}
-
-	/* Define a GUC variable for weak mode. */
-	DefineCustomBoolVariable("isn.weak",
-							 "Accept input with invalid ISN check digits.",
-							 NULL,
-							 &g_weak,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
-	MarkGUCPrefixReserved("isn");
 }
 
-/*
- * isn_out
+/* isn_out
  */
 PG_FUNCTION_INFO_V1(isn_out);
 Datum
@@ -950,8 +948,7 @@ isn_out(PG_FUNCTION_ARGS)
 	PG_RETURN_CSTRING(result);
 }
 
-/*
- * ean13_out
+/* ean13_out
  */
 PG_FUNCTION_INFO_V1(ean13_out);
 Datum
@@ -967,8 +964,7 @@ ean13_out(PG_FUNCTION_ARGS)
 	PG_RETURN_CSTRING(result);
 }
 
-/*
- * ean13_in
+/* ean13_in
  */
 PG_FUNCTION_INFO_V1(ean13_in);
 Datum
@@ -982,8 +978,7 @@ ean13_in(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(result);
 }
 
-/*
- * isbn_in
+/* isbn_in
  */
 PG_FUNCTION_INFO_V1(isbn_in);
 Datum
@@ -997,8 +992,7 @@ isbn_in(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(result);
 }
 
-/*
- * ismn_in
+/* ismn_in
  */
 PG_FUNCTION_INFO_V1(ismn_in);
 Datum
@@ -1012,8 +1006,7 @@ ismn_in(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(result);
 }
 
-/*
- * issn_in
+/* issn_in
  */
 PG_FUNCTION_INFO_V1(issn_in);
 Datum
@@ -1027,8 +1020,7 @@ issn_in(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(result);
 }
 
-/*
- * upc_in
+/* upc_in
  */
 PG_FUNCTION_INFO_V1(upc_in);
 Datum
@@ -1042,9 +1034,8 @@ upc_in(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(result);
 }
 
-/*
- * casting functions
- */
+/* casting functions
+*/
 PG_FUNCTION_INFO_V1(isbn_cast_from_ean13);
 Datum
 isbn_cast_from_ean13(PG_FUNCTION_ARGS)
@@ -1094,8 +1085,7 @@ upc_cast_from_ean13(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * is_valid - returns false if the "invalid-check-digit-on-input" is set
+/* is_valid - returns false if the "invalid-check-digit-on-input" is set
  */
 PG_FUNCTION_INFO_V1(is_valid);
 Datum
@@ -1106,8 +1096,7 @@ is_valid(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL((val & 1) == 0);
 }
 
-/*
- * make_valid - unsets the "invalid-check-digit-on-input" flag
+/* make_valid - unsets the "invalid-check-digit-on-input" flag
  */
 PG_FUNCTION_INFO_V1(make_valid);
 Datum
@@ -1119,19 +1108,19 @@ make_valid(PG_FUNCTION_ARGS)
 	PG_RETURN_EAN13(val);
 }
 
-/*
- * this function temporarily sets weak input flag
+/* this function temporarily sets weak input flag
  * (to lose the strictness of check digit acceptance)
+ * It's a helper function, not intended to be used!!
  */
 PG_FUNCTION_INFO_V1(accept_weak_input);
 Datum
 accept_weak_input(PG_FUNCTION_ARGS)
 {
-	bool		newvalue = PG_GETARG_BOOL(0);
-
-	(void) set_config_option("isn.weak", newvalue ? "on" : "off",
-							 PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SET, true, 0, false);
+#ifdef ISN_WEAK_MODE
+	g_weak = PG_GETARG_BOOL(0);
+#else
+	/* function has no effect */
+#endif							/* ISN_WEAK_MODE */
 	PG_RETURN_BOOL(g_weak);
 }
 

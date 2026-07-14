@@ -17,12 +17,6 @@ for i in range(count):
 	t += ( content, )
 return t
 $$ LANGUAGE plpython3u;
-CREATE FUNCTION test_setof_as_set(count integer, content text) RETURNS SETOF text AS $$
-s = set()
-for i in range(count):
-	s.add(content * (i + 1) if content is not None else None)
-return s
-$$ LANGUAGE plpython3u;
 CREATE FUNCTION test_setof_as_iterator(count integer, content text) RETURNS SETOF text AS $$
 class producer:
 	def __init__ (self, icount, icontent):
@@ -95,30 +89,6 @@ SELECT test_setof_as_tuple(2, null);
  
  
 (2 rows)
-
-SELECT * FROM test_setof_as_set(0, 'set') ORDER BY 1;
- test_setof_as_set 
--------------------
-(0 rows)
-
-SELECT * FROM test_setof_as_set(1, 'set') ORDER BY 1;
- test_setof_as_set 
--------------------
- set
-(1 row)
-
-SELECT * FROM test_setof_as_set(2, 'set') ORDER BY 1;
- test_setof_as_set 
--------------------
- set
- setset
-(2 rows)
-
-SELECT * FROM test_setof_as_set(2, null) ORDER BY 1;
- test_setof_as_set 
--------------------
- 
-(1 row)
 
 SELECT test_setof_as_iterator(0, 'list');
  test_setof_as_iterator 
@@ -227,42 +197,4 @@ SELECT * FROM get_user_records2();
  rick   | smith | slash    |      4
  willem | doe   | w_doe    |      3
 (4 rows)
-
--- Test partial execution of a set-returning function
-SELECT get_user_records2() LIMIT 2;
- get_user_records2  
---------------------
- (jane,doe,j_doe,1)
- (john,doe,johnd,2)
-(2 rows)
-
-SELECT * FROM get_user_records2() LIMIT 2;
- fname | lname | username | userid 
--------+-------+----------+--------
- jane  | doe   | j_doe    |      1
- john  | doe   | johnd    |      2
-(2 rows)
-
--- A set-returning function that is invalidated mid-iteration must run to
--- completion using its original definition (bug #19480).
-CREATE OR REPLACE FUNCTION self_invalidating_srf(x int) RETURNS SETOF int AS $$
-for i in range(3):
-    if i == 1:
-        plpy.execute("CREATE OR REPLACE FUNCTION self_invalidating_srf(x int) "
-                     "RETURNS SETOF int LANGUAGE plpython3u AS 'return [-1]'")
-    yield x + i
-$$ LANGUAGE plpython3u;
-SELECT self_invalidating_srf(10); -- expect 10,11,12 (original definition)
- self_invalidating_srf 
------------------------
-                    10
-                    11
-                    12
-(3 rows)
-
-SELECT self_invalidating_srf(10); -- expect -1 (replacement now in effect)
- self_invalidating_srf 
------------------------
-                    -1
-(1 row)
 

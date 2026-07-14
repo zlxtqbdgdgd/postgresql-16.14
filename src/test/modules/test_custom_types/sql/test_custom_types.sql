@@ -92,10 +92,7 @@ SELECT tablename,
   correlation,
   most_common_elems,
   most_common_elem_freqs,
-  elem_count_histogram,
-  range_length_histogram,
-  range_empty_frac,
-  range_bounds_histogram
+  elem_count_histogram
   FROM pg_stats_ext_exprs WHERE statistics_name = 'test_stats' \gx
 -- Run a query able to load the extended stats, including the NULL data.
 SELECT COUNT(*) FROM test_table GROUP BY (func_int_custom(data));

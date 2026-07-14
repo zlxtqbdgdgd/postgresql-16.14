@@ -3,7 +3,7 @@
  * rewriteDefine.c
  *	  routines for defining a rewrite rule
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,15 +14,21 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
-#include "access/relation.h"
-#include "access/table.h"
+#include "access/multixact.h"
+#include "access/tableam.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
-#include "catalog/indexing.h"
+#include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/storage.h"
+#include "commands/policy.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_utilcmd.h"
@@ -34,6 +40,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 
@@ -262,18 +269,6 @@ DefineQueryRewrite(const char *rulename,
 						RelationGetRelationName(event_relation)),
 				 errdetail_relkind_not_supported(event_relation->rd_rel->relkind)));
 
-	/*
-	 * Conflict log tables are used internally for logical replication
-	 * conflict logging and should not have rules, as it could disrupt
-	 * conflict logging.
-	 */
-	if (IsConflictLogTableClass(event_relation->rd_rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("conflict log table \"%s\" cannot have rules",
-						RelationGetRelationName(event_relation)),
-				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
-
 	if (!allowSystemTableMods && IsSystemRelation(event_relation))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -402,11 +397,26 @@ DefineQueryRewrite(const char *rulename,
 		 * ... and finally the rule must be named _RETURN.
 		 */
 		if (strcmp(rulename, ViewSelectRuleName) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("view rule for \"%s\" must be named \"%s\"",
-							RelationGetRelationName(event_relation),
-							ViewSelectRuleName)));
+		{
+			/*
+			 * In versions before 7.3, the expected name was _RETviewname. For
+			 * backwards compatibility with old pg_dump output, accept that
+			 * and silently change it to _RETURN.  Since this is just a quick
+			 * backwards-compatibility hack, limit the number of characters
+			 * checked to a few less than NAMEDATALEN; this saves having to
+			 * worry about where a multibyte character might have gotten
+			 * truncated.
+			 */
+			if (strncmp(rulename, "_RET", 4) != 0 ||
+				strncmp(rulename + 4, RelationGetRelationName(event_relation),
+						NAMEDATALEN - 4 - 4) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("view rule for \"%s\" must be named \"%s\"",
+								RelationGetRelationName(event_relation),
+								ViewSelectRuleName)));
+			rulename = pstrdup(ViewSelectRuleName);
+		}
 	}
 	else
 	{
@@ -641,7 +651,7 @@ setRuleCheckAsUser_walker(Node *node, Oid *context)
 		return false;
 	}
 	return expression_tree_walker(node, setRuleCheckAsUser_walker,
-								  context);
+								  (void *) context);
 }
 
 static void
@@ -676,7 +686,7 @@ setRuleCheckAsUser_Query(Query *qry, Oid userid)
 
 	/* If there are sublinks, search for them and process their RTEs */
 	if (qry->hasSubLinks)
-		query_tree_walker(qry, setRuleCheckAsUser_walker, &userid,
+		query_tree_walker(qry, setRuleCheckAsUser_walker, (void *) &userid,
 						  QTW_IGNORE_RC_SUBQUERIES);
 }
 
@@ -722,9 +732,10 @@ EnableDisableRule(Relation rel, const char *rulename,
 	/*
 	 * Change ev_enabled if it is different from the desired new state.
 	 */
-	if (ruleform->ev_enabled != fires_when)
+	if (DatumGetChar(ruleform->ev_enabled) !=
+		fires_when)
 	{
-		ruleform->ev_enabled = fires_when;
+		ruleform->ev_enabled = CharGetDatum(fires_when);
 		CatalogTupleUpdate(pg_rewrite_desc, &ruletup->t_self, ruletup);
 
 		changed = true;
@@ -768,18 +779,6 @@ RangeVarCallbackForRenameRule(const RangeVar *rv, Oid relid, Oid oldrelid,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" cannot have rules", rv->relname),
 				 errdetail_relkind_not_supported(form->relkind)));
-
-	/*
-	 * Conflict log tables are used internally for logical replication
-	 * conflict logging and should not have rules, as it could disrupt
-	 * conflict logging.
-	 */
-	if (IsConflictLogTableClass(form))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("conflict log table \"%s\" cannot have rules",
-						rv->relname),
-				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 	if (!allowSystemTableMods && IsSystemClass(relid, form))
 		ereport(ERROR,
@@ -851,17 +850,6 @@ RenameRewriteRule(RangeVar *relation, const char *oldName,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("renaming an ON SELECT rule is not allowed")));
-
-	/*
-	 * Conversely, if it's not an ON SELECT rule then it must *not* be named
-	 * _RETURN.
-	 */
-	if (strcmp(newName, ViewSelectRuleName) == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("non-view rule for \"%s\" must not be named \"%s\"",
-						RelationGetRelationName(targetrel),
-						ViewSelectRuleName)));
 
 	/* OK, do the update */
 	namestrcpy(&(ruleform->rulename), newName);

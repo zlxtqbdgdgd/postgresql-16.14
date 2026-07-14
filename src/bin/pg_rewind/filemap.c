@@ -16,7 +16,7 @@
  * for each file.  Finally, it sorts the array to the final order that the
  * actions should be executed in.
  *
- * Copyright (c) 2013-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2023, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -26,24 +26,24 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/xlog_internal.h"
 #include "catalog/pg_tablespace_d.h"
-#include "common/file_utils.h"
-#include "common/hashfn_unstable.h"
+#include "common/hashfn.h"
 #include "common/string.h"
 #include "datapagemap.h"
 #include "filemap.h"
 #include "pg_rewind.h"
+#include "storage/fd.h"
 
 /*
  * Define a hash table which we can use to store information about the files
  * appearing in source and target systems.
  */
+static uint32 hash_string_pointer(const char *s);
 #define SH_PREFIX				filehash
 #define SH_ELEMENT_TYPE			file_entry_t
 #define SH_KEY_TYPE				const char *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	hash_string(key)
+#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
 #define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
 #define SH_SCOPE				static inline
 #define SH_RAW_ALLOCATOR		pg_malloc0
@@ -55,7 +55,7 @@
 
 static filehash_hash *filehash;
 
-static file_content_type_t getFileContentType(const char *path);
+static bool isRelDataFile(const char *path);
 static char *datasegpath(RelFileLocator rlocator, ForkNumber forknum,
 						 BlockNumber segno);
 
@@ -75,7 +75,7 @@ typedef struct keepwal_entry
 #define SH_ELEMENT_TYPE			keepwal_entry
 #define SH_KEY_TYPE				const char *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	hash_string(key)
+#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
 #define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
 #define SH_SCOPE				static inline
 #define SH_RAW_ALLOCATOR		pg_malloc0
@@ -114,7 +114,7 @@ struct exclude_list_item
  * they are defined in backend-only headers.  So this list is maintained
  * with a best effort in mind.
  */
-static const char *const excludeDirContents[] =
+static const char *excludeDirContents[] =
 {
 	/*
 	 * Skip temporary statistics files. PG_STAT_TMP_DIR must be skipped
@@ -127,7 +127,7 @@ static const char *const excludeDirContents[] =
 	 * even if the intention is to restore to another primary. See backup.sgml
 	 * for a more detailed description.
 	 */
-	"pg_replslot",				/* defined as PG_REPLSLOT_DIR */
+	"pg_replslot",
 
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	"pg_dynshmem",				/* defined as PG_DYNSHMEM_DIR */
@@ -210,7 +210,7 @@ insert_filehash_entry(const char *path)
 	if (!found)
 	{
 		entry->path = pg_strdup(path);
-		entry->content_type = getFileContentType(path);
+		entry->isrelfile = isRelDataFile(path);
 
 		entry->target_exists = false;
 		entry->target_type = FILE_TYPE_UNDEFINED;
@@ -294,7 +294,7 @@ process_source_file(const char *path, file_type_t type, size_t size,
 	 * sanity check: a filename that looks like a data file better be a
 	 * regular file
 	 */
-	if (type != FILE_TYPE_REGULAR && getFileContentType(path) == FILE_CONTENT_TYPE_RELATION)
+	if (type != FILE_TYPE_REGULAR && isRelDataFile(path))
 		pg_fatal("data file \"%s\" in source is not a regular file", path);
 
 	/* Remember this source file */
@@ -383,7 +383,7 @@ process_target_wal_block_change(ForkNumber forknum, RelFileLocator rlocator,
 	 */
 	if (entry)
 	{
-		Assert(entry->content_type == FILE_CONTENT_TYPE_RELATION);
+		Assert(entry->isrelfile);
 
 		if (entry->target_exists)
 		{
@@ -546,9 +546,7 @@ print_filemap(filemap_t *filemap)
 	for (i = 0; i < filemap->nentries; i++)
 	{
 		entry = filemap->entries[i];
-
 		if (entry->action != FILE_ACTION_NONE ||
-			entry->content_type == FILE_CONTENT_TYPE_WAL ||
 			entry->target_pages_to_overwrite.bitmapsize > 0)
 		{
 			pg_log_debug("%s (%s)", entry->path,
@@ -562,35 +560,22 @@ print_filemap(filemap_t *filemap)
 }
 
 /*
- * Determine what kind of file this one looks like.
+ * Does it look like a relation data file?
+ *
+ * For our purposes, only files belonging to the main fork are considered
+ * relation files. Other forks are always copied in toto, because we cannot
+ * reliably track changes to them, because WAL only contains block references
+ * for the main fork.
  */
-static file_content_type_t
-getFileContentType(const char *path)
+static bool
+isRelDataFile(const char *path)
 {
 	RelFileLocator rlocator;
 	unsigned int segNo;
 	int			nmatch;
-	file_content_type_t result = FILE_CONTENT_TYPE_OTHER;
-
-	/* Check if it is a WAL file. */
-	if (strncmp("pg_wal/", path, 7) == 0)
-	{
-		const char *filename = path + 7;	/* Skip "pg_wal/" */
-
-		if (IsXLogFileName(filename))
-			return FILE_CONTENT_TYPE_WAL;
-		else
-			return FILE_CONTENT_TYPE_OTHER;
-	}
+	bool		matched;
 
 	/*----
-	 * Does it look like a relation data file?
-	 *
-	 * For our purposes, only files belonging to the main fork are considered
-	 * relation files. Other forks are always copied in toto, because we
-	 * cannot reliably track changes to them, because WAL only contains block
-	 * references for the main fork.
-	 *
 	 * Relation data files can be in one of the following directories:
 	 *
 	 * global/
@@ -613,14 +598,14 @@ getFileContentType(const char *path)
 	rlocator.dbOid = InvalidOid;
 	rlocator.relNumber = InvalidRelFileNumber;
 	segNo = 0;
-	result = FILE_CONTENT_TYPE_OTHER;
+	matched = false;
 
 	nmatch = sscanf(path, "global/%u.%u", &rlocator.relNumber, &segNo);
 	if (nmatch == 1 || nmatch == 2)
 	{
 		rlocator.spcOid = GLOBALTABLESPACE_OID;
 		rlocator.dbOid = 0;
-		result = FILE_CONTENT_TYPE_RELATION;
+		matched = true;
 	}
 	else
 	{
@@ -629,7 +614,7 @@ getFileContentType(const char *path)
 		if (nmatch == 2 || nmatch == 3)
 		{
 			rlocator.spcOid = DEFAULTTABLESPACE_OID;
-			result = FILE_CONTENT_TYPE_RELATION;
+			matched = true;
 		}
 		else
 		{
@@ -637,7 +622,7 @@ getFileContentType(const char *path)
 							&rlocator.spcOid, &rlocator.dbOid, &rlocator.relNumber,
 							&segNo);
 			if (nmatch == 3 || nmatch == 4)
-				result = FILE_CONTENT_TYPE_RELATION;
+				matched = true;
 		}
 	}
 
@@ -647,17 +632,17 @@ getFileContentType(const char *path)
 	 * creates the exact same filename, when passed the RelFileLocator
 	 * information we extracted from the filename.
 	 */
-	if (result == FILE_CONTENT_TYPE_RELATION)
+	if (matched)
 	{
 		char	   *check_path = datasegpath(rlocator, MAIN_FORKNUM, segNo);
 
 		if (strcmp(check_path, path) != 0)
-			result = FILE_CONTENT_TYPE_OTHER;
+			matched = false;
 
 		pfree(check_path);
 	}
 
-	return result;
+	return matched;
 }
 
 /*
@@ -668,17 +653,18 @@ getFileContentType(const char *path)
 static char *
 datasegpath(RelFileLocator rlocator, ForkNumber forknum, BlockNumber segno)
 {
-	RelPathStr	path;
+	char	   *path;
 	char	   *segpath;
 
 	path = relpathperm(rlocator, forknum);
 	if (segno > 0)
 	{
-		segpath = psprintf("%s.%u", path.str, segno);
+		segpath = psprintf("%s.%u", path, segno);
+		pfree(path);
 		return segpath;
 	}
 	else
-		return pstrdup(path.str);
+		return path;
 }
 
 /*
@@ -694,8 +680,8 @@ datasegpath(RelFileLocator rlocator, ForkNumber forknum, BlockNumber segno)
 static int
 final_filemap_cmp(const void *a, const void *b)
 {
-	file_entry_t *fa = *((file_entry_t *const *) a);
-	file_entry_t *fb = *((file_entry_t *const *) b);
+	file_entry_t *fa = *((file_entry_t **) a);
+	file_entry_t *fb = *((file_entry_t **) b);
 
 	if (fa->action > fb->action)
 		return 1;
@@ -709,44 +695,10 @@ final_filemap_cmp(const void *a, const void *b)
 }
 
 /*
- * Decide what to do with a WAL segment file based on its position
- * relative to the point of divergence.
- *
- * Caller is responsible for ensuring that the file exists on both
- * source and target servers.
- */
-static file_action_t
-decide_wal_file_action(const char *fname, XLogSegNo last_common_segno,
-					   size_t source_size, size_t target_size)
-{
-	TimeLineID	file_tli;
-	XLogSegNo	file_segno;
-
-	/* Get current WAL segment number given current segment file name */
-	XLogFromFileName(fname, &file_tli, &file_segno, WalSegSz);
-
-	/*
-	 * Avoid copying files before the last common segment.
-	 *
-	 * These files exist on the source and the target servers, so they should
-	 * be identical and located strictly before the segment that contains the
-	 * LSN where target and source servers have diverged.
-	 *
-	 * While we are on it, double-check the size of each file and copy the
-	 * file if they do not match, in case.
-	 */
-	if (file_segno < last_common_segno &&
-		source_size == target_size)
-		return FILE_ACTION_NONE;
-
-	return FILE_ACTION_COPY;
-}
-
-/*
  * Decide what action to perform to a file.
  */
 static file_action_t
-decide_file_action(file_entry_t *entry, XLogSegNo last_common_segno)
+decide_file_action(file_entry_t *entry)
 {
 	const char *path = entry->path;
 
@@ -754,7 +706,7 @@ decide_file_action(file_entry_t *entry, XLogSegNo last_common_segno)
 	 * Don't touch the control file. It is handled specially, after copying
 	 * all the other files.
 	 */
-	if (strcmp(path, XLOG_CONTROL_FILE) == 0)
+	if (strcmp(path, "global/pg_control") == 0)
 		return FILE_ACTION_NONE;
 
 	/* Skip macOS system files */
@@ -848,21 +800,7 @@ decide_file_action(file_entry_t *entry, XLogSegNo last_common_segno)
 			return FILE_ACTION_NONE;
 
 		case FILE_TYPE_REGULAR:
-			if (entry->content_type == FILE_CONTENT_TYPE_WAL)
-			{
-				/* Handle WAL segment file */
-				const char *filename = last_dir_separator(entry->path);
-
-				if (filename == NULL)
-					filename = entry->path;
-				else
-					filename++; /* Skip the separator */
-
-				return decide_wal_file_action(filename, last_common_segno,
-											  entry->source_size,
-											  entry->target_size);
-			}
-			else if (entry->content_type != FILE_CONTENT_TYPE_RELATION)
+			if (!entry->isrelfile)
 			{
 				/*
 				 * It's a non-data file that we have no special processing
@@ -921,7 +859,7 @@ decide_file_action(file_entry_t *entry, XLogSegNo last_common_segno)
  * should be executed.
  */
 filemap_t *
-decide_file_actions(XLogSegNo last_common_segno)
+decide_file_actions(void)
 {
 	int			i;
 	filehash_iterator it;
@@ -931,7 +869,7 @@ decide_file_actions(XLogSegNo last_common_segno)
 	filehash_start_iterate(filehash, &it);
 	while ((entry = filehash_iterate(filehash, &it)) != NULL)
 	{
-		entry->action = decide_file_action(entry, last_common_segno);
+		entry->action = decide_file_action(entry);
 	}
 
 	/*
@@ -952,4 +890,16 @@ decide_file_actions(XLogSegNo last_common_segno)
 		  final_filemap_cmp);
 
 	return filemap;
+}
+
+
+/*
+ * Helper function for filemap hash table.
+ */
+static uint32
+hash_string_pointer(const char *s)
+{
+	unsigned char *ss = (unsigned char *) s;
+
+	return hash_bytes(ss, strlen(s));
 }

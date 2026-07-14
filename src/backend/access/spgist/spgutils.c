@@ -4,7 +4,7 @@
  *	  various support functions for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,11 +28,11 @@
 #include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
+#include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/catcache.h"
-#include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
 
 
@@ -43,63 +43,54 @@
 Datum
 spghandler(PG_FUNCTION_ARGS)
 {
-	static const IndexAmRoutine amroutine = {
-		.type = T_IndexAmRoutine,
-		.amstrategies = 0,
-		.amsupport = SPGISTNProc,
-		.amoptsprocnum = SPGIST_OPTIONS_PROC,
-		.amcanorder = false,
-		.amcanorderbyop = true,
-		.amcanhash = false,
-		.amconsistentequality = false,
-		.amconsistentordering = false,
-		.amcanbackward = false,
-		.amcanunique = false,
-		.amcanmulticol = false,
-		.amoptionalkey = true,
-		.amsearcharray = false,
-		.amsearchnulls = true,
-		.amstorage = true,
-		.amclusterable = false,
-		.ampredlocks = false,
-		.amcanparallel = false,
-		.amcanbuildparallel = false,
-		.amcaninclude = true,
-		.amusemaintenanceworkmem = false,
-		.amsummarizing = false,
-		.amparallelvacuumoptions =
-		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_COND_CLEANUP,
-		.amkeytype = InvalidOid,
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
-		.ambuild = spgbuild,
-		.ambuildempty = spgbuildempty,
-		.aminsert = spginsert,
-		.aminsertcleanup = NULL,
-		.ambulkdelete = spgbulkdelete,
-		.amvacuumcleanup = spgvacuumcleanup,
-		.amcanreturn = spgcanreturn,
-		.amcostestimate = spgcostestimate,
-		.amgettreeheight = NULL,
-		.amoptions = spgoptions,
-		.amproperty = spgproperty,
-		.ambuildphasename = NULL,
-		.amvalidate = spgvalidate,
-		.amadjustmembers = spgadjustmembers,
-		.ambeginscan = spgbeginscan,
-		.amrescan = spgrescan,
-		.amgettuple = spggettuple,
-		.amgetbitmap = spggetbitmap,
-		.amendscan = spgendscan,
-		.ammarkpos = NULL,
-		.amrestrpos = NULL,
-		.amestimateparallelscan = NULL,
-		.aminitparallelscan = NULL,
-		.amparallelrescan = NULL,
-		.amtranslatestrategy = NULL,
-		.amtranslatecmptype = NULL,
-	};
+	amroutine->amstrategies = 0;
+	amroutine->amsupport = SPGISTNProc;
+	amroutine->amoptsprocnum = SPGIST_OPTIONS_PROC;
+	amroutine->amcanorder = false;
+	amroutine->amcanorderbyop = true;
+	amroutine->amcanbackward = false;
+	amroutine->amcanunique = false;
+	amroutine->amcanmulticol = false;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = false;
+	amroutine->amsearchnulls = true;
+	amroutine->amstorage = true;
+	amroutine->amclusterable = false;
+	amroutine->ampredlocks = false;
+	amroutine->amcanparallel = false;
+	amroutine->amcaninclude = true;
+	amroutine->amusemaintenanceworkmem = false;
+	amroutine->amsummarizing = false;
+	amroutine->amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_COND_CLEANUP;
+	amroutine->amkeytype = InvalidOid;
 
-	PG_RETURN_POINTER(&amroutine);
+	amroutine->ambuild = spgbuild;
+	amroutine->ambuildempty = spgbuildempty;
+	amroutine->aminsert = spginsert;
+	amroutine->ambulkdelete = spgbulkdelete;
+	amroutine->amvacuumcleanup = spgvacuumcleanup;
+	amroutine->amcanreturn = spgcanreturn;
+	amroutine->amcostestimate = spgcostestimate;
+	amroutine->amoptions = spgoptions;
+	amroutine->amproperty = spgproperty;
+	amroutine->ambuildphasename = NULL;
+	amroutine->amvalidate = spgvalidate;
+	amroutine->amadjustmembers = spgadjustmembers;
+	amroutine->ambeginscan = spgbeginscan;
+	amroutine->amrescan = spgrescan;
+	amroutine->amgettuple = spggettuple;
+	amroutine->amgetbitmap = spggetbitmap;
+	amroutine->amendscan = spgendscan;
+	amroutine->ammarkpos = NULL;
+	amroutine->amrestrpos = NULL;
+	amroutine->amestimateparallelscan = NULL;
+	amroutine->aminitparallelscan = NULL;
+	amroutine->amparallelrescan = NULL;
+
+	PG_RETURN_POINTER(amroutine);
 }
 
 /*
@@ -285,7 +276,7 @@ spgGetCache(Relation index)
 			UnlockReleaseBuffer(metabuffer);
 		}
 
-		index->rd_amcache = cache;
+		index->rd_amcache = (void *) cache;
 	}
 	else
 	{
@@ -335,9 +326,9 @@ getSpGistTupleDesc(Relation index, SpGistTypeDesc *keyType)
 		/* We shouldn't need to bother with making these valid: */
 		att->attcompression = InvalidCompressionMethod;
 		att->attcollation = InvalidOid;
-
-		populate_compact_attribute(outTupDesc, spgKeyColumn);
-		TupleDescFinalize(outTupDesc);
+		/* In case we changed typlen, we'd better reset following offsets */
+		for (int i = spgFirstIncludeColumn; i < outTupDesc->natts; i++)
+			TupleDescAttr(outTupDesc, i)->attcacheoff = -1;
 	}
 	return outTupDesc;
 }
@@ -377,7 +368,7 @@ initSpGistState(SpGistState *state, Relation index)
 	 * for VACUUM to immediately expire a redirection tuple that contains an
 	 * invalid xid.
 	 */
-	state->redirectXid = GetTopTransactionIdIfAny();
+	state->myXid = GetTopTransactionIdIfAny();
 
 	/* Assume we're not in an index build (spgbuild will override) */
 	state->isBuild = false;
@@ -784,7 +775,7 @@ SpGistGetInnerTypeSize(SpGistTypeDesc *att, Datum datum)
 	else if (att->attlen > 0)
 		size = att->attlen;
 	else
-		size = VARSIZE_ANY(DatumGetPointer(datum));
+		size = VARSIZE_ANY(datum);
 
 	return MAXALIGN(size);
 }
@@ -803,7 +794,7 @@ memcpyInnerDatum(void *target, SpGistTypeDesc *att, Datum datum)
 	}
 	else
 	{
-		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(DatumGetPointer(datum));
+		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(datum);
 		memcpy(target, DatumGetPointer(datum), size);
 	}
 }
@@ -815,7 +806,7 @@ memcpyInnerDatum(void *target, SpGistTypeDesc *att, Datum datum)
  */
 Size
 SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
-					   const Datum *datums, const bool *isnulls)
+					   Datum *datums, bool *isnulls)
 {
 	Size		size;
 	Size		data_size;
@@ -867,8 +858,8 @@ SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
  * Construct a leaf tuple containing the given heap TID and datum values
  */
 SpGistLeafTuple
-spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
-				 const Datum *datums, const bool *isnulls)
+spgFormLeafTuple(SpGistState *state, ItemPointer heapPtr,
+				 Datum *datums, bool *isnulls)
 {
 	SpGistLeafTuple tup;
 	TupleDesc	tupleDescriptor = state->leafTupDesc;
@@ -929,12 +920,12 @@ spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
 
 	if (needs_null_mask)
 	{
-		uint8	   *bp;			/* ptr to null bitmap in tuple */
+		bits8	   *bp;			/* ptr to null bitmap in tuple */
 
 		/* Set nullmask presence bit in SpGistLeafTuple header */
 		SGLT_SET_HASNULLMASK(tup, true);
 		/* Fill the data area and null mask */
-		bp = (uint8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
+		bp = (bits8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
 		heap_fill_tuple(tupleDescriptor, datums, isnulls, tp, data_size,
 						&tupmask, bp);
 	}
@@ -942,7 +933,7 @@ spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
 	{
 		/* Fill data area only */
 		heap_fill_tuple(tupleDescriptor, datums, isnulls, tp, data_size,
-						&tupmask, (uint8 *) NULL);
+						&tupmask, (bits8 *) NULL);
 	}
 	/* otherwise we have no data, nor a bitmap, to fill */
 
@@ -1093,7 +1084,7 @@ spgFormDeadTuple(SpGistState *state, int tupstate,
 	if (tupstate == SPGIST_REDIRECT)
 	{
 		ItemPointerSet(&tuple->pointer, blkno, offnum);
-		tuple->xid = state->redirectXid;
+		tuple->xid = state->myXid;
 	}
 	else
 	{
@@ -1116,7 +1107,7 @@ spgDeformLeafTuple(SpGistLeafTuple tup, TupleDesc tupleDescriptor,
 {
 	bool		hasNullsMask = SGLT_GET_HASNULLMASK(tup);
 	char	   *tp;				/* ptr to tuple data */
-	uint8	   *bp;				/* ptr to null bitmap in tuple */
+	bits8	   *bp;				/* ptr to null bitmap in tuple */
 
 	if (keyColumnIsNull && tupleDescriptor->natts == 1)
 	{
@@ -1137,7 +1128,7 @@ spgDeformLeafTuple(SpGistLeafTuple tup, TupleDesc tupleDescriptor,
 	}
 
 	tp = (char *) tup + SGLTHDRSZ(hasNullsMask);
-	bp = (uint8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
+	bp = (bits8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
 
 	index_deform_tuple_internal(tupleDescriptor,
 								datums, isnulls,
@@ -1176,7 +1167,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
 	}
 	else
 	{
-		nodeLabels = palloc_array(Datum, innerTuple->nNodes);
+		nodeLabels = (Datum *) palloc(sizeof(Datum) * innerTuple->nNodes);
 		SGITITERATE(innerTuple, i, node)
 		{
 			if (IndexTupleHasNulls(node))
@@ -1199,7 +1190,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
  * rather than returning InvalidOffsetNumber.
  */
 OffsetNumber
-SpGistPageAddNewItem(SpGistState *state, Page page, const void *item, Size size,
+SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
 					 OffsetNumber *startOffset, bool errorOK)
 {
 	SpGistPageOpaque opaque = SpGistPageGetOpaque(page);

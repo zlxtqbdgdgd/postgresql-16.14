@@ -14,7 +14,7 @@
  *
  * Currently, the supported keywords are "level", "long", and "workers".
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/common/compression.c
@@ -40,36 +40,6 @@ static int	expect_integer_value(char *keyword, char *value,
 								 pg_compress_specification *result);
 static bool expect_boolean_value(char *keyword, char *value,
 								 pg_compress_specification *result);
-
-/*
- * Look up a compression algorithm by archive file extension. Returns true and
- * sets *algorithm if the extension is recognized. Otherwise returns false.
- */
-bool
-parse_tar_compress_algorithm(const char *fname, pg_compress_algorithm *algorithm)
-{
-	size_t		fname_len = strlen(fname);
-
-	if (fname_len >= 4 &&
-		strcmp(fname + fname_len - 4, ".tar") == 0)
-		*algorithm = PG_COMPRESSION_NONE;
-	else if (fname_len >= 4 &&
-			 strcmp(fname + fname_len - 4, ".tgz") == 0)
-		*algorithm = PG_COMPRESSION_GZIP;
-	else if (fname_len >= 7 &&
-			 strcmp(fname + fname_len - 7, ".tar.gz") == 0)
-		*algorithm = PG_COMPRESSION_GZIP;
-	else if (fname_len >= 8 &&
-			 strcmp(fname + fname_len - 8, ".tar.lz4") == 0)
-		*algorithm = PG_COMPRESSION_LZ4;
-	else if (fname_len >= 8 &&
-			 strcmp(fname + fname_len - 8, ".tar.zst") == 0)
-		*algorithm = PG_COMPRESSION_ZSTD;
-	else
-		return false;
-
-	return true;
-}
 
 /*
  * Look up a compression algorithm by name. Returns true and sets *algorithm

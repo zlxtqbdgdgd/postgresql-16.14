@@ -3,7 +3,7 @@
  * constraint.c
  *	  PostgreSQL CONSTRAINT support code.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,11 +14,13 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 
@@ -106,8 +108,7 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 */
 	tmptid = checktid;
 	{
-		IndexFetchTableData *scan = table_index_fetch_begin(trigdata->tg_relation,
-															SO_NONE);
+		IndexFetchTableData *scan = table_index_fetch_begin(trigdata->tg_relation);
 		bool		call_again = false;
 
 		if (!table_index_fetch_tuple(scan, &tmptid, SnapshotSelf, slot,
@@ -175,9 +176,6 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 		index_insert(indexRel, values, isnull, &checktid,
 					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
 					 false, indexInfo);
-
-		/* Cleanup cache possibly initialized by index_insert. */
-		index_insert_cleanup(indexRel, indexInfo);
 	}
 	else
 	{

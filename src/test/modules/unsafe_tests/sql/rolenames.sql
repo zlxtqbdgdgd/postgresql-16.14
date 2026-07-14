@@ -75,8 +75,6 @@ CREATE ROLE pg_abc; -- error
 CREATE ROLE "pg_abc"; -- error
 CREATE ROLE pg_abcdef; -- error
 CREATE ROLE "pg_abcdef"; -- error
-CREATE ROLE "invalid
-rolename"; -- error
 
 CREATE ROLE regress_testrol0 SUPERUSER LOGIN;
 CREATE ROLE regress_testrolx SUPERUSER LOGIN;

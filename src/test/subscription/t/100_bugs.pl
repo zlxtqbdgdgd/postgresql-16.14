@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Tests for various bugs found over time
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -24,7 +24,7 @@ $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init;
+$node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
@@ -175,7 +175,7 @@ $node_pub_sub->init(allows_streaming => 'logical');
 $node_pub_sub->start;
 
 my $node_sub = PostgreSQL::Test::Cluster->new('testsubscriber1');
-$node_sub->init;
+$node_sub->init(allows_streaming => 'logical');
 $node_sub->start;
 
 # Create the tables in all nodes.
@@ -377,8 +377,8 @@ $node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_sch");
 $node_publisher->stop('fast');
 $node_subscriber->stop('fast');
 
-# The bug was that when the REPLICA IDENTITY FULL is used with dropped
-# we fail to apply updates and deletes
+# The bug was that when the REPLICA IDENTITY FULL is used with dropped or
+# generated columns, we fail to apply updates and deletes
 $node_publisher->rotate_logfile();
 $node_publisher->start();
 
@@ -389,14 +389,18 @@ $node_publisher->safe_psql(
 	'postgres', qq(
 	CREATE TABLE dropped_cols (a int, b_drop int, c int);
 	ALTER TABLE dropped_cols REPLICA IDENTITY FULL;
-	CREATE PUBLICATION pub_dropped_cols FOR TABLE dropped_cols;
+	CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
+	ALTER TABLE generated_cols REPLICA IDENTITY FULL;
+	CREATE PUBLICATION pub_dropped_cols FOR TABLE dropped_cols, generated_cols;
 	-- some initial data
 	INSERT INTO dropped_cols VALUES (1, 1, 1);
+	INSERT INTO generated_cols (a, c) VALUES (1, 1);
 ));
 
 $node_subscriber->safe_psql(
 	'postgres', qq(
 	 CREATE TABLE dropped_cols (a int, b_drop int, c int);
+	 CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
 ));
 
 $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
@@ -417,6 +421,7 @@ $node_subscriber->safe_psql(
 $node_publisher->safe_psql(
 	'postgres', qq(
 		UPDATE dropped_cols SET a = 100;
+		UPDATE generated_cols SET a = 100;
 ));
 $node_publisher->wait_for_catchup('sub_dropped_cols');
 
@@ -424,6 +429,11 @@ is( $node_subscriber->safe_psql(
 		'postgres', "SELECT count(*) FROM dropped_cols WHERE a = 100"),
 	qq(1),
 	'replication with RI FULL and dropped columns');
+
+is( $node_subscriber->safe_psql(
+		'postgres', "SELECT count(*) FROM generated_cols WHERE a = 100"),
+	qq(1),
+	'replication with RI FULL and generated columns');
 
 $node_publisher->stop('fast');
 $node_subscriber->stop('fast');
@@ -459,41 +469,24 @@ $node_subscriber->safe_psql(
 ));
 
 $node_subscriber->wait_for_subscription_sync($node_publisher, 'sub1');
-$result =
-  $node_subscriber->safe_psql('postgres', "SELECT a, b FROM tab_default");
-is( $result, qq(1|f
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT a, b FROM tab_default");
+is($result, qq(1|f
 2|t), 'check snapshot on subscriber');
 
 # Update all rows in the table and ensure the rows with the missing `b`
 # attribute replicate correctly.
-$node_publisher->safe_psql('postgres', "UPDATE tab_default SET a = a + 1");
+$node_publisher->safe_psql('postgres',
+	"UPDATE tab_default SET a = a + 1");
 $node_publisher->wait_for_catchup('sub1');
 
 # When the bug is present, the `1|f` row will not be updated to `2|f` because
 # the publisher incorrectly fills in `NULL` for `b` and publishes an update
 # for `1|NULL`, which doesn't exist in the subscriber.
-$result =
-  $node_subscriber->safe_psql('postgres', "SELECT a, b FROM tab_default");
-is( $result, qq(2|f
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT a, b FROM tab_default");
+is($result, qq(2|f
 3|t), 'check replicated update on subscriber');
-
-# Test create and immediate drop of replication slot via replication commands
-# (this exposed a memory-management bug in v18)
-my $publisher_host = $node_publisher->host;
-my $publisher_port = $node_publisher->port;
-my $connstr_db =
-  "host=$publisher_host port=$publisher_port replication=database dbname=postgres";
-
-is( $node_publisher->psql(
-		'postgres',
-		qq[
-		CREATE_REPLICATION_SLOT test_slot LOGICAL pgoutput (SNAPSHOT export);
-		DROP_REPLICATION_SLOT test_slot;
-	],
-		timeout => $PostgreSQL::Test::Utils::timeout_default,
-		extra_params => [ '-d', $connstr_db ]),
-	0,
-	'create and immediate drop of replication slot');
 
 $node_publisher->stop('fast');
 $node_subscriber->stop('fast');
@@ -602,53 +595,6 @@ like(
 	"could not drop replication slot: error message");
 
 $node_publisher->safe_psql('postgres', "DROP DATABASE regress_db");
-
-$node_publisher->stop('fast');
-
-# https://postgr.es/m/19c7623e882.4080fd5426212.311756747309556767%40zohocorp.com
-
-# The bug was that when an ERROR was raised while processing an INSERT ... ON
-# CONFLICT statement, the decoded change misses to be free'd. This can cause an
-# assertion failure if enabled.
-
-$node_publisher->rotate_logfile();
-$node_publisher->start();
-
-# Create a publication with the zero-division row filter. It always throws an
-# ERROR before publishing changes, when the filter is evaluated.
-$node_publisher->safe_psql(
-	'postgres', qq(
-	CREATE TABLE tab_upsert (a INT PRIMARY KEY, b INT);
-	CREATE PUBLICATION pub_rowfilter_error FOR TABLE tab_upsert WHERE ((a / 0) > 0);
-	SELECT * FROM pg_create_logical_replication_slot('upsert_slot', 'pgoutput');
-	INSERT INTO tab_upsert (a, b) VALUES (1, 1)
-		ON CONFLICT(a) DO UPDATE SET b = excluded.b;
-));
-
-# Decode the changes with a publication whose row filter causes a
-# division by zero error, and verify that the logical decoder doesn't crash.
-($ret, $stdout, $stderr) = $node_publisher->psql(
-	'postgres', qq(
-	SELECT *
-	FROM pg_logical_slot_peek_binary_changes(
-		'upsert_slot',
-		NULL,
-		NULL,
-		'proto_version', '1',
-		'publication_names', 'pub_rowfilter_error'
-	);
-));
-
-ok( $stderr =~ qr/division by zero/,
-	'peek logical changes with row filter causing division by zero throws error'
-);
-
-# Clean up
-$node_publisher->safe_psql('postgres',
-	"SELECT pg_drop_replication_slot('upsert_slot')");
-$node_publisher->safe_psql('postgres',
-	"DROP PUBLICATION pub_rowfilter_error");
-$node_publisher->safe_psql('postgres', "DROP TABLE tab_upsert");
 
 $node_publisher->stop('fast');
 

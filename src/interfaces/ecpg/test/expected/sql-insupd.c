@@ -22,7 +22,7 @@
 #line 5 "insupd.pgc"
 
 
-int main(void) {
+int main() {
   /* exec sql begin declare section */
 	    
   

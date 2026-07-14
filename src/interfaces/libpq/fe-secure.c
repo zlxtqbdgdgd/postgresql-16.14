@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,10 +35,12 @@
 
 #include <sys/stat.h>
 
+#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
+#endif
 #endif
 
 #include "fe-auth.h"
@@ -53,6 +55,8 @@
 #ifndef WIN32
 
 #define SIGPIPE_MASKED(conn)	((conn)->sigpipe_so || (conn)->sigpipe_flag)
+
+#ifdef ENABLE_THREAD_SAFETY
 
 struct sigpipe_info
 {
@@ -86,6 +90,24 @@ struct sigpipe_info
 			pq_reset_sigpipe(&(spinfo).oldsigmask, (spinfo).sigpipe_pending, \
 							 (spinfo).got_epipe); \
 	} while (0)
+#else							/* !ENABLE_THREAD_SAFETY */
+
+#define DECLARE_SIGPIPE_INFO(spinfo) pqsigfunc spinfo = NULL
+
+#define DISABLE_SIGPIPE(conn, spinfo, failaction) \
+	do { \
+		if (!SIGPIPE_MASKED(conn)) \
+			spinfo = pqsignal(SIGPIPE, SIG_IGN); \
+	} while (0)
+
+#define REMEMBER_EPIPE(spinfo, cond)
+
+#define RESTORE_SIGPIPE(conn, spinfo) \
+	do { \
+		if (!SIGPIPE_MASKED(conn)) \
+			pqsignal(SIGPIPE, spinfo); \
+	} while (0)
+#endif							/* ENABLE_THREAD_SAFETY */
 #else							/* WIN32 */
 
 #define DECLARE_SIGPIPE_INFO(spinfo)
@@ -108,27 +130,42 @@ PQsslInUse(PGconn *conn)
 }
 
 /*
- *	Exported function to allow application to tell us it's already initialized
- *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
- *	initialize libssl and libcrypto, so this is a no-op.  This function remains
- *	for backwards API compatibility.
+ *	Exported function to allow application to tell us it's already
+ *	initialized OpenSSL.
  */
 void
 PQinitSSL(int do_init)
 {
-	/* no-op */
+#ifdef USE_SSL
+	pgtls_init_library(do_init, do_init);
+#endif
 }
 
 /*
- *	Exported function to allow application to tell us it's already initialized
- *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
- *	initialize libssl and libcrypto, so this is a no-op.  This function remains
- *	for backwards API compatibility.
+ *	Exported function to allow application to tell us it's already
+ *	initialized OpenSSL and/or libcrypto.
  */
 void
 PQinitOpenSSL(int do_ssl, int do_crypto)
 {
-	/* no-op */
+#ifdef USE_SSL
+	pgtls_init_library(do_ssl, do_crypto);
+#endif
+}
+
+/*
+ *	Initialize global SSL context
+ */
+int
+pqsecure_initialize(PGconn *conn, bool do_ssl, bool do_crypto)
+{
+	int			r = 0;
+
+#ifdef USE_SSL
+	r = pgtls_init(conn, do_ssl, do_crypto);
+#endif
+
+	return r;
 }
 
 /*
@@ -241,29 +278,6 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 	SOCK_ERRNO_SET(result_errno);
 
 	return n;
-}
-
-/*
- *	Return the number of bytes available in the transport buffer.
- *
- * If pqsecure_read() is called for this number of bytes, it's guaranteed to
- * return successfully without reading from the underlying socket.  See
- * pqDrainPending() for a more complete discussion of the concepts involved.
- */
-ssize_t
-pqsecure_bytes_pending(PGconn *conn)
-{
-#ifdef USE_SSL
-	if (conn->ssl_in_use)
-		return pgtls_bytes_pending(conn);
-#endif
-#ifdef ENABLE_GSS
-	if (conn->gssenc)
-		return pg_GSS_bytes_pending(conn);
-#endif
-
-	/* Plaintext connections have no transport buffer. */
-	return 0;
 }
 
 /*
@@ -402,7 +416,7 @@ retry_masked:
 				/* Set flag for EPIPE */
 				REMEMBER_EPIPE(spinfo, true);
 
-				pg_fallthrough;
+				/* FALL THRU */
 
 			case ECONNRESET:
 				conn->write_failed = true;
@@ -517,7 +531,7 @@ PQgssEncInUse(PGconn *conn)
 #endif							/* ENABLE_GSS */
 
 
-#if !defined(WIN32)
+#if defined(ENABLE_THREAD_SAFETY) && !defined(WIN32)
 
 /*
  *	Block SIGPIPE for this thread.  This prevents send()/write() from exiting
@@ -601,4 +615,4 @@ pq_reset_sigpipe(sigset_t *osigset, bool sigpipe_pending, bool got_epipe)
 	SOCK_ERRNO_SET(save_errno);
 }
 
-#endif							/* !WIN32 */
+#endif							/* ENABLE_THREAD_SAFETY && !WIN32 */

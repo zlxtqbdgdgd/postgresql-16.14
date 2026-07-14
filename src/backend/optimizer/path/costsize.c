@@ -50,17 +50,6 @@
  * so beware of division-by-zero.)	The LIMIT is applied as a top-level
  * plan node.
  *
- * Each path stores the total number of disabled nodes that exist at or
- * below that point in the plan tree. This is regarded as a component of
- * the cost, and paths with fewer disabled nodes should be regarded as
- * cheaper than those with more. Disabled nodes occur when the user sets
- * a GUC like enable_seqscan=false. We can't necessarily respect such a
- * setting in every part of the plan tree, but we want to respect in as many
- * parts of the plan tree as possible. Simpler schemes like storing a Boolean
- * here rather than a count fail to do that. We used to disable nodes by
- * adding a large constant to the startup cost, but that distorted planning
- * in other ways.
- *
  * For largely historical reasons, most of the routines in this module use
  * the passed result Path only to store their results (rows, startup_cost and
  * total_cost) into.  All the input data they need is passed as separate
@@ -71,7 +60,7 @@
  * values.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -95,7 +84,6 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "nodes/tidbitmap.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -103,6 +91,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
+#include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -151,7 +140,6 @@ bool		enable_tidscan = true;
 bool		enable_sort = true;
 bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
-bool		enable_groupagg = true;
 bool		enable_nestloop = true;
 bool		enable_material = true;
 bool		enable_memoize = true;
@@ -231,32 +219,29 @@ clamp_row_est(double nrows)
 }
 
 /*
- * clamp_width_est
- *		Force a tuple-width estimate to a sane value.
- *
- * The planner represents datatype width and tuple width estimates as int32.
- * When summing column width estimates to create a tuple width estimate,
- * it's possible to reach integer overflow in edge cases.  To ensure sane
- * behavior, we form such sums in int64 arithmetic and then apply this routine
- * to clamp to int32 range.
+ * clamp_cardinality_to_long
+ *		Cast a Cardinality value to a sane long value.
  */
-int32
-clamp_width_est(int64 tuple_width)
+long
+clamp_cardinality_to_long(Cardinality x)
 {
 	/*
-	 * Anything more than MaxAllocSize is clearly bogus, since we could not
-	 * create a tuple that large.
+	 * Just for paranoia's sake, ensure we do something sane with negative or
+	 * NaN values.
 	 */
-	if (tuple_width > MaxAllocSize)
-		return (int32) MaxAllocSize;
+	if (isnan(x))
+		return LONG_MAX;
+	if (x <= 0)
+		return 0;
 
 	/*
-	 * Unlike clamp_row_est, we just Assert that the value isn't negative,
-	 * rather than masking such errors.
+	 * If "long" is 64 bits, then LONG_MAX cannot be represented exactly as a
+	 * double.  Casting it to double and back may well result in overflow due
+	 * to rounding, so avoid doing that.  We trust that any double value that
+	 * compares strictly less than "(double) LONG_MAX" will cast to a
+	 * representable "long" value.
 	 */
-	Assert(tuple_width >= 0);
-
-	return (int32) tuple_width;
+	return (x < (double) LONG_MAX) ? (long) x : LONG_MAX;
 }
 
 
@@ -277,7 +262,6 @@ cost_seqscan(Path *path, PlannerInfo *root,
 	double		spc_seq_page_cost;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = PGS_SEQSCAN;
 
 	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
@@ -288,6 +272,9 @@ cost_seqscan(Path *path, PlannerInfo *root,
 		path->rows = param_info->ppi_rows;
 	else
 		path->rows = baserel->rows;
+
+	if (!enable_seqscan)
+		startup_cost += disable_cost;
 
 	/* fetch estimated page cost for tablespace containing table */
 	get_tablespace_page_costs(baserel->reltablespace,
@@ -330,11 +317,7 @@ cost_seqscan(Path *path, PlannerInfo *root,
 		 */
 		path->rows = clamp_row_est(path->rows / parallel_divisor);
 	}
-	else
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
 
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + cpu_run_cost + disk_run_cost;
 }
@@ -360,7 +343,6 @@ cost_samplescan(Path *path, PlannerInfo *root,
 				spc_page_cost;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations with tablesample clauses */
 	Assert(baserel->relid > 0);
@@ -408,11 +390,6 @@ cost_samplescan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -451,8 +428,6 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows;
 
-	path->path.disabled_nodes = path->subpath->disabled_nodes
-		+ ((rel->pgs_mask & PGS_GATHER) != 0 ? 0 : 1);
 	path->path.startup_cost = startup_cost;
 	path->path.total_cost = (startup_cost + run_cost);
 }
@@ -470,7 +445,6 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 void
 cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 				  RelOptInfo *rel, ParamPathInfo *param_info,
-				  int input_disabled_nodes,
 				  Cost input_startup_cost, Cost input_total_cost,
 				  double *rows)
 {
@@ -487,6 +461,9 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 		path->path.rows = param_info->ppi_rows;
 	else
 		path->path.rows = rel->rows;
+
+	if (!enable_gathermerge)
+		startup_cost += disable_cost;
 
 	/*
 	 * Add one to the number of workers to account for the leader.  This might
@@ -518,8 +495,6 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows * 1.05;
 
-	path->path.disabled_nodes = path->subpath->disabled_nodes
-		+ ((rel->pgs_mask & PGS_GATHER_MERGE) != 0 ? 0 : 1);
 	path->path.startup_cost = startup_cost + input_startup_cost;
 	path->path.total_cost = (startup_cost + run_cost + input_total_cost);
 }
@@ -569,7 +544,6 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	double		pages_fetched;
 	double		rand_heap_pages;
 	double		index_pages;
-	uint64		enable_mask;
 
 	/* Should only be applied to base relations */
 	Assert(IsA(baserel, RelOptInfo) &&
@@ -601,11 +575,9 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 											  path->indexclauses);
 	}
 
-	/* is this scan type disabled? */
-	enable_mask = (indexonly ? PGS_INDEXONLYSCAN : PGS_INDEXSCAN)
-		| (partial_path ? 0 : PGS_CONSIDER_NONPARTIAL);
-	path->path.disabled_nodes =
-		(baserel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
+	if (!enable_indexscan)
+		startup_cost += disable_cost;
+	/* we don't need to check enable_indexonlyscan; indxpath.c does that */
 
 	/*
 	 * Call index-access-method-specific code to estimate the processing cost
@@ -1026,7 +998,6 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 	double		spc_seq_page_cost,
 				spc_random_page_cost;
 	double		T;
-	uint64		enable_mask = PGS_BITMAPSCAN;
 
 	/* Should only be applied to base relations */
 	Assert(IsA(baserel, RelOptInfo));
@@ -1038,6 +1009,9 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 		path->rows = param_info->ppi_rows;
 	else
 		path->rows = baserel->rows;
+
+	if (!enable_bitmapscan)
+		startup_cost += disable_cost;
 
 	pages_fetched = compute_bitmap_pages(root, baserel, bitmapqual,
 										 loop_count, &indexTotalCost,
@@ -1092,8 +1066,6 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 
 		path->rows = clamp_row_est(path->rows / parallel_divisor);
 	}
-	else
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
 
 
 	run_cost += cpu_run_cost;
@@ -1102,8 +1074,6 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1189,7 +1159,6 @@ cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root)
 	}
 	path->bitmapselectivity = selec;
 	path->path.rows = 0;		/* per above, not used */
-	path->path.disabled_nodes = 0;
 	path->path.startup_cost = totalCost;
 	path->path.total_cost = totalCost;
 }
@@ -1254,18 +1223,17 @@ cost_tidscan(Path *path, PlannerInfo *root,
 {
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
+	bool		isCurrentOf = false;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 	QualCost	tid_qual_cost;
-	double		ntuples;
+	int			ntuples;
 	ListCell   *l;
 	double		spc_random_page_cost;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
 	Assert(baserel->rtekind == RTE_RELATION);
-	Assert(tidquals != NIL);
 
 	/* Mark the path with the correct row estimate */
 	if (param_info)
@@ -1280,25 +1248,18 @@ cost_tidscan(Path *path, PlannerInfo *root,
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
 		Expr	   *qual = rinfo->clause;
 
-		/*
-		 * We must use a TID scan for CurrentOfExpr; in any other case, we
-		 * should be generating a TID scan only if TID scans are allowed.
-		 * Also, if CurrentOfExpr is the qual, there should be only one.
-		 */
-		Assert((baserel->pgs_mask & PGS_TIDSCAN) != 0 || IsA(qual, CurrentOfExpr));
-		Assert(list_length(tidquals) == 1 || !IsA(qual, CurrentOfExpr));
-
 		if (IsA(qual, ScalarArrayOpExpr))
 		{
 			/* Each element of the array yields 1 tuple */
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) qual;
 			Node	   *arraynode = (Node *) lsecond(saop->args);
 
-			ntuples += estimate_array_length(root, arraynode);
+			ntuples += estimate_array_length(arraynode);
 		}
 		else if (IsA(qual, CurrentOfExpr))
 		{
 			/* CURRENT OF yields 1 tuple */
+			isCurrentOf = true;
 			ntuples++;
 		}
 		else
@@ -1307,6 +1268,22 @@ cost_tidscan(Path *path, PlannerInfo *root,
 			ntuples++;
 		}
 	}
+
+	/*
+	 * We must force TID scan for WHERE CURRENT OF, because only nodeTidscan.c
+	 * understands how to do it correctly.  Therefore, honor enable_tidscan
+	 * only when CURRENT OF isn't present.  Also note that cost_qual_eval
+	 * counts a CurrentOfExpr as having startup cost disable_cost, which we
+	 * subtract off here; that's to prevent other plan types such as seqscan
+	 * from winning.
+	 */
+	if (isCurrentOf)
+	{
+		Assert(baserel->baserestrictcost.startup >= disable_cost);
+		startup_cost -= disable_cost;
+	}
+	else if (!enable_tidscan)
+		startup_cost += disable_cost;
 
 	/*
 	 * The TID qual expressions will be computed once, any other baserestrict
@@ -1335,16 +1312,6 @@ cost_tidscan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	/*
-	 * There are assertions above verifying that we only reach this function
-	 * either when baserel->pgs_mask includes PGS_TIDSCAN or when the TID scan
-	 * is the only legal path, so we only need to consider the effects of
-	 * PGS_CONSIDER_NONPARTIAL here.
-	 */
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1365,9 +1332,8 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 {
 	Selectivity selectivity;
 	double		pages;
-	Cost		startup_cost;
-	Cost		cpu_run_cost;
-	Cost		disk_run_cost;
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 	QualCost	tid_qual_cost;
@@ -1375,7 +1341,6 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 	double		nseqpages;
 	double		spc_random_page_cost;
 	double		spc_seq_page_cost;
-	uint64		enable_mask = PGS_TIDSCAN;
 
 	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
@@ -1400,11 +1365,14 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 	 * page is just a normal sequential page read. NOTE: it's desirable for
 	 * TID Range Scans to cost more than the equivalent Sequential Scans,
 	 * because Seq Scans have some performance advantages such as scan
-	 * synchronization, and we'd prefer one of them to be picked unless a TID
-	 * Range Scan really is better.
+	 * synchronization and parallelizability, and we'd prefer one of them to
+	 * be picked unless a TID Range Scan really is better.
 	 */
 	ntuples = selectivity * baserel->tuples;
 	nseqpages = pages - 1.0;
+
+	if (!enable_tidscan)
+		startup_cost += disable_cost;
 
 	/*
 	 * The TID qual expressions will be computed once, any other baserestrict
@@ -1418,7 +1386,7 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 							  &spc_seq_page_cost);
 
 	/* disk costs; 1 random page and the remainder as seq pages */
-	disk_run_cost = spc_random_page_cost + spc_seq_page_cost * nseqpages;
+	run_cost += spc_random_page_cost + spc_seq_page_cost * nseqpages;
 
 	/* Add scanning CPU costs */
 	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
@@ -1430,41 +1398,17 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 	 * can't be removed, this is a mistake and we're going to underestimate
 	 * the CPU cost a bit.)
 	 */
-	startup_cost = qpqual_cost.startup + tid_qual_cost.per_tuple;
+	startup_cost += qpqual_cost.startup + tid_qual_cost.per_tuple;
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple -
 		tid_qual_cost.per_tuple;
-	cpu_run_cost = cpu_per_tuple * ntuples;
+	run_cost += cpu_per_tuple * ntuples;
 
 	/* tlist eval costs are paid per output row, not per tuple scanned */
 	startup_cost += path->pathtarget->cost.startup;
-	cpu_run_cost += path->pathtarget->cost.per_tuple * path->rows;
+	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	/* Adjust costing for parallelism, if used. */
-	if (path->parallel_workers > 0)
-	{
-		double		parallel_divisor = get_parallel_divisor(path);
-
-		/* The CPU cost is divided among all the workers. */
-		cpu_run_cost /= parallel_divisor;
-
-		/*
-		 * In the case of a parallel plan, the row count needs to represent
-		 * the number of tuples processed per worker.
-		 */
-		path->rows = clamp_row_est(path->rows / parallel_divisor);
-	}
-
-	/*
-	 * We should not generate this path type when PGS_TIDSCAN is unset, but we
-	 * might need to disable this path due to PGS_CONSIDER_NONPARTIAL.
-	 */
-	Assert((baserel->pgs_mask & PGS_TIDSCAN) != 0);
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
-	path->total_cost = startup_cost + cpu_run_cost + disk_run_cost;
+	path->total_cost = startup_cost + run_cost;
 }
 
 /*
@@ -1485,7 +1429,6 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 	List	   *qpquals;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are subqueries */
 	Assert(baserel->relid > 0);
@@ -1516,10 +1459,6 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 	 * SubqueryScan node, plus cpu_tuple_cost to account for selection and
 	 * projection overhead.
 	 */
-	if (path->path.parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->path.disabled_nodes = path->subpath->disabled_nodes
-		+ (((baserel->pgs_mask & enable_mask) != enable_mask) ? 1 : 0);
 	path->path.startup_cost = path->subpath->startup_cost;
 	path->path.total_cost = path->subpath->total_cost;
 
@@ -1570,7 +1509,6 @@ cost_functionscan(Path *path, PlannerInfo *root,
 	Cost		cpu_per_tuple;
 	RangeTblEntry *rte;
 	QualCost	exprcost;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are functions */
 	Assert(baserel->relid > 0);
@@ -1611,10 +1549,6 @@ cost_functionscan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1636,7 +1570,6 @@ cost_tablefuncscan(Path *path, PlannerInfo *root,
 	Cost		cpu_per_tuple;
 	RangeTblEntry *rte;
 	QualCost	exprcost;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are functions */
 	Assert(baserel->relid > 0);
@@ -1672,10 +1605,6 @@ cost_tablefuncscan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1695,7 +1624,6 @@ cost_valuesscan(Path *path, PlannerInfo *root,
 	Cost		run_cost = 0;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are values lists */
 	Assert(baserel->relid > 0);
@@ -1724,10 +1652,6 @@ cost_valuesscan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1750,7 +1674,6 @@ cost_ctescan(Path *path, PlannerInfo *root,
 	Cost		run_cost = 0;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are CTEs */
 	Assert(baserel->relid > 0);
@@ -1776,10 +1699,6 @@ cost_ctescan(Path *path, PlannerInfo *root,
 	startup_cost += path->pathtarget->cost.startup;
 	run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1796,7 +1715,6 @@ cost_namedtuplestorescan(Path *path, PlannerInfo *root,
 	Cost		run_cost = 0;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to base relations that are Tuplestores */
 	Assert(baserel->relid > 0);
@@ -1818,10 +1736,6 @@ cost_namedtuplestorescan(Path *path, PlannerInfo *root,
 	cpu_per_tuple += cpu_tuple_cost + qpqual_cost.per_tuple;
 	run_cost += cpu_per_tuple * baserel->tuples;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1838,7 +1752,6 @@ cost_resultscan(Path *path, PlannerInfo *root,
 	Cost		run_cost = 0;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
-	uint64		enable_mask = 0;
 
 	/* Should only be applied to RTE_RESULT base relations */
 	Assert(baserel->relid > 0);
@@ -1857,10 +1770,6 @@ cost_resultscan(Path *path, PlannerInfo *root,
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
 	run_cost += cpu_per_tuple * baserel->tuples;
 
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	path->disabled_nodes =
-		(baserel->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1878,7 +1787,6 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 	Cost		startup_cost;
 	Cost		total_cost;
 	double		total_rows;
-	uint64		enable_mask = 0;
 
 	/* We probably have decent estimates for the non-recursive term */
 	startup_cost = nrterm->startup_cost;
@@ -1901,10 +1809,6 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 	 */
 	total_cost += cpu_tuple_cost * total_rows;
 
-	if (runion->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	runion->disabled_nodes =
-		(runion->parent->pgs_mask & enable_mask) != enable_mask ? 1 : 0;
 	runion->startup_cost = startup_cost;
 	runion->total_cost = total_cost;
 	runion->rows = total_rows;
@@ -1957,7 +1861,7 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
 	double		output_tuples;
-	int64		sort_mem_bytes = sort_mem * (int64) 1024;
+	long		sort_mem_bytes = sort_mem * 1024L;
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -2053,7 +1957,6 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 void
 cost_incremental_sort(Path *path,
 					  PlannerInfo *root, List *pathkeys, int presorted_keys,
-					  int input_disabled_nodes,
 					  Cost input_startup_cost, Cost input_total_cost,
 					  double input_tuples, int width, Cost comparison_cost, int sort_mem,
 					  double limit_tuples)
@@ -2173,15 +2076,6 @@ cost_incremental_sort(Path *path,
 	run_cost += 2.0 * cpu_tuple_cost * input_groups;
 
 	path->rows = input_tuples;
-
-	/*
-	 * We should not generate these paths when enable_incremental_sort=false.
-	 * We can ignore PGS_CONSIDER_NONPARTIAL here, because if it's relevant,
-	 * it will have already affected the input path.
-	 */
-	Assert(enable_incremental_sort);
-	path->disabled_nodes = input_disabled_nodes;
-
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -2200,8 +2094,7 @@ cost_incremental_sort(Path *path,
  */
 void
 cost_sort(Path *path, PlannerInfo *root,
-		  List *pathkeys, int input_disabled_nodes,
-		  Cost input_cost, double tuples, int width,
+		  List *pathkeys, Cost input_cost, double tuples, int width,
 		  Cost comparison_cost, int sort_mem,
 		  double limit_tuples)
 
@@ -2214,14 +2107,12 @@ cost_sort(Path *path, PlannerInfo *root,
 				   comparison_cost, sort_mem,
 				   limit_tuples);
 
+	if (!enable_sort)
+		startup_cost += disable_cost;
+
 	startup_cost += input_cost;
 
-	/*
-	 * We can ignore PGS_CONSIDER_NONPARTIAL here, because if it's relevant,
-	 * it will have already affected the input path.
-	 */
 	path->rows = tuples;
-	path->disabled_nodes = input_disabled_nodes + (enable_sort ? 0 : 1);
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -2251,7 +2142,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	 * whichever is less.
 	 */
 	arrlen = Min(parallel_workers, numpaths);
-	costarr = palloc_array(Cost, arrlen);
+	costarr = (Cost *) palloc(sizeof(Cost) * arrlen);
 
 	/* The first few paths will each be claimed by a different worker. */
 	path_index = 0;
@@ -2309,17 +2200,10 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
  *	  Determines and returns the cost of an Append node.
  */
 void
-cost_append(AppendPath *apath, PlannerInfo *root)
+cost_append(AppendPath *apath)
 {
-	RelOptInfo *rel = apath->path.parent;
 	ListCell   *l;
-	uint64		enable_mask = PGS_APPEND;
 
-	if (apath->path.parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-
-	apath->path.disabled_nodes =
-		(rel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
 	apath->path.startup_cost = 0;
 	apath->path.total_cost = 0;
 	apath->path.rows = 0;
@@ -2341,16 +2225,12 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 			 */
 			apath->path.startup_cost = firstsubpath->startup_cost;
 
-			/*
-			 * Compute rows, number of disabled nodes, and total cost as sums
-			 * of underlying subplan values.
-			 */
+			/* Compute rows and costs as sums of subplan rows and costs. */
 			foreach(l, apath->subpaths)
 			{
 				Path	   *subpath = (Path *) lfirst(l);
 
 				apath->path.rows += subpath->rows;
-				apath->path.disabled_nodes += subpath->disabled_nodes;
 				apath->path.total_cost += subpath->total_cost;
 			}
 		}
@@ -2377,57 +2257,29 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 			foreach(l, apath->subpaths)
 			{
 				Path	   *subpath = (Path *) lfirst(l);
-				int			presorted_keys;
-				Path		sort_path;	/* dummy for result of
-										 * cost_sort/cost_incremental_sort */
+				Path		sort_path;	/* dummy for result of cost_sort */
 
-				if (!pathkeys_count_contained_in(pathkeys, subpath->pathkeys,
-												 &presorted_keys))
+				if (!pathkeys_contained_in(pathkeys, subpath->pathkeys))
 				{
 					/*
 					 * We'll need to insert a Sort node, so include costs for
-					 * that.  We choose to use incremental sort if it is
-					 * enabled and there are presorted keys; otherwise we use
-					 * full sort.
-					 *
-					 * We can use the parent's LIMIT if any, since we
+					 * that.  We can use the parent's LIMIT if any, since we
 					 * certainly won't pull more than that many tuples from
 					 * any child.
 					 */
-					if (enable_incremental_sort && presorted_keys > 0)
-					{
-						cost_incremental_sort(&sort_path,
-											  root,
-											  pathkeys,
-											  presorted_keys,
-											  subpath->disabled_nodes,
-											  subpath->startup_cost,
-											  subpath->total_cost,
-											  subpath->rows,
-											  subpath->pathtarget->width,
-											  0.0,
-											  work_mem,
-											  apath->limit_tuples);
-					}
-					else
-					{
-						cost_sort(&sort_path,
-								  root,
-								  pathkeys,
-								  subpath->disabled_nodes,
-								  subpath->total_cost,
-								  subpath->rows,
-								  subpath->pathtarget->width,
-								  0.0,
-								  work_mem,
-								  apath->limit_tuples);
-					}
-
+					cost_sort(&sort_path,
+							  NULL, /* doesn't currently need root */
+							  pathkeys,
+							  subpath->total_cost,
+							  subpath->rows,
+							  subpath->pathtarget->width,
+							  0.0,
+							  work_mem,
+							  apath->limit_tuples);
 					subpath = &sort_path;
 				}
 
 				apath->path.rows += subpath->rows;
-				apath->path.disabled_nodes += subpath->disabled_nodes;
 				apath->path.startup_cost += subpath->startup_cost;
 				apath->path.total_cost += subpath->total_cost;
 			}
@@ -2476,7 +2328,6 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 				apath->path.total_cost += subpath->total_cost;
 			}
 
-			apath->path.disabled_nodes += subpath->disabled_nodes;
 			apath->path.rows = clamp_row_est(apath->path.rows);
 
 			i++;
@@ -2517,7 +2368,6 @@ cost_append(AppendPath *apath, PlannerInfo *root)
  *
  * 'pathkeys' is a list of sort keys
  * 'n_streams' is the number of input streams
- * 'input_disabled_nodes' is the sum of the input streams' disabled node counts
  * 'input_startup_cost' is the sum of the input streams' startup costs
  * 'input_total_cost' is the sum of the input streams' total costs
  * 'tuples' is the number of tuples in all the streams
@@ -2525,20 +2375,14 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 void
 cost_merge_append(Path *path, PlannerInfo *root,
 				  List *pathkeys, int n_streams,
-				  int input_disabled_nodes,
 				  Cost input_startup_cost, Cost input_total_cost,
 				  double tuples)
 {
-	RelOptInfo *rel = path->parent;
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
-	uint64		enable_mask = PGS_MERGE_APPEND;
-
-	if (path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
 
 	/*
 	 * Avoid log(0)...
@@ -2561,9 +2405,6 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	 */
 	run_cost += cpu_tuple_cost * APPEND_CPU_COST_MULTIPLIER * tuples;
 
-	path->disabled_nodes =
-		(rel->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
-	path->disabled_nodes += input_disabled_nodes;
 	path->startup_cost = startup_cost + input_startup_cost;
 	path->total_cost = startup_cost + run_cost + input_total_cost;
 }
@@ -2582,14 +2423,13 @@ cost_merge_append(Path *path, PlannerInfo *root,
  */
 void
 cost_material(Path *path,
-			  bool enabled, int input_disabled_nodes,
 			  Cost input_startup_cost, Cost input_total_cost,
 			  double tuples, int width)
 {
 	Cost		startup_cost = input_startup_cost;
 	Cost		run_cost = input_total_cost - input_startup_cost;
 	double		nbytes = relation_byte_size(tuples, width);
-	double		work_mem_bytes = work_mem * (Size) 1024;
+	long		work_mem_bytes = work_mem * 1024L;
 
 	path->rows = tuples;
 
@@ -2620,7 +2460,6 @@ cost_material(Path *path,
 		run_cost += seq_page_cost * npages;
 	}
 
-	path->disabled_nodes = input_disabled_nodes + (enabled ? 0 : 1);
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -2647,13 +2486,13 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	Cost		input_startup_cost = mpath->subpath->startup_cost;
 	Cost		input_total_cost = mpath->subpath->total_cost;
 	double		tuples = mpath->subpath->rows;
-	Cardinality est_calls = mpath->est_calls;
+	double		calls = mpath->calls;
 	int			width = mpath->subpath->pathtarget->width;
 
 	double		hash_mem_bytes;
 	double		est_entry_bytes;
-	Cardinality est_cache_entries;
-	Cardinality ndistinct;
+	double		est_cache_entries;
+	double		ndistinct;
 	double		evict_ratio;
 	double		hit_ratio;
 	Cost		startup_cost;
@@ -2679,7 +2518,7 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
 
 	/* estimate on the distinct number of parameter values */
-	ndistinct = estimate_num_groups(root, mpath->param_exprs, est_calls, NULL,
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
 									&estinfo);
 
 	/*
@@ -2691,10 +2530,7 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * certainly mean a MemoizePath will never survive add_path().
 	 */
 	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
-		ndistinct = est_calls;
-
-	/* Remember the ndistinct estimate for EXPLAIN */
-	mpath->est_unique_keys = ndistinct;
+		ndistinct = calls;
 
 	/*
 	 * Since we've already estimated the maximum number of entries we can
@@ -2722,11 +2558,8 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * must look at how many scans are estimated in total for this node and
 	 * how many of those scans we expect to get a cache hit.
 	 */
-	hit_ratio = ((est_calls - ndistinct) / est_calls) *
+	hit_ratio = ((calls - ndistinct) / calls) *
 		(est_cache_entries / Max(ndistinct, est_cache_entries));
-
-	/* Remember the hit ratio estimate for EXPLAIN */
-	mpath->est_hit_ratio = hit_ratio;
 
 	Assert(hit_ratio >= 0 && hit_ratio <= 1.0);
 
@@ -2790,19 +2623,19 @@ cost_agg(Path *path, PlannerInfo *root,
 		 AggStrategy aggstrategy, const AggClauseCosts *aggcosts,
 		 int numGroupCols, double numGroups,
 		 List *quals,
-		 int disabled_nodes,
 		 Cost input_startup_cost, Cost input_total_cost,
 		 double input_tuples, double input_width)
 {
 	double		output_tuples;
 	Cost		startup_cost;
 	Cost		total_cost;
-	const AggClauseCosts dummy_aggcosts = {0};
+	AggClauseCosts dummy_aggcosts;
 
 	/* Use all-zero per-aggregate costs if NULL is passed */
 	if (aggcosts == NULL)
 	{
 		Assert(aggstrategy == AGG_HASHED);
+		MemSet(&dummy_aggcosts, 0, sizeof(AggClauseCosts));
 		aggcosts = &dummy_aggcosts;
 	}
 
@@ -2838,14 +2671,17 @@ cost_agg(Path *path, PlannerInfo *root,
 		/* we aren't grouping */
 		total_cost = startup_cost + cpu_tuple_cost;
 		output_tuples = 1;
-
-		/* AGG_PLAIN neither hashes nor sorts, so neither switch disables it */
 	}
 	else if (aggstrategy == AGG_SORTED || aggstrategy == AGG_MIXED)
 	{
 		/* Here we are able to deliver output on-the-fly */
 		startup_cost = input_startup_cost;
 		total_cost = input_total_cost;
+		if (aggstrategy == AGG_MIXED && !enable_hashagg)
+		{
+			startup_cost += disable_cost;
+			total_cost += disable_cost;
+		}
 		/* calcs phrased this way to match HASHED case, see note above */
 		total_cost += aggcosts->transCost.startup;
 		total_cost += aggcosts->transCost.per_tuple * input_tuples;
@@ -2854,31 +2690,13 @@ cost_agg(Path *path, PlannerInfo *root,
 		total_cost += aggcosts->finalCost.per_tuple * numGroups;
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
-
-		/*
-		 * AGG_MIXED hashes at least one grouping set, so it is disabled when
-		 * enable_hashagg is off.  Any sorted grouping it also performs is
-		 * costed separately, since create_groupingsets_path() calls
-		 * cost_agg() once per rollup and the non-hashed rollups come through
-		 * as AGG_SORTED.
-		 *
-		 * AGG_SORTED is disabled when enable_groupagg is off, but only when
-		 * there are grouping columns.  The empty grouping set arrives with
-		 * numGroupCols == 0 and is computed like AGG_PLAIN, with no hashing
-		 * or sorting, so it isn't disabled.
-		 */
-		if (aggstrategy == AGG_MIXED)
-		{
-			if (!enable_hashagg)
-				++disabled_nodes;
-		}
-		else if (numGroupCols > 0 && !enable_groupagg)	/* AGG_SORTED */
-			++disabled_nodes;
 	}
 	else
 	{
 		/* must be AGG_HASHED */
 		startup_cost = input_total_cost;
+		if (!enable_hashagg)
+			startup_cost += disable_cost;
 		startup_cost += aggcosts->transCost.startup;
 		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
 		/* cost of computing hash value */
@@ -2890,10 +2708,6 @@ cost_agg(Path *path, PlannerInfo *root,
 		/* cost of retrieving from hash table */
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
-
-		/* AGG_HASHED is disabled when enable_hashagg is off */
-		if (!enable_hashagg)
-			++disabled_nodes;
 	}
 
 	/*
@@ -2991,229 +2805,8 @@ cost_agg(Path *path, PlannerInfo *root,
 	}
 
 	path->rows = output_tuples;
-	path->disabled_nodes = disabled_nodes;
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
-}
-
-/*
- * get_windowclause_startup_tuples
- *		Estimate how many tuples we'll need to fetch from a WindowAgg's
- *		subnode before we can output the first WindowAgg tuple.
- *
- * How many tuples need to be read depends on the WindowClause.  For example,
- * a WindowClause with no PARTITION BY and no ORDER BY requires that all
- * subnode tuples are read and aggregated before the WindowAgg can output
- * anything.  If there's a PARTITION BY, then we only need to look at tuples
- * in the first partition.  Here we attempt to estimate just how many
- * 'input_tuples' the WindowAgg will need to read for the given WindowClause
- * before the first tuple can be output.
- */
-static double
-get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
-								double input_tuples)
-{
-	int			frameOptions = wc->frameOptions;
-	double		partition_tuples;
-	double		return_tuples;
-	double		peer_tuples;
-
-	/*
-	 * First, figure out how many partitions there are likely to be and set
-	 * partition_tuples according to that estimate.
-	 */
-	if (wc->partitionClause != NIL)
-	{
-		double		num_partitions;
-		List	   *partexprs = get_sortgrouplist_exprs(wc->partitionClause,
-														root->parse->targetList);
-
-		num_partitions = estimate_num_groups(root, partexprs, input_tuples,
-											 NULL, NULL);
-		list_free(partexprs);
-
-		partition_tuples = input_tuples / num_partitions;
-	}
-	else
-	{
-		/* all tuples belong to the same partition */
-		partition_tuples = input_tuples;
-	}
-
-	/* estimate the number of tuples in each peer group */
-	if (wc->orderClause != NIL)
-	{
-		double		num_groups;
-		List	   *orderexprs;
-
-		orderexprs = get_sortgrouplist_exprs(wc->orderClause,
-											 root->parse->targetList);
-
-		/* estimate out how many peer groups there are in the partition */
-		num_groups = estimate_num_groups(root, orderexprs,
-										 partition_tuples, NULL,
-										 NULL);
-		list_free(orderexprs);
-		peer_tuples = partition_tuples / num_groups;
-	}
-	else
-	{
-		/* no ORDER BY so only 1 tuple belongs in each peer group */
-		peer_tuples = 1.0;
-	}
-
-	if (frameOptions & FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
-	{
-		/* include all partition rows */
-		return_tuples = partition_tuples;
-	}
-	else if (frameOptions & FRAMEOPTION_END_CURRENT_ROW)
-	{
-		if (frameOptions & FRAMEOPTION_ROWS)
-		{
-			/* just count the current row */
-			return_tuples = 1.0;
-		}
-		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
-		{
-			/*
-			 * When in RANGE/GROUPS mode, it's more complex.  If there's no
-			 * ORDER BY, then all rows in the partition are peers, otherwise
-			 * we'll need to read the first group of peers.
-			 */
-			if (wc->orderClause == NIL)
-				return_tuples = partition_tuples;
-			else
-				return_tuples = peer_tuples;
-		}
-		else
-		{
-			/*
-			 * Something new we don't support yet?  This needs attention.
-			 * We'll just return 1.0 in the meantime.
-			 */
-			Assert(false);
-			return_tuples = 1.0;
-		}
-	}
-	else if (frameOptions & FRAMEOPTION_END_OFFSET_PRECEDING)
-	{
-		/*
-		 * BETWEEN ... AND N PRECEDING will only need to read the WindowAgg's
-		 * subnode after N ROWS/RANGES/GROUPS.  N can be 0, but not negative,
-		 * so we'll just assume only the current row needs to be read to fetch
-		 * the first WindowAgg row.
-		 */
-		return_tuples = 1.0;
-	}
-	else if (frameOptions & FRAMEOPTION_END_OFFSET_FOLLOWING)
-	{
-		Const	   *endOffset = (Const *) wc->endOffset;
-		double		end_offset_value;
-
-		/* try and figure out the value specified in the endOffset. */
-		if (IsA(endOffset, Const))
-		{
-			if (endOffset->constisnull)
-			{
-				/*
-				 * NULLs are not allowed, but currently, there's no code to
-				 * error out if there's a NULL Const.  We'll only discover
-				 * this during execution.  For now, just pretend everything is
-				 * fine and assume that just the first row/range/group will be
-				 * needed.
-				 */
-				end_offset_value = 1.0;
-			}
-			else
-			{
-				switch (endOffset->consttype)
-				{
-					case INT2OID:
-						end_offset_value =
-							(double) DatumGetInt16(endOffset->constvalue);
-						break;
-					case INT4OID:
-						end_offset_value =
-							(double) DatumGetInt32(endOffset->constvalue);
-						break;
-					case INT8OID:
-						end_offset_value =
-							(double) DatumGetInt64(endOffset->constvalue);
-						break;
-					default:
-						end_offset_value =
-							partition_tuples / peer_tuples *
-							DEFAULT_INEQ_SEL;
-						break;
-				}
-			}
-		}
-		else
-		{
-			/*
-			 * When the end bound is not a Const, we'll just need to guess. We
-			 * just make use of DEFAULT_INEQ_SEL.
-			 */
-			end_offset_value =
-				partition_tuples / peer_tuples * DEFAULT_INEQ_SEL;
-		}
-
-		if (frameOptions & FRAMEOPTION_ROWS)
-		{
-			/* include the N FOLLOWING and the current row */
-			return_tuples = end_offset_value + 1.0;
-		}
-		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
-		{
-			/* include N FOLLOWING ranges/group and the initial range/group */
-			return_tuples = peer_tuples * (end_offset_value + 1.0);
-		}
-		else
-		{
-			/*
-			 * Something new we don't support yet?  This needs attention.
-			 * We'll just return 1.0 in the meantime.
-			 */
-			Assert(false);
-			return_tuples = 1.0;
-		}
-	}
-	else
-	{
-		/*
-		 * Something new we don't support yet?  This needs attention.  We'll
-		 * just return 1.0 in the meantime.
-		 */
-		Assert(false);
-		return_tuples = 1.0;
-	}
-
-	if (wc->partitionClause != NIL || wc->orderClause != NIL)
-	{
-		/*
-		 * Cap the return value to the estimated partition tuples and account
-		 * for the extra tuple WindowAgg will need to read to confirm the next
-		 * tuple does not belong to the same partition or peer group.
-		 */
-		return_tuples = Min(return_tuples + 1.0, partition_tuples);
-	}
-	else
-	{
-		/*
-		 * Cap the return value so it's never higher than the expected tuples
-		 * in the partition.
-		 */
-		return_tuples = Min(return_tuples, partition_tuples);
-	}
-
-	/*
-	 * We needn't worry about any EXCLUDE options as those only exclude rows
-	 * from being aggregated, not from being read from the WindowAgg's
-	 * subnode.
-	 */
-
-	return clamp_row_est(return_tuples);
 }
 
 /*
@@ -3225,20 +2818,13 @@ get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
  */
 void
 cost_windowagg(Path *path, PlannerInfo *root,
-			   List *windowFuncs, WindowClause *winclause,
-			   int input_disabled_nodes,
+			   List *windowFuncs, int numPartCols, int numOrderCols,
 			   Cost input_startup_cost, Cost input_total_cost,
 			   double input_tuples)
 {
 	Cost		startup_cost;
 	Cost		total_cost;
-	double		startup_tuples;
-	int			numPartCols;
-	int			numOrderCols;
 	ListCell   *lc;
-
-	numPartCols = list_length(winclause->partitionClause);
-	numOrderCols = list_length(winclause->orderClause);
 
 	startup_cost = input_startup_cost;
 	total_cost = input_total_cost;
@@ -3292,24 +2878,8 @@ cost_windowagg(Path *path, PlannerInfo *root,
 	total_cost += cpu_tuple_cost * input_tuples;
 
 	path->rows = input_tuples;
-	path->disabled_nodes = input_disabled_nodes;
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
-
-	/*
-	 * Also, take into account how many tuples we need to read from the
-	 * subnode in order to produce the first tuple from the WindowAgg.  To do
-	 * this we proportion the run cost (total cost not including startup cost)
-	 * over the estimated startup tuples.  We already included the startup
-	 * cost of the subnode, so we only need to do this when the estimated
-	 * startup tuples is above 1.0.
-	 */
-	startup_tuples = get_windowclause_startup_tuples(root, winclause,
-													 input_tuples);
-
-	if (startup_tuples > 1.0)
-		path->startup_cost += (total_cost - startup_cost) / input_tuples *
-			(startup_tuples - 1.0);
 }
 
 /*
@@ -3324,7 +2894,6 @@ void
 cost_group(Path *path, PlannerInfo *root,
 		   int numGroupCols, double numGroups,
 		   List *quals,
-		   int input_disabled_nodes,
 		   Cost input_startup_cost, Cost input_total_cost,
 		   double input_tuples)
 {
@@ -3363,7 +2932,6 @@ cost_group(Path *path, PlannerInfo *root,
 	}
 
 	path->rows = output_tuples;
-	path->disabled_nodes = input_disabled_nodes + (enable_groupagg ? 0 : 1);
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
 }
@@ -3394,11 +2962,10 @@ cost_group(Path *path, PlannerInfo *root,
  */
 void
 initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
-					  JoinType jointype, uint64 enable_mask,
+					  JoinType jointype,
 					  Path *outer_path, Path *inner_path,
 					  JoinPathExtraData *extra)
 {
-	int			disabled_nodes;
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 	double		outer_path_rows = outer_path->rows;
@@ -3406,11 +2973,6 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	Cost		inner_rescan_total_cost;
 	Cost		inner_run_cost;
 	Cost		inner_rescan_run_cost;
-
-	/* Count up disabled nodes. */
-	disabled_nodes = (extra->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
-	disabled_nodes += inner_path->disabled_nodes;
-	disabled_nodes += outer_path->disabled_nodes;
 
 	/* estimate costs to rescan the inner relation */
 	cost_rescan(root, inner_path,
@@ -3459,7 +3021,6 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	/* CPU costs left for later */
 
 	/* Public result fields */
-	workspace->disabled_nodes = disabled_nodes;
 	workspace->startup_cost = startup_cost;
 	workspace->total_cost = startup_cost + run_cost;
 	/* Save private data for final_cost_nestloop */
@@ -3489,9 +3050,6 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	QualCost	restrict_qual_cost;
 	double		ntuples;
 
-	/* Set the number of disabled nodes. */
-	path->jpath.path.disabled_nodes = workspace->disabled_nodes;
-
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (outer_path_rows <= 0)
 		outer_path_rows = 1;
@@ -3511,6 +3069,14 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 		path->jpath.path.rows =
 			clamp_row_est(path->jpath.path.rows / parallel_divisor);
 	}
+
+	/*
+	 * We could include disable_cost in the preliminary estimate, but that
+	 * would amount to optimizing for the case where the join method is
+	 * disabled, which doesn't seem like the way to bet.
+	 */
+	if (!enable_nestloop)
+		startup_cost += disable_cost;
 
 	/* cost of inner-relation source data (we already dealt with outer rel) */
 
@@ -3660,8 +3226,7 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
  * join quals here, except for obtaining the scan selectivity estimate which
  * is really essential (but fortunately, use of caching keeps the cost of
  * getting that down to something reasonable).
- * We also assume that cost_sort/cost_incremental_sort is cheap enough to use
- * here.
+ * We also assume that cost_sort is cheap enough to use here.
  *
  * 'workspace' is to be filled with startup_cost, total_cost, and perhaps
  *		other data to be used by final_cost_mergejoin
@@ -3671,7 +3236,6 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
  * 'inner_path' is the inner input to the join
  * 'outersortkeys' is the list of sort keys for the outer path
  * 'innersortkeys' is the list of sort keys for the inner path
- * 'outer_presorted_keys' is the number of presorted keys of the outer path
  * 'extra' contains miscellaneous information about the join
  *
  * Note: outersortkeys and innersortkeys should be NIL if no explicit
@@ -3683,10 +3247,8 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 					   List *mergeclauses,
 					   Path *outer_path, Path *inner_path,
 					   List *outersortkeys, List *innersortkeys,
-					   int outer_presorted_keys,
 					   JoinPathExtraData *extra)
 {
-	int			disabled_nodes;
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 	double		outer_path_rows = outer_path->rows;
@@ -3700,8 +3262,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 				outerendsel,
 				innerstartsel,
 				innerendsel;
-	Path		sort_path;		/* dummy for result of
-								 * cost_sort/cost_incremental_sort */
+	Path		sort_path;		/* dummy for result of cost_sort */
 
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (outer_path_rows <= 0)
@@ -3739,7 +3300,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 		/* debugging check */
 		if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
 			opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation ||
-			opathkey->pk_cmptype != ipathkey->pk_cmptype ||
+			opathkey->pk_strategy != ipathkey->pk_strategy ||
 			opathkey->pk_nulls_first != ipathkey->pk_nulls_first)
 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
 
@@ -3808,65 +3369,19 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	Assert(outerstartsel <= outerendsel);
 	Assert(innerstartsel <= innerendsel);
 
-	/*
-	 * We don't decide whether to materialize the inner path until we get to
-	 * final_cost_mergejoin(), so we don't know whether to check the pgs_mask
-	 * against PGS_MERGEJOIN_PLAIN or PGS_MERGEJOIN_MATERIALIZE. Instead, we
-	 * just account for any child nodes here and assume that this node is not
-	 * itself disabled; we can sort out the details in final_cost_mergejoin().
-	 *
-	 * (We could be more precise here by setting disabled_nodes to 1 at this
-	 * stage if both PGS_MERGEJOIN_PLAIN and PGS_MERGEJOIN_MATERIALIZE are
-	 * disabled, but that seems to against the idea of making this function
-	 * produce a quick, optimistic approximation of the final cost.)
-	 */
-	disabled_nodes = 0;
-
 	/* cost of source data */
 
 	if (outersortkeys)			/* do we need to sort outer? */
 	{
-		/*
-		 * We can assert that the outer path is not already ordered
-		 * appropriately for the mergejoin; otherwise, outersortkeys would
-		 * have been set to NIL.
-		 */
-		Assert(!pathkeys_contained_in(outersortkeys, outer_path->pathkeys));
-
-		/*
-		 * We choose to use incremental sort if it is enabled and there are
-		 * presorted keys; otherwise we use full sort.
-		 */
-		if (enable_incremental_sort && outer_presorted_keys > 0)
-		{
-			cost_incremental_sort(&sort_path,
-								  root,
-								  outersortkeys,
-								  outer_presorted_keys,
-								  outer_path->disabled_nodes,
-								  outer_path->startup_cost,
-								  outer_path->total_cost,
-								  outer_path_rows,
-								  outer_path->pathtarget->width,
-								  0.0,
-								  work_mem,
-								  -1.0);
-		}
-		else
-		{
-			cost_sort(&sort_path,
-					  root,
-					  outersortkeys,
-					  outer_path->disabled_nodes,
-					  outer_path->total_cost,
-					  outer_path_rows,
-					  outer_path->pathtarget->width,
-					  0.0,
-					  work_mem,
-					  -1.0);
-		}
-
-		disabled_nodes += sort_path.disabled_nodes;
+		cost_sort(&sort_path,
+				  root,
+				  outersortkeys,
+				  outer_path->total_cost,
+				  outer_path_rows,
+				  outer_path->pathtarget->width,
+				  0.0,
+				  work_mem,
+				  -1.0);
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
 			* outerstartsel;
@@ -3875,7 +3390,6 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	}
 	else
 	{
-		disabled_nodes += outer_path->disabled_nodes;
 		startup_cost += outer_path->startup_cost;
 		startup_cost += (outer_path->total_cost - outer_path->startup_cost)
 			* outerstartsel;
@@ -3885,29 +3399,15 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 
 	if (innersortkeys)			/* do we need to sort inner? */
 	{
-		/*
-		 * We can assert that the inner path is not already ordered
-		 * appropriately for the mergejoin; otherwise, innersortkeys would
-		 * have been set to NIL.
-		 */
-		Assert(!pathkeys_contained_in(innersortkeys, inner_path->pathkeys));
-
-		/*
-		 * We do not consider incremental sort for inner path, because
-		 * incremental sort does not support mark/restore.
-		 */
-
 		cost_sort(&sort_path,
 				  root,
 				  innersortkeys,
-				  inner_path->disabled_nodes,
 				  inner_path->total_cost,
 				  inner_path_rows,
 				  inner_path->pathtarget->width,
 				  0.0,
 				  work_mem,
 				  -1.0);
-		disabled_nodes += sort_path.disabled_nodes;
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
 			* innerstartsel;
@@ -3916,7 +3416,6 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	}
 	else
 	{
-		disabled_nodes += inner_path->disabled_nodes;
 		startup_cost += inner_path->startup_cost;
 		startup_cost += (inner_path->total_cost - inner_path->startup_cost)
 			* innerstartsel;
@@ -3935,7 +3434,6 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	/* CPU costs left for later */
 
 	/* Public result fields */
-	workspace->disabled_nodes = disabled_nodes;
 	workspace->startup_cost = startup_cost;
 	workspace->total_cost = startup_cost + run_cost + inner_run_cost;
 	/* Save private data for final_cost_mergejoin */
@@ -3999,7 +3497,6 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	double		mergejointuples,
 				rescannedtuples;
 	double		rescanratio;
-	uint64		enable_mask = 0;
 
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (inner_path_rows <= 0)
@@ -4019,6 +3516,14 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 		path->jpath.path.rows =
 			clamp_row_est(path->jpath.path.rows / parallel_divisor);
 	}
+
+	/*
+	 * We could include disable_cost in the preliminary estimate, but that
+	 * would amount to optimizing for the case where the join method is
+	 * disabled, which doesn't seem like the way to bet.
+	 */
+	if (!enable_mergejoin)
+		startup_cost += disable_cost;
 
 	/*
 	 * Compute cost of the mergequals and qpquals (other restriction clauses)
@@ -4073,12 +3578,10 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * when we should not.  Can we do better without expensive selectivity
 	 * computations?
 	 *
-	 * The whole issue is moot if we know we don't need to mark/restore at
-	 * all, or if we are working from a unique-ified outer input.
+	 * The whole issue is moot if we are working from a unique-ified outer
+	 * input, or if we know we don't need to mark/restore at all.
 	 */
-	if (path->skip_mark_restore ||
-		RELATION_WAS_MADE_UNIQUE(outer_path->parent, extra->sjinfo,
-								 path->jpath.jointype))
+	if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
 		rescannedtuples = 0;
 	else
 	{
@@ -4129,20 +3632,16 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 		path->materialize_inner = false;
 
 	/*
-	 * If merge joins with materialization are enabled, then choose
-	 * materialization if either (a) it looks cheaper or (b) merge joins
-	 * without materialization are disabled.
+	 * Prefer materializing if it looks cheaper, unless the user has asked to
+	 * suppress materialization.
 	 */
-	else if ((extra->pgs_mask & PGS_MERGEJOIN_MATERIALIZE) != 0 &&
-			 (mat_inner_cost < bare_inner_cost ||
-			  (extra->pgs_mask & PGS_MERGEJOIN_PLAIN) == 0))
+	else if (enable_material && mat_inner_cost < bare_inner_cost)
 		path->materialize_inner = true;
 
 	/*
-	 * Regardless of what plan shapes are enabled and what the costs seem to
-	 * be, we *must* materialize it if the inner path is to be used directly
-	 * (without sorting) and it doesn't support mark/restore. Planner failure
-	 * is not an option!
+	 * Even if materializing doesn't look cheaper, we *must* do it if the
+	 * inner path is to be used directly (without sorting) and it doesn't
+	 * support mark/restore.
 	 *
 	 * Since the inner side must be ordered, and only Sorts and IndexScans can
 	 * create order to begin with, and they both support mark/restore, you
@@ -4150,6 +3649,10 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * merge joins can *preserve* the order of their inputs, so they can be
 	 * selected as the input of a mergejoin, and they don't support
 	 * mark/restore at present.
+	 *
+	 * We don't test the value of enable_material here, because
+	 * materialization is required for correctness in this case, and turning
+	 * it off does not entitle us to deliver an invalid plan.
 	 */
 	else if (innersortkeys == NIL &&
 			 !ExecSupportsMarkRestore(inner_path))
@@ -4163,41 +3666,22 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * though.
 	 *
 	 * Since materialization is a performance optimization in this case,
-	 * rather than necessary for correctness, we skip it if materialization is
-	 * switched off.
+	 * rather than necessary for correctness, we skip it if enable_material is
+	 * off.
 	 */
-	else if ((extra->pgs_mask & PGS_MERGEJOIN_MATERIALIZE) != 0 &&
-			 innersortkeys != NIL &&
+	else if (enable_material && innersortkeys != NIL &&
 			 relation_byte_size(inner_path_rows,
 								inner_path->pathtarget->width) >
-			 work_mem * (Size) 1024)
+			 (work_mem * 1024L))
 		path->materialize_inner = true;
 	else
 		path->materialize_inner = false;
 
-	/* Get the number of disabled nodes, not yet including this one. */
-	path->jpath.path.disabled_nodes = workspace->disabled_nodes;
-
-	/*
-	 * Charge the right incremental cost for the chosen case, and update
-	 * enable_mask as appropriate.
-	 */
+	/* Charge the right incremental cost for the chosen case */
 	if (path->materialize_inner)
-	{
 		run_cost += mat_inner_cost;
-		enable_mask |= PGS_MERGEJOIN_MATERIALIZE;
-	}
 	else
-	{
 		run_cost += bare_inner_cost;
-		enable_mask |= PGS_MERGEJOIN_PLAIN;
-	}
-
-	/* Incremental count of disabled nodes if this node is disabled. */
-	if (path->jpath.path.parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-	if ((extra->pgs_mask & enable_mask) != enable_mask)
-		++path->jpath.path.disabled_nodes;
 
 	/* CPU costs */
 
@@ -4254,7 +3738,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 		cache = (MergeScanSelCache *) lfirst(lc);
 		if (cache->opfamily == pathkey->pk_opfamily &&
 			cache->collation == pathkey->pk_eclass->ec_collation &&
-			cache->cmptype == pathkey->pk_cmptype &&
+			cache->strategy == pathkey->pk_strategy &&
 			cache->nulls_first == pathkey->pk_nulls_first)
 			return cache;
 	}
@@ -4263,7 +3747,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	mergejoinscansel(root,
 					 (Node *) rinfo->clause,
 					 pathkey->pk_opfamily,
-					 pathkey->pk_cmptype,
+					 pathkey->pk_strategy,
 					 pathkey->pk_nulls_first,
 					 &leftstartsel,
 					 &leftendsel,
@@ -4273,10 +3757,10 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	/* Cache the result in suitably long-lived workspace */
 	oldcontext = MemoryContextSwitchTo(root->planner_cxt);
 
-	cache = palloc_object(MergeScanSelCache);
+	cache = (MergeScanSelCache *) palloc(sizeof(MergeScanSelCache));
 	cache->opfamily = pathkey->pk_opfamily;
 	cache->collation = pathkey->pk_eclass->ec_collation;
-	cache->cmptype = pathkey->pk_cmptype;
+	cache->strategy = pathkey->pk_strategy;
 	cache->nulls_first = pathkey->pk_nulls_first;
 	cache->leftstartsel = leftstartsel;
 	cache->leftendsel = leftendsel;
@@ -4324,7 +3808,6 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 					  JoinPathExtraData *extra,
 					  bool parallel_hash)
 {
-	int			disabled_nodes;
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 	double		outer_path_rows = outer_path->rows;
@@ -4335,15 +3818,6 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	int			numbatches;
 	int			num_skew_mcvs;
 	size_t		space_allowed;	/* unused */
-	uint64		enable_mask = PGS_HASHJOIN;
-
-	if (outer_path->parallel_workers == 0)
-		enable_mask |= PGS_CONSIDER_NONPARTIAL;
-
-	/* Count up disabled nodes. */
-	disabled_nodes = (extra->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
-	disabled_nodes += inner_path->disabled_nodes;
-	disabled_nodes += outer_path->disabled_nodes;
 
 	/* cost of source data */
 	startup_cost += outer_path->startup_cost;
@@ -4414,7 +3888,6 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	/* CPU costs left for later */
 
 	/* Public result fields */
-	workspace->disabled_nodes = disabled_nodes;
 	workspace->startup_cost = startup_cost;
 	workspace->total_cost = startup_cost + run_cost;
 	/* Save private data for final_cost_hashjoin */
@@ -4459,9 +3932,6 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	Selectivity innermcvfreq;
 	ListCell   *hcl;
 
-	/* Set the number of disabled nodes. */
-	path->jpath.path.disabled_nodes = workspace->disabled_nodes;
-
 	/* Mark the path with the correct row estimate */
 	if (path->jpath.path.param_info)
 		path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
@@ -4476,6 +3946,14 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 		path->jpath.path.rows =
 			clamp_row_est(path->jpath.path.rows / parallel_divisor);
 	}
+
+	/*
+	 * We could include disable_cost in the preliminary estimate, but that
+	 * would amount to optimizing for the case where the join method is
+	 * disabled, which doesn't seem like the way to bet.
+	 */
+	if (!enable_hashjoin)
+		startup_cost += disable_cost;
 
 	/* mark the path with estimated # of batches */
 	path->num_batches = numbatches;
@@ -4496,27 +3974,16 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	 * because we avoid contaminating the cache with a value that's wrong for
 	 * non-unique-ified paths.
 	 */
-	if (RELATION_WAS_MADE_UNIQUE(inner_path->parent, extra->sjinfo,
-								 path->jpath.jointype))
+	if (IsA(inner_path, UniquePath))
 	{
 		innerbucketsize = 1.0 / virtualbuckets;
-		innermcvfreq = 1.0 / inner_path_rows_total;
+		innermcvfreq = 0.0;
 	}
 	else
 	{
-		List	   *otherclauses;
-
 		innerbucketsize = 1.0;
 		innermcvfreq = 1.0;
-
-		/* At first, try to estimate bucket size using extended statistics. */
-		otherclauses = estimate_multivariate_bucketsize(root,
-														inner_path->parent,
-														hashclauses,
-														&innerbucketsize);
-
-		/* Pass through the remaining clauses */
-		foreach(hcl, otherclauses)
+		foreach(hcl, hashclauses)
 		{
 			RestrictInfo *restrictinfo = lfirst_node(RestrictInfo, hcl);
 			Selectivity thisbucketsize;
@@ -4568,8 +4035,7 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 
 			if (innerbucketsize > thisbucketsize)
 				innerbucketsize = thisbucketsize;
-			/* Disregard zero for MCV freq, it means we have no data */
-			if (thismcvfreq > 0.0 && innermcvfreq > thismcvfreq)
+			if (innermcvfreq > thismcvfreq)
 				innermcvfreq = thismcvfreq;
 		}
 	}
@@ -4784,7 +4250,6 @@ cost_subplan(PlannerInfo *root, SubPlan *subplan, Plan *plan)
 			sp_cost.per_tuple += plan->startup_cost;
 	}
 
-	subplan->disabled_nodes = plan->disabled_nodes;
 	subplan->startup_cost = sp_cost.startup;
 	subplan->per_call_cost = sp_cost.per_tuple;
 }
@@ -4854,7 +4319,7 @@ cost_rescan(PlannerInfo *root, Path *path,
 				Cost		run_cost = cpu_tuple_cost * path->rows;
 				double		nbytes = relation_byte_size(path->rows,
 														path->pathtarget->width);
-				double		work_mem_bytes = work_mem * (Size) 1024;
+				long		work_mem_bytes = work_mem * 1024L;
 
 				if (nbytes > work_mem_bytes)
 				{
@@ -4881,7 +4346,7 @@ cost_rescan(PlannerInfo *root, Path *path,
 				Cost		run_cost = cpu_operator_cost * path->rows;
 				double		nbytes = relation_byte_size(path->rows,
 														path->pathtarget->width);
-				double		work_mem_bytes = work_mem * (Size) 1024;
+				long		work_mem_bytes = work_mem * 1024L;
 
 				if (nbytes > work_mem_bytes)
 				{
@@ -4915,9 +4380,6 @@ cost_rescan(PlannerInfo *root, Path *path,
  *		preferred since it allows caching of the results.)
  *		The result includes both a one-time (startup) component,
  *		and a per-evaluation component.
- *
- * Note: in some code paths root can be passed as NULL, resulting in
- * slightly worse estimates.
  */
 void
 cost_qual_eval(QualCost *cost, List *quals, PlannerInfo *root)
@@ -5052,7 +4514,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		Node	   *arraynode = (Node *) lsecond(saop->args);
 		QualCost	sacosts;
 		QualCost	hcosts;
-		double		estarraylen = estimate_array_length(context->root, arraynode);
+		int			estarraylen = estimate_array_length(arraynode);
 
 		set_sa_opfuncid(saop);
 		sacosts.startup = sacosts.per_tuple = 0;
@@ -5090,7 +4552,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 			 */
 			context->total.startup += sacosts.startup;
 			context->total.per_tuple += sacosts.per_tuple *
-				estimate_array_length(context->root, arraynode) * 0.5;
+				estimate_array_length(arraynode) * 0.5;
 		}
 	}
 	else if (IsA(node, Aggref) ||
@@ -5141,7 +4603,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		context->total.startup += perelemcost.startup;
 		if (perelemcost.per_tuple > 0)
 			context->total.per_tuple += perelemcost.per_tuple *
-				estimate_array_length(context->root, (Node *) acoerce->arg);
+				estimate_array_length((Node *) acoerce->arg);
 	}
 	else if (IsA(node, RowCompareExpr))
 	{
@@ -5161,11 +4623,15 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 			 IsA(node, SQLValueFunction) ||
 			 IsA(node, XmlExpr) ||
 			 IsA(node, CoerceToDomain) ||
-			 IsA(node, NextValueExpr) ||
-			 IsA(node, JsonExpr))
+			 IsA(node, NextValueExpr))
 	{
 		/* Treat all these as having cost 1 */
 		context->total.per_tuple += cpu_operator_cost;
+	}
+	else if (IsA(node, CurrentOfExpr))
+	{
+		/* Report high cost to prevent selection of anything but TID scan */
+		context->total.startup += disable_cost;
 	}
 	else if (IsA(node, SubLink))
 	{
@@ -5220,7 +4686,8 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 	}
 
 	/* recurse into children */
-	return expression_tree_walker(node, cost_qual_eval_walker, context);
+	return expression_tree_walker(node, cost_qual_eval_walker,
+								  (void *) context);
 }
 
 /*
@@ -5327,7 +4794,23 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	/*
 	 * Also get the normal inner-join selectivity of the join clauses.
 	 */
-	init_dummy_sjinfo(&norm_sjinfo, outerrel->relids, innerrel->relids);
+	norm_sjinfo.type = T_SpecialJoinInfo;
+	norm_sjinfo.min_lefthand = outerrel->relids;
+	norm_sjinfo.min_righthand = innerrel->relids;
+	norm_sjinfo.syn_lefthand = outerrel->relids;
+	norm_sjinfo.syn_righthand = innerrel->relids;
+	norm_sjinfo.jointype = JOIN_INNER;
+	norm_sjinfo.ojrelid = 0;
+	norm_sjinfo.commute_above_l = NULL;
+	norm_sjinfo.commute_above_r = NULL;
+	norm_sjinfo.commute_below_l = NULL;
+	norm_sjinfo.commute_below_r = NULL;
+	/* we don't bother trying to make the remaining fields valid */
+	norm_sjinfo.lhs_strict = false;
+	norm_sjinfo.semi_can_btree = false;
+	norm_sjinfo.semi_can_hash = false;
+	norm_sjinfo.semi_operators = NIL;
+	norm_sjinfo.semi_rhs_exprs = NIL;
 
 	nselec = clauselist_selectivity(root,
 									joinquals,
@@ -5480,8 +4963,23 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	/*
 	 * Make up a SpecialJoinInfo for JOIN_INNER semantics.
 	 */
-	init_dummy_sjinfo(&sjinfo, path->outerjoinpath->parent->relids,
-					  path->innerjoinpath->parent->relids);
+	sjinfo.type = T_SpecialJoinInfo;
+	sjinfo.min_lefthand = path->outerjoinpath->parent->relids;
+	sjinfo.min_righthand = path->innerjoinpath->parent->relids;
+	sjinfo.syn_lefthand = path->outerjoinpath->parent->relids;
+	sjinfo.syn_righthand = path->innerjoinpath->parent->relids;
+	sjinfo.jointype = JOIN_INNER;
+	sjinfo.ojrelid = 0;
+	sjinfo.commute_above_l = NULL;
+	sjinfo.commute_above_r = NULL;
+	sjinfo.commute_below_l = NULL;
+	sjinfo.commute_below_r = NULL;
+	/* we don't bother trying to make the remaining fields valid */
+	sjinfo.lhs_strict = false;
+	sjinfo.semi_can_btree = false;
+	sjinfo.semi_can_hash = false;
+	sjinfo.semi_operators = NIL;
+	sjinfo.semi_rhs_exprs = NIL;
 
 	/* Get the approximate selectivity */
 	foreach(l, quals)
@@ -6030,8 +5528,7 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 				if (ec && ec->ec_has_const)
 				{
 					EquivalenceMember *em = fkinfo->fk_eclass_member[i];
-					RestrictInfo *rinfo = find_derived_clause_for_ec_member(root,
-																			ec,
+					RestrictInfo *rinfo = find_derived_clause_for_ec_member(ec,
 																			em);
 
 					if (rinfo)
@@ -6377,7 +5874,7 @@ static void
 set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 {
 	Oid			reloid = planner_rt_fetch(rel->relid, root)->relid;
-	int64		tuple_width = 0;
+	int32		tuple_width = 0;
 	bool		have_wholerow_var = false;
 	ListCell   *lc;
 
@@ -6489,7 +5986,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 	 */
 	if (have_wholerow_var)
 	{
-		int64		wholerow_width = MAXALIGN(SizeofHeapTupleHeader);
+		int32		wholerow_width = MAXALIGN(SizeofHeapTupleHeader);
 
 		if (reloid != InvalidOid)
 		{
@@ -6506,7 +6003,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 				wholerow_width += rel->attr_widths[i - rel->min_attr];
 		}
 
-		rel->attr_widths[0 - rel->min_attr] = clamp_width_est(wholerow_width);
+		rel->attr_widths[0 - rel->min_attr] = wholerow_width;
 
 		/*
 		 * Include the whole-row Var as part of the output tuple.  Yes, that
@@ -6515,7 +6012,8 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 		tuple_width += wholerow_width;
 	}
 
-	rel->reltarget->width = clamp_width_est(tuple_width);
+	Assert(tuple_width >= 0);
+	rel->reltarget->width = tuple_width;
 }
 
 /*
@@ -6533,7 +6031,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 PathTarget *
 set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 {
-	int64		tuple_width = 0;
+	int32		tuple_width = 0;
 	ListCell   *lc;
 
 	/* Vars are assumed to have cost zero, but other exprs do not */
@@ -6557,7 +6055,8 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 		}
 	}
 
-	target->width = clamp_width_est(tuple_width);
+	Assert(tuple_width >= 0);
+	target->width = tuple_width;
 
 	return target;
 }
@@ -6667,20 +6166,12 @@ get_parallel_divisor(Path *path)
 
 /*
  * compute_bitmap_pages
- *	  Estimate number of pages fetched from heap in a bitmap heap scan.
  *
- * 'baserel' is the relation to be scanned
- * 'bitmapqual' is a tree of IndexPaths, BitmapAndPaths, and BitmapOrPaths
- * 'loop_count' is the number of repetitions of the indexscan to factor into
- *		estimates of caching behavior
- *
- * If cost_p isn't NULL, the indexTotalCost estimate is returned in *cost_p.
- * If tuples_p isn't NULL, the tuples_fetched estimate is returned in *tuples_p.
+ * compute number of pages fetched from heap in bitmap heap scan.
  */
 double
-compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
-					 Path *bitmapqual, double loop_count,
-					 Cost *cost_p, double *tuples_p)
+compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
+					 int loop_count, Cost *cost, double *tuple)
 {
 	Cost		indexTotalCost;
 	Selectivity indexSelectivity;
@@ -6688,7 +6179,7 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 	double		pages_fetched;
 	double		tuples_fetched;
 	double		heap_pages;
-	double		maxentries;
+	long		maxentries;
 
 	/*
 	 * Fetch total cost of obtaining the bitmap, as well as its total
@@ -6719,7 +6210,7 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 	 * the bitmap at one time.)
 	 */
 	heap_pages = Min(pages_fetched, baserel->pages);
-	maxentries = tbm_calculate_entries(work_mem * (Size) 1024);
+	maxentries = tbm_calculate_entries(work_mem * 1024L);
 
 	if (loop_count > 1)
 	{
@@ -6770,28 +6261,10 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 							  (lossy_pages / heap_pages) * baserel->tuples);
 	}
 
-	if (cost_p)
-		*cost_p = indexTotalCost;
-	if (tuples_p)
-		*tuples_p = tuples_fetched;
+	if (cost)
+		*cost = indexTotalCost;
+	if (tuple)
+		*tuple = tuples_fetched;
 
 	return pages_fetched;
-}
-
-/*
- * compute_gather_rows
- *	  Estimate number of rows for gather (merge) nodes.
- *
- * In a parallel plan, each worker's row estimate is determined by dividing the
- * total number of rows by parallel_divisor, which accounts for the leader's
- * contribution in addition to the number of workers.  Accordingly, when
- * estimating the number of rows for gather (merge) nodes, we multiply the rows
- * per worker by the same parallel_divisor to undo the division.
- */
-double
-compute_gather_rows(Path *path)
-{
-	Assert(path->parallel_workers > 0);
-
-	return clamp_row_est(path->rows * get_parallel_divisor(path));
 }

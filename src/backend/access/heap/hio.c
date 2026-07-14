@@ -3,7 +3,7 @@
  * hio.c
  *	  POSTGRES heap access method input/output code.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/smgr.h"
 
 
 /*
@@ -58,7 +59,9 @@ RelationPutHeapTuple(Relation relation,
 	/* Add the tuple to the page */
 	pageHeader = BufferGetPage(buffer);
 
-	offnum = PageAddItem(pageHeader, tuple->t_data, tuple->t_len, InvalidOffsetNumber, false, true);
+	offnum = PageAddItem(pageHeader, (Item) tuple->t_data,
+						 tuple->t_len, InvalidOffsetNumber, false, true);
+
 	if (offnum == InvalidOffsetNumber)
 		elog(PANIC, "failed to add tuple to page");
 
@@ -498,7 +501,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  */
 Buffer
 RelationGetBufferForTuple(Relation relation, Size len,
-						  Buffer otherBuffer, uint32 options,
+						  Buffer otherBuffer, int options,
 						  BulkInsertState bistate,
 						  Buffer *vmbuffer, Buffer *vmbuffer_other,
 						  int num_pages)
@@ -711,15 +714,14 @@ loop:
 		 * unlock the two buffers in, so this can be slightly simpler than the
 		 * code above.
 		 */
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		if (otherBuffer == InvalidBuffer)
-			UnlockReleaseBuffer(buffer);
+			ReleaseBuffer(buffer);
 		else if (otherBlock != targetBlock)
 		{
-			UnlockReleaseBuffer(buffer);
 			LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buffer);
 		}
-		else
-			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 		/* Is there an ongoing bulk extension? */
 		if (bistate && bistate->next_free != InvalidBlockNumber)

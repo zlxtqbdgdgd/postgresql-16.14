@@ -27,6 +27,7 @@
 
 #include "common/file_utils.h"
 #include "compress_io.h"
+#include "parallel.h"
 #include "pg_backup_utils.h"
 
 /*--------
@@ -136,8 +137,12 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 	AH->WorkerJobRestorePtr = _WorkerJobRestoreCustom;
 
 	/* Set up a private area. */
-	ctx = pg_malloc0_object(lclContext);
-	AH->formatData = ctx;
+	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
+	AH->formatData = (void *) ctx;
+
+	/* Initialize LO buffering */
+	AH->lo_buf_size = LOBBUFSIZE;
+	AH->lo_buf = (void *) pg_malloc(LOBBUFSIZE);
 
 	/*
 	 * Now open the file
@@ -193,19 +198,19 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
  * Optional.
  *
  * Set up extract format-related TOC data.
- */
+*/
 static void
 _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *ctx;
 
-	ctx = pg_malloc0_object(lclTocEntry);
+	ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
 	if (te->dataDumper)
 		ctx->dataState = K_OFFSET_POS_NOT_SET;
 	else
 		ctx->dataState = K_OFFSET_NO_DATA;
 
-	te->formatData = ctx;
+	te->formatData = (void *) ctx;
 }
 
 /*
@@ -240,8 +245,8 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 
 	if (ctx == NULL)
 	{
-		ctx = pg_malloc0_object(lclTocEntry);
-		te->formatData = ctx;
+		ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+		te->formatData = (void *) ctx;
 	}
 
 	ctx->dataState = ReadOffset(AH, &(ctx->dataPos));
@@ -337,7 +342,7 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
 }
 
 /*
- * Called by the archiver when starting to save BLOB DATA (not schema).
+ * Called by the archiver when starting to save all BLOB DATA (not schema).
  * This routine should save whatever format-specific information is needed
  * to read the LOs back into memory.
  *
@@ -397,7 +402,7 @@ _EndLO(ArchiveHandle *AH, TocEntry *te, Oid oid)
 }
 
 /*
- * Called by the archiver when finishing saving BLOB DATA.
+ * Called by the archiver when finishing saving all BLOB DATA.
  *
  * Optional.
  */
@@ -563,7 +568,7 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te)
 
 /*
  * Print data from current file position.
- */
+*/
 static void
 _PrintData(ArchiveHandle *AH)
 {
@@ -617,26 +622,19 @@ _skipLOs(ArchiveHandle *AH)
  * Skip data from current file position.
  * Data blocks are formatted as an integer length, followed by data.
  * A zero length indicates the end of the block.
- */
+*/
 static void
 _skipData(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	size_t		blkLen;
 	char	   *buf = NULL;
-	size_t		buflen = 0;
+	int			buflen = 0;
 
 	blkLen = ReadInt(AH);
 	while (blkLen != 0)
 	{
-		/*
-		 * Seeks of less than stdio's buffer size are less efficient than just
-		 * reading the data, at least on common platforms.  We don't know the
-		 * buffer size for sure, but 4kB is the usual value.  (While pg_dump
-		 * currently tries to avoid producing such short data blocks, older
-		 * dump files often contain them.)
-		 */
-		if (ctx->hasSeek && blkLen >= 4 * 1024)
+		if (ctx->hasSeek)
 		{
 			if (fseeko(AH->FH, blkLen, SEEK_CUR) != 0)
 				pg_fatal("error during file seek: %m");
@@ -645,9 +643,9 @@ _skipData(ArchiveHandle *AH)
 		{
 			if (blkLen > buflen)
 			{
-				pg_free(buf);
-				buflen = Max(blkLen, 4 * 1024);
-				buf = (char *) pg_malloc(buflen);
+				free(buf);
+				buf = (char *) pg_malloc(blkLen);
+				buflen = blkLen;
 			}
 			if (fread(buf, 1, blkLen, AH->FH) != blkLen)
 			{
@@ -661,7 +659,7 @@ _skipData(ArchiveHandle *AH)
 		blkLen = ReadInt(AH);
 	}
 
-	pg_free(buf);
+	free(buf);
 }
 
 /*
@@ -762,11 +760,9 @@ _CloseArchive(ArchiveHandle *AH)
 		 * If possible, re-write the TOC in order to update the data offset
 		 * information.  This is not essential, as pg_restore can cope in most
 		 * cases without it; but it can make pg_restore significantly faster
-		 * in some situations (especially parallel restore).  We can skip this
-		 * step if we're not dumping any data; there are no offsets to update
-		 * in that case.
+		 * in some situations (especially parallel restore).
 		 */
-		if (ctx->hasSeek && AH->public.dopt->dumpData &&
+		if (ctx->hasSeek &&
 			fseeko(AH->FH, tpos, SEEK_SET) == 0)
 			WriteToc(AH);
 	}
@@ -893,7 +889,7 @@ _Clone(ArchiveHandle *AH)
 	/*
 	 * Each thread must have private lclContext working state.
 	 */
-	AH->formatData = pg_malloc_object(lclContext);
+	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
 	memcpy(AH->formatData, ctx, sizeof(lclContext));
 	ctx = (lclContext *) AH->formatData;
 
@@ -906,6 +902,9 @@ _Clone(ArchiveHandle *AH)
 	 * share knowledge about where the data blocks are across threads.
 	 * _PrintTocData has to be careful about the order of operations on that
 	 * state, though.
+	 *
+	 * Note: we do not make a local lo_buf because we expect at most one BLOBS
+	 * entry per archive, so no parallelism is possible.
 	 */
 }
 

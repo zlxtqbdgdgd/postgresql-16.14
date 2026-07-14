@@ -8,6 +8,30 @@
 
 static struct ECPGstruct_member struct_no_indicator = {"no_indicator", &ecpg_no_indicator, NULL};
 
+/* malloc + error check */
+void *
+mm_alloc(size_t size)
+{
+	void	   *ptr = malloc(size);
+
+	if (ptr == NULL)
+		mmfatal(OUT_OF_MEMORY, "out of memory");
+
+	return ptr;
+}
+
+/* strdup + error check */
+char *
+mm_strdup(const char *string)
+{
+	char	   *new = strdup(string);
+
+	if (new == NULL)
+		mmfatal(OUT_OF_MEMORY, "out of memory");
+
+	return new;
+}
+
 /* duplicate memberlist */
 struct ECPGstruct_member *
 ECPGstruct_member_dup(struct ECPGstruct_member *rm)
@@ -69,13 +93,13 @@ ECPGmake_struct_member(const char *name, struct ECPGtype *type, struct ECPGstruc
 }
 
 struct ECPGtype *
-ECPGmake_simple_type(enum ECPGttype type, const char *size, int counter)
+ECPGmake_simple_type(enum ECPGttype type, char *size, int counter)
 {
 	struct ECPGtype *ne = (struct ECPGtype *) mm_alloc(sizeof(struct ECPGtype));
 
 	ne->type = type;
 	ne->type_name = NULL;
-	ne->size = mm_strdup(size);
+	ne->size = size;
 	ne->u.element = NULL;
 	ne->struct_sizeof = NULL;
 	ne->counter = counter;		/* only needed for varchar and bytea */
@@ -84,7 +108,7 @@ ECPGmake_simple_type(enum ECPGttype type, const char *size, int counter)
 }
 
 struct ECPGtype *
-ECPGmake_array_type(struct ECPGtype *type, const char *size)
+ECPGmake_array_type(struct ECPGtype *type, char *size)
 {
 	struct ECPGtype *ne = ECPGmake_simple_type(ECPGt_array, size, 0);
 
@@ -94,14 +118,13 @@ ECPGmake_array_type(struct ECPGtype *type, const char *size)
 }
 
 struct ECPGtype *
-ECPGmake_struct_type(struct ECPGstruct_member *rm, enum ECPGttype type,
-					 const char *type_name, const char *struct_sizeof)
+ECPGmake_struct_type(struct ECPGstruct_member *rm, enum ECPGttype type, char *type_name, char *struct_sizeof)
 {
-	struct ECPGtype *ne = ECPGmake_simple_type(type, "1", 0);
+	struct ECPGtype *ne = ECPGmake_simple_type(type, mm_strdup("1"), 0);
 
 	ne->type_name = mm_strdup(type_name);
 	ne->u.members = ECPGstruct_member_dup(rm);
-	ne->struct_sizeof = struct_sizeof ? mm_strdup(struct_sizeof) : NULL;
+	ne->struct_sizeof = struct_sizeof;
 
 	return ne;
 }
@@ -194,20 +217,19 @@ get_type(enum ECPGttype type)
 	return NULL;
 }
 
-/*
- * Dump a type.
- * The type is dumped as:
- * type-tag <comma>				   - enum ECPGttype
- * reference-to-variable <comma>		   - char *
- * size <comma>					   - long size of this field (if varchar)
- * arrsize <comma>				   - long number of elements in the arr
- * offset <comma>				   - offset to the next element
- * Where:
- * type-tag is one of the simple types or varchar.
- * reference-to-variable can be a reference to a struct element.
- * arrsize is the size of the array in case of array fetches. Otherwise 0.
- * size is the maxsize in case it is a varchar. Otherwise it is the size of
- * the variable (required to do array fetches of structs).
+/* Dump a type.
+   The type is dumped as:
+   type-tag <comma>				   - enum ECPGttype
+   reference-to-variable <comma>		   - char *
+   size <comma>					   - long size of this field (if varchar)
+   arrsize <comma>				   - long number of elements in the arr
+   offset <comma>				   - offset to the next element
+   Where:
+   type-tag is one of the simple types or varchar.
+   reference-to-variable can be a reference to a struct element.
+   arrsize is the size of the array in case of array fetches. Otherwise 0.
+   size is the maxsize in case it is a varchar. Otherwise it is the size of
+   the variable (required to do array fetches of structs).
  */
 static void ECPGdump_a_simple(FILE *o, const char *name, enum ECPGttype type,
 							  char *varcharsize,
@@ -383,10 +405,8 @@ ECPGdump_a_type(FILE *o, const char *name, struct ECPGtype *type, const int brac
 }
 
 
-/*
- * If size is NULL, then the offset is 0, if not use size as a
- * string, it represents the offset needed if we are in an array of structs.
- */
+/* If size is NULL, then the offset is 0, if not use size as a
+   string, it represents the offset needed if we are in an array of structs. */
 static void
 ECPGdump_a_simple(FILE *o, const char *name, enum ECPGttype type,
 				  char *varcharsize,
@@ -626,7 +646,7 @@ ECPGfree_struct_member(struct ECPGstruct_member *rm)
 
 		rm = rm->next;
 		free(p->name);
-		ECPGfree_type(p->type);
+		free(p->type);
 		free(p);
 	}
 }
@@ -647,13 +667,14 @@ ECPGfree_type(struct ECPGtype *type)
 					case ECPGt_struct:
 					case ECPGt_union:
 						/* Array of structs. */
-						ECPGfree_type(type->u.element);
+						ECPGfree_struct_member(type->u.element->u.members);
+						free(type->u.element);
 						break;
 					default:
 						if (!IS_SIMPLE_TYPE(type->u.element->type))
 							base_yyerror("internal error: unknown datatype, please report this to <" PACKAGE_BUGREPORT ">");
 
-						ECPGfree_type(type->u.element);
+						free(type->u.element);
 				}
 				break;
 			case ECPGt_struct:
@@ -665,9 +686,6 @@ ECPGfree_type(struct ECPGtype *type)
 				break;
 		}
 	}
-	free(type->type_name);
-	free(type->size);
-	free(type->struct_sizeof);
 	free(type);
 }
 
@@ -677,7 +695,7 @@ get_dtype(enum ECPGdtype type)
 	switch (type)
 	{
 		case ECPGd_count:
-			return "ECPGd_count";
+			return "ECPGd_countr";
 			break;
 		case ECPGd_data:
 			return "ECPGd_data";

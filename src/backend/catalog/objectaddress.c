@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/objectaddress.h"
@@ -33,6 +34,7 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -47,11 +49,6 @@
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
-#include "catalog/pg_propgraph_element.h"
-#include "catalog/pg_propgraph_element_label.h"
-#include "catalog/pg_propgraph_label.h"
-#include "catalog/pg_propgraph_label_property.h"
-#include "catalog/pg_propgraph_property.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
@@ -67,6 +64,7 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -77,6 +75,7 @@
 #include "foreign/foreign.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
@@ -104,11 +103,10 @@ typedef struct
 								 * error messages */
 	Oid			class_oid;		/* oid of catalog */
 	Oid			oid_index_oid;	/* oid of index on system oid column */
-	SysCacheIdentifier oid_catcache_id; /* id of catcache on system oid column	*/
-	SysCacheIdentifier name_catcache_id;	/* id of catcache on
-											 * (name,namespace), or (name) if
-											 * the object does not live in a
-											 * namespace */
+	int			oid_catcache_id;	/* id of catcache on system oid column	*/
+	int			name_catcache_id;	/* id of catcache on (name,namespace), or
+									 * (name) if the object does not live in a
+									 * namespace */
 	AttrNumber	attnum_oid;		/* attribute number of oid column */
 	AttrNumber	attnum_name;	/* attnum of name field */
 	AttrNumber	attnum_namespace;	/* attnum of namespace field */
@@ -134,15 +132,15 @@ static const ObjectPropertyType ObjectProperty[] =
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_ACCESS_METHOD,
+		-1,
 		true
 	},
 	{
 		"access method operator",
 		AccessMethodOperatorRelationId,
 		AccessMethodOperatorOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_amop_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -155,8 +153,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"access method procedure",
 		AccessMethodProcedureRelationId,
 		AccessMethodProcedureOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_amproc_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -169,14 +167,14 @@ static const ObjectPropertyType ObjectProperty[] =
 		"cast",
 		CastRelationId,
 		CastOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_cast_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_CAST,
+		-1,
 		false
 	},
 	{
@@ -184,7 +182,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		CollationRelationId,
 		CollationOidIndexId,
 		COLLOID,
-		SYSCACHEID_INVALID,		/* COLLNAMEENCNSP also takes encoding */
+		-1,						/* COLLNAMEENCNSP also takes encoding */
 		Anum_pg_collation_oid,
 		Anum_pg_collation_collname,
 		Anum_pg_collation_collnamespace,
@@ -198,7 +196,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		ConstraintRelationId,
 		ConstraintOidIndexId,
 		CONSTROID,
-		SYSCACHEID_INVALID,
+		-1,
 		Anum_pg_constraint_oid,
 		Anum_pg_constraint_conname,
 		Anum_pg_constraint_connamespace,
@@ -226,7 +224,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		DatabaseRelationId,
 		DatabaseOidIndexId,
 		DATABASEOID,
-		SYSCACHEID_INVALID,
+		-1,
 		Anum_pg_database_oid,
 		Anum_pg_database_datname,
 		InvalidAttrNumber,
@@ -239,8 +237,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"default ACL",
 		DefaultAclRelationId,
 		DefaultAclOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_default_acl_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -253,8 +251,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"extension",
 		ExtensionRelationId,
 		ExtensionOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_extension_oid,
 		Anum_pg_extension_extname,
 		InvalidAttrNumber,		/* extension doesn't belong to extnamespace */
@@ -296,7 +294,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		ProcedureRelationId,
 		ProcedureOidIndexId,
 		PROCOID,
-		SYSCACHEID_INVALID,		/* PROCNAMEARGSNSP also takes argument types */
+		-1,						/* PROCNAMEARGSNSP also takes argument types */
 		Anum_pg_proc_oid,
 		Anum_pg_proc_proname,
 		Anum_pg_proc_pronamespace,
@@ -323,8 +321,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"large object metadata",
 		LargeObjectMetadataRelationId,
 		LargeObjectMetadataOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_largeobject_metadata_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -338,7 +336,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorClassRelationId,
 		OpclassOidIndexId,
 		CLAOID,
-		SYSCACHEID_INVALID,		/* CLAAMNAMENSP also takes opcmethod */
+		-1,						/* CLAAMNAMENSP also takes opcmethod */
 		Anum_pg_opclass_oid,
 		Anum_pg_opclass_opcname,
 		Anum_pg_opclass_opcnamespace,
@@ -352,7 +350,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorRelationId,
 		OperatorOidIndexId,
 		OPEROID,
-		SYSCACHEID_INVALID,		/* OPERNAMENSP also takes left and right type */
+		-1,						/* OPERNAMENSP also takes left and right type */
 		Anum_pg_operator_oid,
 		Anum_pg_operator_oprname,
 		Anum_pg_operator_oprnamespace,
@@ -366,7 +364,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorFamilyRelationId,
 		OpfamilyOidIndexId,
 		OPFAMILYOID,
-		SYSCACHEID_INVALID,		/* OPFAMILYAMNAMENSP also takes opfmethod */
+		-1,						/* OPFAMILYAMNAMENSP also takes opfmethod */
 		Anum_pg_opfamily_oid,
 		Anum_pg_opfamily_opfname,
 		Anum_pg_opfamily_opfnamespace,
@@ -374,76 +372,6 @@ static const ObjectPropertyType ObjectProperty[] =
 		InvalidAttrNumber,
 		OBJECT_OPFAMILY,
 		true
-	},
-	{
-		"property graph element",
-		PropgraphElementRelationId,
-		PropgraphElementObjectIndexId,
-		PROPGRAPHELOID,
-		PROPGRAPHELALIAS,
-		Anum_pg_propgraph_element_oid,
-		Anum_pg_propgraph_element_pgealias,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		-1,
-		false
-	},
-	{
-		"property graph element label",
-		PropgraphElementLabelRelationId,
-		PropgraphElementLabelObjectIndexId,
-		-1,
-		-1,
-		Anum_pg_propgraph_element_label_oid,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		-1,
-		false
-	},
-	{
-		"property graph label",
-		PropgraphLabelRelationId,
-		PropgraphLabelObjectIndexId,
-		PROPGRAPHLABELOID,
-		PROPGRAPHLABELNAME,
-		Anum_pg_propgraph_label_oid,
-		Anum_pg_propgraph_label_pgllabel,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		-1,
-		false
-	},
-	{
-		"property graph label property",
-		PropgraphLabelPropertyRelationId,
-		PropgraphLabelPropertyObjectIndexId,
-		-1,
-		-1,
-		Anum_pg_propgraph_label_property_oid,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		-1,
-		false
-	},
-	{
-		"property graph property",
-		PropgraphPropertyRelationId,
-		PropgraphPropertyObjectIndexId,
-		-1,
-		PROPGRAPHPROPNAME,
-		Anum_pg_propgraph_property_oid,
-		Anum_pg_propgraph_property_pgpname,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		-1,
-		false
 	},
 	{
 		"role",
@@ -456,15 +384,15 @@ static const ObjectPropertyType ObjectProperty[] =
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_ROLE,
+		-1,
 		true
 	},
 	{
 		"role membership",
 		AuthMemRelationId,
 		AuthMemOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_auth_members_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -477,14 +405,14 @@ static const ObjectPropertyType ObjectProperty[] =
 		"rule",
 		RewriteRelationId,
 		RewriteOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_rewrite_oid,
 		Anum_pg_rewrite_rulename,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_RULE,
+		-1,
 		false
 	},
 	{
@@ -520,7 +448,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		TableSpaceRelationId,
 		TablespaceOidIndexId,
 		TABLESPACEOID,
-		SYSCACHEID_INVALID,
+		-1,
 		Anum_pg_tablespace_oid,
 		Anum_pg_tablespace_spcname,
 		InvalidAttrNumber,
@@ -534,41 +462,35 @@ static const ObjectPropertyType ObjectProperty[] =
 		TransformRelationId,
 		TransformOidIndexId,
 		TRFOID,
-		SYSCACHEID_INVALID,
-		Anum_pg_transform_oid,
 		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		InvalidAttrNumber,
-		OBJECT_TRANSFORM,
-		false
+		Anum_pg_transform_oid
 	},
 	{
 		"trigger",
 		TriggerRelationId,
 		TriggerOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_trigger_oid,
 		Anum_pg_trigger_tgname,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_TRIGGER,
+		-1,
 		false
 	},
 	{
 		"policy",
 		PolicyRelationId,
 		PolicyOidIndexId,
-		SYSCACHEID_INVALID,
-		SYSCACHEID_INVALID,
+		-1,
+		-1,
 		Anum_pg_policy_oid,
 		Anum_pg_policy_polname,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_POLICY,
+		-1,
 		false
 	},
 	{
@@ -624,7 +546,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_ts_parser_prsnamespace,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_TSPARSER,
+		-1,
 		true
 	},
 	{
@@ -638,7 +560,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_ts_template_tmplnamespace,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
-		OBJECT_TSTEMPLATE,
+		-1,
 		true,
 	},
 	{
@@ -702,7 +624,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		UserMappingRelationId,
 		UserMappingOidIndexId,
 		USERMAPPINGOID,
-		SYSCACHEID_INVALID,
+		-1,
 		Anum_pg_user_mapping_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -730,6 +652,7 @@ static const struct object_type_map
 
 			ObjectTypeMap[] =
 {
+	/* OCLASS_CLASS, all kinds of relations */
 	{
 		"table", OBJECT_TABLE
 	},
@@ -755,9 +678,6 @@ static const struct object_type_map
 		"foreign table", OBJECT_FOREIGN_TABLE
 	},
 	{
-		"property graph", OBJECT_PROPGRAPH
-	},
-	{
 		"table column", OBJECT_COLUMN
 	},
 	{
@@ -781,6 +701,7 @@ static const struct object_type_map
 	{
 		"foreign table column", OBJECT_COLUMN
 	},
+	/* OCLASS_PROC */
 	{
 		"aggregate", OBJECT_AGGREGATE
 	},
@@ -790,138 +711,162 @@ static const struct object_type_map
 	{
 		"procedure", OBJECT_PROCEDURE
 	},
+	/* OCLASS_TYPE */
 	{
 		"type", OBJECT_TYPE
 	},
+	/* OCLASS_CAST */
 	{
 		"cast", OBJECT_CAST
 	},
+	/* OCLASS_COLLATION */
 	{
 		"collation", OBJECT_COLLATION
 	},
+	/* OCLASS_CONSTRAINT */
 	{
 		"table constraint", OBJECT_TABCONSTRAINT
 	},
 	{
 		"domain constraint", OBJECT_DOMCONSTRAINT
 	},
+	/* OCLASS_CONVERSION */
 	{
 		"conversion", OBJECT_CONVERSION
 	},
+	/* OCLASS_DEFAULT */
 	{
 		"default value", OBJECT_DEFAULT
 	},
+	/* OCLASS_LANGUAGE */
 	{
 		"language", OBJECT_LANGUAGE
 	},
+	/* OCLASS_LARGEOBJECT */
 	{
 		"large object", OBJECT_LARGEOBJECT
 	},
+	/* OCLASS_OPERATOR */
 	{
 		"operator", OBJECT_OPERATOR
 	},
+	/* OCLASS_OPCLASS */
 	{
 		"operator class", OBJECT_OPCLASS
 	},
+	/* OCLASS_OPFAMILY */
 	{
 		"operator family", OBJECT_OPFAMILY
 	},
+	/* OCLASS_AM */
 	{
 		"access method", OBJECT_ACCESS_METHOD
 	},
+	/* OCLASS_AMOP */
 	{
 		"operator of access method", OBJECT_AMOP
 	},
+	/* OCLASS_AMPROC */
 	{
 		"function of access method", OBJECT_AMPROC
 	},
+	/* OCLASS_REWRITE */
 	{
 		"rule", OBJECT_RULE
 	},
+	/* OCLASS_TRIGGER */
 	{
 		"trigger", OBJECT_TRIGGER
 	},
+	/* OCLASS_SCHEMA */
 	{
 		"schema", OBJECT_SCHEMA
 	},
+	/* OCLASS_TSPARSER */
 	{
 		"text search parser", OBJECT_TSPARSER
 	},
+	/* OCLASS_TSDICT */
 	{
 		"text search dictionary", OBJECT_TSDICTIONARY
 	},
+	/* OCLASS_TSTEMPLATE */
 	{
 		"text search template", OBJECT_TSTEMPLATE
 	},
+	/* OCLASS_TSCONFIG */
 	{
 		"text search configuration", OBJECT_TSCONFIGURATION
 	},
+	/* OCLASS_ROLE */
 	{
 		"role", OBJECT_ROLE
 	},
+	/* OCLASS_ROLE_MEMBERSHIP */
 	{
 		"role membership", -1	/* unmapped */
 	},
+	/* OCLASS_DATABASE */
 	{
 		"database", OBJECT_DATABASE
 	},
+	/* OCLASS_TBLSPACE */
 	{
 		"tablespace", OBJECT_TABLESPACE
 	},
+	/* OCLASS_FDW */
 	{
 		"foreign-data wrapper", OBJECT_FDW
 	},
+	/* OCLASS_FOREIGN_SERVER */
 	{
 		"server", OBJECT_FOREIGN_SERVER
 	},
+	/* OCLASS_USER_MAPPING */
 	{
 		"user mapping", OBJECT_USER_MAPPING
 	},
+	/* OCLASS_DEFACL */
 	{
 		"default acl", OBJECT_DEFACL
 	},
+	/* OCLASS_EXTENSION */
 	{
 		"extension", OBJECT_EXTENSION
 	},
+	/* OCLASS_EVENT_TRIGGER */
 	{
 		"event trigger", OBJECT_EVENT_TRIGGER
 	},
+	/* OCLASS_PARAMETER_ACL */
 	{
 		"parameter ACL", OBJECT_PARAMETER_ACL
 	},
+	/* OCLASS_POLICY */
 	{
 		"policy", OBJECT_POLICY
 	},
-	{
-		"property graph element", -1
-	},
-	{
-		"property graph element label", -1
-	},
-	{
-		"property graph label", -1
-	},
-	{
-		"property graph label property", -1
-	},
-	{
-		"property graph property", -1
-	},
+	/* OCLASS_PUBLICATION */
 	{
 		"publication", OBJECT_PUBLICATION
 	},
+	/* OCLASS_PUBLICATION_NAMESPACE */
 	{
 		"publication namespace", OBJECT_PUBLICATION_NAMESPACE
 	},
+	/* OCLASS_PUBLICATION_REL */
 	{
 		"publication relation", OBJECT_PUBLICATION_REL
 	},
+	/* OCLASS_SUBSCRIPTION */
 	{
 		"subscription", OBJECT_SUBSCRIPTION
 	},
+	/* OCLASS_TRANSFORM */
 	{
 		"transform", OBJECT_TRANSFORM
 	},
+	/* OCLASS_STATISTIC_EXT */
 	{
 		"statistics object", OBJECT_STATISTIC_EXT
 	}
@@ -989,8 +934,7 @@ static void getRelationIdentity(StringInfo buffer, Oid relid, List **object,
  *
  * If the object is a relation or a child object of a relation (e.g. an
  * attribute or constraint), the relation is also opened and *relp receives
- * the open relcache entry pointer; otherwise, *relp is set to NULL.
- * (relp can be NULL if the caller never passes a relation-related object.)  This
+ * the open relcache entry pointer; otherwise, *relp is set to NULL.  This
  * is a bit grotty but it makes life simpler, since the caller will
  * typically need the relcache entry too.  Caller must close the relcache
  * entry when done with it.  The relation is locked with the specified lockmode
@@ -1042,7 +986,6 @@ get_object_address(ObjectType objtype, Node *object,
 			case OBJECT_VIEW:
 			case OBJECT_MATVIEW:
 			case OBJECT_FOREIGN_TABLE:
-			case OBJECT_PROPGRAPH:
 				address =
 					get_relation_by_qualified_name(objtype, castNode(List, object),
 												   &relation, lockmode,
@@ -1299,12 +1242,8 @@ get_object_address(ObjectType objtype, Node *object,
 		old_address = address;
 	}
 
-	/* relp must be given if it's a relation */
-	Assert(!relation || relp);
-
 	/* Return the object address and the relation. */
-	if (relp)
-		*relp = relation;
+	*relp = relation;
 	return address;
 }
 
@@ -1453,13 +1392,6 @@ get_relation_by_qualified_name(ObjectType objtype, List *object,
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is not an index",
-								RelationGetRelationName(relation))));
-			break;
-		case OBJECT_PROPGRAPH:
-			if (relation->rd_rel->relkind != RELKIND_PROPGRAPH)
-				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						 errmsg("\"%s\" is not a property graph",
 								RelationGetRelationName(relation))));
 			break;
 		case OBJECT_SEQUENCE:
@@ -2106,20 +2038,16 @@ get_object_address_defacl(List *object, bool missing_ok)
 		case DEFACLOBJ_NAMESPACE:
 			objtype_str = "schemas";
 			break;
-		case DEFACLOBJ_LARGEOBJECT:
-			objtype_str = "large objects";
-			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("unrecognized default ACL object type \"%c\"", objtype),
-					 errhint("Valid object types are \"%c\", \"%c\", \"%c\", \"%c\", \"%c\", \"%c\".",
+					 errhint("Valid object types are \"%c\", \"%c\", \"%c\", \"%c\", \"%c\".",
 							 DEFACLOBJ_RELATION,
 							 DEFACLOBJ_SEQUENCE,
 							 DEFACLOBJ_FUNCTION,
 							 DEFACLOBJ_TYPE,
-							 DEFACLOBJ_NAMESPACE,
-							 DEFACLOBJ_LARGEOBJECT)));
+							 DEFACLOBJ_NAMESPACE)));
 	}
 
 	/*
@@ -2333,7 +2261,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be exactly %d", 1)));
 			/* fall through to check args length */
-			pg_fallthrough;
+			/* FALLTHROUGH */
 		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_CAST:
 		case OBJECT_PUBLICATION_REL:
@@ -2358,7 +2286,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be at least %d", 3)));
 			/* fall through to check args length */
-			pg_fallthrough;
+			/* FALLTHROUGH */
 		case OBJECT_OPERATOR:
 			if (list_length(args) != 2)
 				ereport(ERROR,
@@ -2381,7 +2309,6 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_MATVIEW:
 		case OBJECT_INDEX:
 		case OBJECT_FOREIGN_TABLE:
-		case OBJECT_PROPGRAPH:
 		case OBJECT_COLUMN:
 		case OBJECT_ATTRIBUTE:
 		case OBJECT_COLLATION:
@@ -2501,7 +2428,6 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
 		case OBJECT_FOREIGN_TABLE:
-		case OBJECT_PROPGRAPH:
 		case OBJECT_COLUMN:
 		case OBJECT_RULE:
 		case OBJECT_TRIGGER:
@@ -2675,7 +2601,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 Oid
 get_object_namespace(const ObjectAddress *address)
 {
-	SysCacheIdentifier cache;
+	int			cache;
 	HeapTuple	tuple;
 	Oid			oid;
 	const ObjectPropertyType *property;
@@ -2687,7 +2613,7 @@ get_object_namespace(const ObjectAddress *address)
 
 	/* Currently, we can only handle object types with system caches. */
 	cache = property->oid_catcache_id;
-	Assert(cache != SYSCACHEID_INVALID);
+	Assert(cache != -1);
 
 	/* Fetch tuple from syscache and extract namespace attribute. */
 	tuple = SearchSysCache1(cache, ObjectIdGetDatum(address->objectId));
@@ -2744,7 +2670,7 @@ get_object_oid_index(Oid class_id)
 	return prop->oid_index_oid;
 }
 
-SysCacheIdentifier
+int
 get_object_catcache_oid(Oid class_id)
 {
 	const ObjectPropertyType *prop = get_object_property_data(class_id);
@@ -2752,7 +2678,7 @@ get_object_catcache_oid(Oid class_id)
 	return prop->oid_catcache_id;
 }
 
-SysCacheIdentifier
+int
 get_object_catcache_name(Oid class_id)
 {
 	const ObjectPropertyType *prop = get_object_property_data(class_id);
@@ -2910,9 +2836,9 @@ get_catalog_object_by_oid_extended(Relation catalog,
 {
 	HeapTuple	tuple;
 	Oid			classId = RelationGetRelid(catalog);
-	SysCacheIdentifier oidCacheId = get_object_catcache_oid(classId);
+	int			oidCacheId = get_object_catcache_oid(classId);
 
-	if (oidCacheId >= 0)
+	if (oidCacheId > 0)
 	{
 		if (locktup)
 			tuple = SearchSysCacheLockedCopy1(oidCacheId,
@@ -3018,9 +2944,9 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 
 	initStringInfo(&buffer);
 
-	switch (object->classId)
+	switch (getObjectClass(object))
 	{
-		case RelationRelationId:
+		case OCLASS_CLASS:
 			if (object->objectSubId == 0)
 				getRelationDescription(&buffer, object->objectId, missing_ok);
 			else
@@ -3043,9 +2969,9 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 			}
 			break;
 
-		case ProcedureRelationId:
+		case OCLASS_PROC:
 			{
-				uint16		flags = FORMAT_PROC_INVALID_AS_NULL;
+				bits16		flags = FORMAT_PROC_INVALID_AS_NULL;
 				char	   *proname = format_procedure_extended(object->objectId,
 																flags);
 
@@ -3056,9 +2982,9 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TypeRelationId:
+		case OCLASS_TYPE:
 			{
-				uint16		flags = FORMAT_TYPE_INVALID_AS_NULL;
+				bits16		flags = FORMAT_TYPE_INVALID_AS_NULL;
 				char	   *typname = format_type_extended(object->objectId, -1,
 														   flags);
 
@@ -3069,7 +2995,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case CastRelationId:
+		case OCLASS_CAST:
 			{
 				Relation	castDesc;
 				ScanKeyData skey[1];
@@ -3111,7 +3037,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case CollationRelationId:
+		case OCLASS_COLLATION:
 			{
 				HeapTuple	collTup;
 				Form_pg_collation coll;
@@ -3142,7 +3068,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ConstraintRelationId:
+		case OCLASS_CONSTRAINT:
 			{
 				HeapTuple	conTup;
 				Form_pg_constraint con;
@@ -3180,7 +3106,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ConversionRelationId:
+		case OCLASS_CONVERSION:
 			{
 				HeapTuple	conTup;
 				Form_pg_conversion conv;
@@ -3211,7 +3137,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case AttrDefaultRelationId:
+		case OCLASS_DEFAULT:
 			{
 				ObjectAddress colobject;
 
@@ -3231,7 +3157,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case LanguageRelationId:
+		case OCLASS_LANGUAGE:
 			{
 				char	   *langname = get_language_name(object->objectId,
 														 missing_ok);
@@ -3242,16 +3168,16 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case LargeObjectRelationId:
+		case OCLASS_LARGEOBJECT:
 			if (!LargeObjectExists(object->objectId))
 				break;
 			appendStringInfo(&buffer, _("large object %u"),
 							 object->objectId);
 			break;
 
-		case OperatorRelationId:
+		case OCLASS_OPERATOR:
 			{
-				uint16		flags = FORMAT_OPERATOR_INVALID_AS_NULL;
+				bits16		flags = FORMAT_OPERATOR_INVALID_AS_NULL;
 				char	   *oprname = format_operator_extended(object->objectId,
 															   flags);
 
@@ -3262,7 +3188,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case OperatorClassRelationId:
+		case OCLASS_OPCLASS:
 			{
 				HeapTuple	opcTup;
 				Form_pg_opclass opcForm;
@@ -3305,11 +3231,11 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case OperatorFamilyRelationId:
+		case OCLASS_OPFAMILY:
 			getOpFamilyDescription(&buffer, object->objectId, missing_ok);
 			break;
 
-		case AccessMethodRelationId:
+		case OCLASS_AM:
 			{
 				HeapTuple	tup;
 
@@ -3329,7 +3255,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case AccessMethodOperatorRelationId:
+		case OCLASS_AMOP:
 			{
 				Relation	amopDesc;
 				HeapTuple	tup;
@@ -3394,7 +3320,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case AccessMethodProcedureRelationId:
+		case OCLASS_AMPROC:
 			{
 				Relation	amprocDesc;
 				ScanKeyData skey[1];
@@ -3459,7 +3385,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case RewriteRelationId:
+		case OCLASS_REWRITE:
 			{
 				Relation	ruleDesc;
 				ScanKeyData skey[1];
@@ -3505,7 +3431,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TriggerRelationId:
+		case OCLASS_TRIGGER:
 			{
 				Relation	trigDesc;
 				ScanKeyData skey[1];
@@ -3551,7 +3477,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case NamespaceRelationId:
+		case OCLASS_SCHEMA:
 			{
 				char	   *nspname;
 
@@ -3567,7 +3493,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case StatisticExtRelationId:
+		case OCLASS_STATISTIC_EXT:
 			{
 				HeapTuple	stxTup;
 				Form_pg_statistic_ext stxForm;
@@ -3599,7 +3525,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TSParserRelationId:
+		case OCLASS_TSPARSER:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_parser prsForm;
@@ -3629,7 +3555,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TSDictionaryRelationId:
+		case OCLASS_TSDICT:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_dict dictForm;
@@ -3660,7 +3586,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TSTemplateRelationId:
+		case OCLASS_TSTEMPLATE:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_template tmplForm;
@@ -3691,7 +3617,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TSConfigRelationId:
+		case OCLASS_TSCONFIG:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_config cfgForm;
@@ -3722,7 +3648,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case AuthIdRelationId:
+		case OCLASS_ROLE:
 			{
 				char	   *username = GetUserNameFromId(object->objectId,
 														 missing_ok);
@@ -3732,7 +3658,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case AuthMemRelationId:
+		case OCLASS_ROLE_MEMBERSHIP:
 			{
 				Relation	amDesc;
 				ScanKeyData skey[1];
@@ -3774,7 +3700,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case DatabaseRelationId:
+		case OCLASS_DATABASE:
 			{
 				char	   *datname;
 
@@ -3790,7 +3716,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TableSpaceRelationId:
+		case OCLASS_TBLSPACE:
 			{
 				char	   *tblspace;
 
@@ -3806,7 +3732,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ForeignDataWrapperRelationId:
+		case OCLASS_FDW:
 			{
 				ForeignDataWrapper *fdw;
 
@@ -3817,7 +3743,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ForeignServerRelationId:
+		case OCLASS_FOREIGN_SERVER:
 			{
 				ForeignServer *srv;
 
@@ -3827,7 +3753,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case UserMappingRelationId:
+		case OCLASS_USER_MAPPING:
 			{
 				HeapTuple	tup;
 				Oid			useid;
@@ -3861,7 +3787,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case DefaultAclRelationId:
+		case OCLASS_DEFACL:
 			{
 				Relation	defaclrel;
 				ScanKeyData skey[1];
@@ -3951,12 +3877,6 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 										 _("default privileges on new schemas belonging to role %s"),
 										 rolename);
 						break;
-					case DEFACLOBJ_LARGEOBJECT:
-						Assert(!nspname);
-						appendStringInfo(&buffer,
-										 _("default privileges on new large objects belonging to role %s"),
-										 rolename);
-						break;
 					default:
 						/* shouldn't get here */
 						if (nspname)
@@ -3975,7 +3895,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ExtensionRelationId:
+		case OCLASS_EXTENSION:
 			{
 				char	   *extname;
 
@@ -3991,7 +3911,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case EventTriggerRelationId:
+		case OCLASS_EVENT_TRIGGER:
 			{
 				HeapTuple	tup;
 
@@ -4010,7 +3930,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case ParameterAclRelationId:
+		case OCLASS_PARAMETER_ACL:
 			{
 				HeapTuple	tup;
 				Datum		nameDatum;
@@ -4033,7 +3953,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case PolicyRelationId:
+		case OCLASS_POLICY:
 			{
 				Relation	policy_rel;
 				ScanKeyData skey[1];
@@ -4079,154 +3999,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case PropgraphElementRelationId:
-			{
-				HeapTuple	tup;
-				Form_pg_propgraph_element pgeform;
-				StringInfoData rel;
-
-				tup = SearchSysCache1(PROPGRAPHELOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for property graph element %u",
-							 object->objectId);
-					break;
-				}
-
-				pgeform = (Form_pg_propgraph_element) GETSTRUCT(tup);
-
-				initStringInfo(&rel);
-				getRelationDescription(&rel, pgeform->pgepgid, false);
-
-				if (pgeform->pgekind == PGEKIND_VERTEX)
-					appendStringInfo(&buffer, _("vertex %s of %s"), NameStr(pgeform->pgealias), rel.data);
-				else if (pgeform->pgekind == PGEKIND_EDGE)
-					appendStringInfo(&buffer, _("edge %s of %s"), NameStr(pgeform->pgealias), rel.data);
-				else
-					appendStringInfo(&buffer, "??? element %s of %s", NameStr(pgeform->pgealias), rel.data);
-
-				pfree(rel.data);
-				ReleaseSysCache(tup);
-				break;
-			}
-
-		case PropgraphElementLabelRelationId:
-			{
-				Relation	rel;
-				HeapTuple	tuple;
-				Form_pg_propgraph_element_label pgelform;
-				ObjectAddress oa;
-
-				rel = table_open(PropgraphElementLabelRelationId, AccessShareLock);
-				tuple = get_catalog_object_by_oid(rel,
-												  Anum_pg_propgraph_element_label_oid,
-												  object->objectId);
-				if (!HeapTupleIsValid(tuple))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for element label %u", object->objectId);
-
-					table_close(rel, AccessShareLock);
-					break;
-				}
-
-				pgelform = (Form_pg_propgraph_element_label) GETSTRUCT(tuple);
-
-				ObjectAddressSet(oa, PropgraphElementRelationId, pgelform->pgelelid);
-				appendStringInfo(&buffer, _("label %s of %s"),
-								 get_propgraph_label_name(pgelform->pgellabelid),
-								 getObjectDescription(&oa, false));
-
-				table_close(rel, AccessShareLock);
-				break;
-			}
-
-		case PropgraphLabelRelationId:
-			{
-				HeapTuple	tuple;
-				Form_pg_propgraph_label pglform;
-				StringInfoData rel;
-
-				tuple = SearchSysCache1(PROPGRAPHLABELOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tuple))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for label %u", object->objectId);
-					break;
-				}
-
-				pglform = (Form_pg_propgraph_label) GETSTRUCT(tuple);
-
-				initStringInfo(&rel);
-				getRelationDescription(&rel, pglform->pglpgid, false);
-
-				appendStringInfo(&buffer, _("label %s of %s"), NameStr(pglform->pgllabel), rel.data);
-
-				pfree(rel.data);
-				ReleaseSysCache(tuple);
-				break;
-			}
-
-		case PropgraphLabelPropertyRelationId:
-			{
-				Relation	rel;
-				HeapTuple	tuple;
-				Form_pg_propgraph_label_property plpform;
-				ObjectAddress oa;
-
-				rel = table_open(PropgraphLabelPropertyRelationId, AccessShareLock);
-				tuple = get_catalog_object_by_oid(rel,
-												  Anum_pg_propgraph_label_property_oid,
-												  object->objectId);
-				if (!HeapTupleIsValid(tuple))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for label property %u", object->objectId);
-
-					table_close(rel, AccessShareLock);
-					break;
-				}
-
-				plpform = (Form_pg_propgraph_label_property) GETSTRUCT(tuple);
-
-				ObjectAddressSet(oa, PropgraphElementLabelRelationId, plpform->plpellabelid);
-
-				appendStringInfo(&buffer, _("property %s of %s"),
-								 get_propgraph_property_name(plpform->plppropid),
-								 getObjectDescription(&oa, false));
-
-				table_close(rel, AccessShareLock);
-				break;
-			}
-
-		case PropgraphPropertyRelationId:
-			{
-				HeapTuple	tuple;
-				Form_pg_propgraph_property pgpform;
-				StringInfoData rel;
-
-				tuple = SearchSysCache1(PROPGRAPHPROPOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tuple))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for property %u", object->objectId);
-					break;
-				}
-
-				pgpform = (Form_pg_propgraph_property) GETSTRUCT(tuple);
-
-				initStringInfo(&rel);
-				getRelationDescription(&rel, pgpform->pgppgid, false);
-
-				appendStringInfo(&buffer, _("property %s of %s"), NameStr(pgpform->pgpname), rel.data);
-
-				pfree(rel.data);
-				ReleaseSysCache(tuple);
-				break;
-			}
-
-		case PublicationRelationId:
+		case OCLASS_PUBLICATION:
 			{
 				char	   *pubname = get_publication_name(object->objectId,
 														   missing_ok);
@@ -4236,7 +4009,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case PublicationNamespaceRelationId:
+		case OCLASS_PUBLICATION_NAMESPACE:
 			{
 				char	   *pubname;
 				char	   *nspname;
@@ -4252,7 +4025,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case PublicationRelRelationId:
+		case OCLASS_PUBLICATION_REL:
 			{
 				HeapTuple	tup;
 				char	   *pubname;
@@ -4283,7 +4056,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case SubscriptionRelationId:
+		case OCLASS_SUBSCRIPTION:
 			{
 				char	   *subname = get_subscription_name(object->objectId,
 															missing_ok);
@@ -4293,7 +4066,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		case TransformRelationId:
+		case OCLASS_TRANSFORM:
 			{
 				HeapTuple	trfTup;
 				Form_pg_transform trfForm;
@@ -4318,8 +4091,10 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
-		default:
-			elog(ERROR, "unsupported object class: %u", object->classId);
+			/*
+			 * There's intentionally no default: case here; we want the
+			 * compiler to warn if a new OCLASS hasn't been handled above.
+			 */
 	}
 
 	/* an empty buffer is equivalent to no object found */
@@ -4409,10 +4184,6 @@ getRelationDescription(StringInfo buffer, Oid relid, bool missing_ok)
 			break;
 		case RELKIND_FOREIGN_TABLE:
 			appendStringInfo(buffer, _("foreign table %s"),
-							 relname);
-			break;
-		case RELKIND_PROPGRAPH:
-			appendStringInfo(buffer, _("property graph %s"),
 							 relname);
 			break;
 		default:
@@ -4537,8 +4308,8 @@ pg_identify_object(PG_FUNCTION_ARGS)
 			nspAttnum = get_object_attnum_namespace(address.classId);
 			if (nspAttnum != InvalidAttrNumber)
 			{
-				schema_oid = DatumGetObjectId(heap_getattr(objtup, nspAttnum,
-														   RelationGetDescr(catalog), &isnull));
+				schema_oid = heap_getattr(objtup, nspAttnum,
+										  RelationGetDescr(catalog), &isnull);
 				if (isnull)
 					elog(ERROR, "invalid null namespace in object %u/%u/%d",
 						 address.classId, address.objectId, address.objectSubId);
@@ -4673,75 +4444,6 @@ pg_identify_object_as_address(PG_FUNCTION_ARGS)
 }
 
 /*
- * SQL-level callable function to obtain the ACL of a specified object, given
- * its catalog OID, object OID and sub-object ID.
- */
-Datum
-pg_get_acl(PG_FUNCTION_ARGS)
-{
-	Oid			classId = PG_GETARG_OID(0);
-	Oid			objectId = PG_GETARG_OID(1);
-	int32		objsubid = PG_GETARG_INT32(2);
-	Oid			catalogId;
-	AttrNumber	Anum_acl;
-	Datum		datum;
-	bool		isnull;
-	HeapTuple	tup;
-
-	/* for "pinned" items in pg_depend, return null */
-	if (!OidIsValid(classId) && !OidIsValid(objectId))
-		PG_RETURN_NULL();
-
-	/* for large objects, the catalog to look at is pg_largeobject_metadata */
-	catalogId = (classId == LargeObjectRelationId) ?
-		LargeObjectMetadataRelationId : classId;
-	Anum_acl = get_object_attnum_acl(catalogId);
-
-	/* return NULL if no ACL field for this catalog */
-	if (Anum_acl == InvalidAttrNumber)
-		PG_RETURN_NULL();
-
-	/*
-	 * If dealing with a relation's attribute (objsubid is set), the ACL is
-	 * retrieved from pg_attribute.
-	 */
-	if (classId == RelationRelationId && objsubid != 0)
-	{
-		AttrNumber	attnum = (AttrNumber) objsubid;
-
-		tup = SearchSysCacheCopyAttNum(objectId, attnum);
-
-		if (!HeapTupleIsValid(tup))
-			PG_RETURN_NULL();
-
-		datum = SysCacheGetAttr(ATTNUM, tup, Anum_pg_attribute_attacl,
-								&isnull);
-	}
-	else
-	{
-		Relation	rel;
-
-		rel = table_open(catalogId, AccessShareLock);
-
-		tup = get_catalog_object_by_oid(rel, get_object_attnum_oid(catalogId),
-										objectId);
-		if (!HeapTupleIsValid(tup))
-		{
-			table_close(rel, AccessShareLock);
-			PG_RETURN_NULL();
-		}
-
-		datum = heap_getattr(tup, Anum_acl, RelationGetDescr(rel), &isnull);
-		table_close(rel, AccessShareLock);
-	}
-
-	if (isnull)
-		PG_RETURN_NULL();
-
-	PG_RETURN_DATUM(datum);
-}
-
-/*
  * Return a palloc'ed string that describes the type of object that the
  * passed address is for.
  *
@@ -4754,198 +4456,180 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 	initStringInfo(&buffer);
 
-	switch (object->classId)
+	switch (getObjectClass(object))
 	{
-		case RelationRelationId:
+		case OCLASS_CLASS:
 			getRelationTypeDescription(&buffer, object->objectId,
 									   object->objectSubId,
 									   missing_ok);
 			break;
 
-		case ProcedureRelationId:
+		case OCLASS_PROC:
 			getProcedureTypeDescription(&buffer, object->objectId,
 										missing_ok);
 			break;
 
-		case TypeRelationId:
+		case OCLASS_TYPE:
 			appendStringInfoString(&buffer, "type");
 			break;
 
-		case CastRelationId:
+		case OCLASS_CAST:
 			appendStringInfoString(&buffer, "cast");
 			break;
 
-		case CollationRelationId:
+		case OCLASS_COLLATION:
 			appendStringInfoString(&buffer, "collation");
 			break;
 
-		case ConstraintRelationId:
+		case OCLASS_CONSTRAINT:
 			getConstraintTypeDescription(&buffer, object->objectId,
 										 missing_ok);
 			break;
 
-		case ConversionRelationId:
+		case OCLASS_CONVERSION:
 			appendStringInfoString(&buffer, "conversion");
 			break;
 
-		case AttrDefaultRelationId:
+		case OCLASS_DEFAULT:
 			appendStringInfoString(&buffer, "default value");
 			break;
 
-		case LanguageRelationId:
+		case OCLASS_LANGUAGE:
 			appendStringInfoString(&buffer, "language");
 			break;
 
-		case LargeObjectRelationId:
+		case OCLASS_LARGEOBJECT:
 			appendStringInfoString(&buffer, "large object");
 			break;
 
-		case OperatorRelationId:
+		case OCLASS_OPERATOR:
 			appendStringInfoString(&buffer, "operator");
 			break;
 
-		case OperatorClassRelationId:
+		case OCLASS_OPCLASS:
 			appendStringInfoString(&buffer, "operator class");
 			break;
 
-		case OperatorFamilyRelationId:
+		case OCLASS_OPFAMILY:
 			appendStringInfoString(&buffer, "operator family");
 			break;
 
-		case AccessMethodRelationId:
+		case OCLASS_AM:
 			appendStringInfoString(&buffer, "access method");
 			break;
 
-		case AccessMethodOperatorRelationId:
+		case OCLASS_AMOP:
 			appendStringInfoString(&buffer, "operator of access method");
 			break;
 
-		case AccessMethodProcedureRelationId:
+		case OCLASS_AMPROC:
 			appendStringInfoString(&buffer, "function of access method");
 			break;
 
-		case RewriteRelationId:
+		case OCLASS_REWRITE:
 			appendStringInfoString(&buffer, "rule");
 			break;
 
-		case TriggerRelationId:
+		case OCLASS_TRIGGER:
 			appendStringInfoString(&buffer, "trigger");
 			break;
 
-		case NamespaceRelationId:
+		case OCLASS_SCHEMA:
 			appendStringInfoString(&buffer, "schema");
 			break;
 
-		case StatisticExtRelationId:
+		case OCLASS_STATISTIC_EXT:
 			appendStringInfoString(&buffer, "statistics object");
 			break;
 
-		case TSParserRelationId:
+		case OCLASS_TSPARSER:
 			appendStringInfoString(&buffer, "text search parser");
 			break;
 
-		case TSDictionaryRelationId:
+		case OCLASS_TSDICT:
 			appendStringInfoString(&buffer, "text search dictionary");
 			break;
 
-		case TSTemplateRelationId:
+		case OCLASS_TSTEMPLATE:
 			appendStringInfoString(&buffer, "text search template");
 			break;
 
-		case TSConfigRelationId:
+		case OCLASS_TSCONFIG:
 			appendStringInfoString(&buffer, "text search configuration");
 			break;
 
-		case AuthIdRelationId:
+		case OCLASS_ROLE:
 			appendStringInfoString(&buffer, "role");
 			break;
 
-		case AuthMemRelationId:
+		case OCLASS_ROLE_MEMBERSHIP:
 			appendStringInfoString(&buffer, "role membership");
 			break;
 
-		case DatabaseRelationId:
+		case OCLASS_DATABASE:
 			appendStringInfoString(&buffer, "database");
 			break;
 
-		case TableSpaceRelationId:
+		case OCLASS_TBLSPACE:
 			appendStringInfoString(&buffer, "tablespace");
 			break;
 
-		case ForeignDataWrapperRelationId:
+		case OCLASS_FDW:
 			appendStringInfoString(&buffer, "foreign-data wrapper");
 			break;
 
-		case ForeignServerRelationId:
+		case OCLASS_FOREIGN_SERVER:
 			appendStringInfoString(&buffer, "server");
 			break;
 
-		case UserMappingRelationId:
+		case OCLASS_USER_MAPPING:
 			appendStringInfoString(&buffer, "user mapping");
 			break;
 
-		case DefaultAclRelationId:
+		case OCLASS_DEFACL:
 			appendStringInfoString(&buffer, "default acl");
 			break;
 
-		case ExtensionRelationId:
+		case OCLASS_EXTENSION:
 			appendStringInfoString(&buffer, "extension");
 			break;
 
-		case EventTriggerRelationId:
+		case OCLASS_EVENT_TRIGGER:
 			appendStringInfoString(&buffer, "event trigger");
 			break;
 
-		case ParameterAclRelationId:
+		case OCLASS_PARAMETER_ACL:
 			appendStringInfoString(&buffer, "parameter ACL");
 			break;
 
-		case PolicyRelationId:
+		case OCLASS_POLICY:
 			appendStringInfoString(&buffer, "policy");
 			break;
 
-		case PropgraphElementRelationId:
-			appendStringInfoString(&buffer, "property graph element");
-			break;
-
-		case PropgraphLabelRelationId:
-			appendStringInfoString(&buffer, "property graph label");
-			break;
-
-		case PropgraphPropertyRelationId:
-			appendStringInfoString(&buffer, "property graph property");
-			break;
-
-		case PropgraphElementLabelRelationId:
-			appendStringInfoString(&buffer, "property graph element label");
-			break;
-
-		case PropgraphLabelPropertyRelationId:
-			appendStringInfoString(&buffer, "property graph label property");
-			break;
-
-		case PublicationRelationId:
+		case OCLASS_PUBLICATION:
 			appendStringInfoString(&buffer, "publication");
 			break;
 
-		case PublicationNamespaceRelationId:
+		case OCLASS_PUBLICATION_NAMESPACE:
 			appendStringInfoString(&buffer, "publication namespace");
 			break;
 
-		case PublicationRelRelationId:
+		case OCLASS_PUBLICATION_REL:
 			appendStringInfoString(&buffer, "publication relation");
 			break;
 
-		case SubscriptionRelationId:
+		case OCLASS_SUBSCRIPTION:
 			appendStringInfoString(&buffer, "subscription");
 			break;
 
-		case TransformRelationId:
+		case OCLASS_TRANSFORM:
 			appendStringInfoString(&buffer, "transform");
 			break;
 
-		default:
-			elog(ERROR, "unsupported object class: %u", object->classId);
+			/*
+			 * There's intentionally no default: case here; we want the
+			 * compiler to warn if a new OCLASS hasn't been handled above.
+			 */
 	}
 
 	/* the result can never be empty */
@@ -5004,9 +4688,6 @@ getRelationTypeDescription(StringInfo buffer, Oid relid, int32 objectSubId,
 			break;
 		case RELKIND_FOREIGN_TABLE:
 			appendStringInfoString(buffer, "foreign table");
-			break;
-		case RELKIND_PROPGRAPH:
-			appendStringInfoString(buffer, "property graph");
 			break;
 		default:
 			/* shouldn't get here */
@@ -5127,16 +4808,16 @@ getObjectIdentityParts(const ObjectAddress *object,
 	 * will be initialized in all cases inside the switch; but we do it anyway
 	 * so that we can test below that no branch leaves it unset.
 	 */
-	Assert((objname != NULL) == (objargs != NULL));
+	Assert(PointerIsValid(objname) == PointerIsValid(objargs));
 	if (objname)
 	{
 		*objname = NIL;
 		*objargs = NIL;
 	}
 
-	switch (object->classId)
+	switch (getObjectClass(object))
 	{
-		case RelationRelationId:
+		case OCLASS_CLASS:
 			{
 				char	   *attr = NULL;
 
@@ -5169,9 +4850,9 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
-		case ProcedureRelationId:
+		case OCLASS_PROC:
 			{
-				uint16		flags = FORMAT_PROC_FORCE_QUALIFY | FORMAT_PROC_INVALID_AS_NULL;
+				bits16		flags = FORMAT_PROC_FORCE_QUALIFY | FORMAT_PROC_INVALID_AS_NULL;
 				char	   *proname = format_procedure_extended(object->objectId,
 																flags);
 
@@ -5185,9 +4866,9 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TypeRelationId:
+		case OCLASS_TYPE:
 			{
-				uint16		flags = FORMAT_TYPE_INVALID_AS_NULL | FORMAT_TYPE_FORCE_QUALIFY;
+				bits16		flags = FORMAT_TYPE_INVALID_AS_NULL | FORMAT_TYPE_FORCE_QUALIFY;
 				char	   *typeout;
 
 				typeout = format_type_extended(object->objectId, -1, flags);
@@ -5201,7 +4882,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
-		case CastRelationId:
+		case OCLASS_CAST:
 			{
 				Relation	castRel;
 				HeapTuple	tup;
@@ -5238,7 +4919,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case CollationRelationId:
+		case OCLASS_COLLATION:
 			{
 				HeapTuple	collTup;
 				Form_pg_collation coll;
@@ -5265,7 +4946,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ConstraintRelationId:
+		case OCLASS_CONSTRAINT:
 			{
 				HeapTuple	conTup;
 				Form_pg_constraint con;
@@ -5312,7 +4993,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ConversionRelationId:
+		case OCLASS_CONVERSION:
 			{
 				HeapTuple	conTup;
 				Form_pg_conversion conForm;
@@ -5339,7 +5020,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case AttrDefaultRelationId:
+		case OCLASS_DEFAULT:
 			{
 				ObjectAddress colobject;
 
@@ -5360,7 +5041,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case LanguageRelationId:
+		case OCLASS_LANGUAGE:
 			{
 				HeapTuple	langTup;
 				Form_pg_language langForm;
@@ -5382,8 +5063,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				ReleaseSysCache(langTup);
 				break;
 			}
-
-		case LargeObjectRelationId:
+		case OCLASS_LARGEOBJECT:
 			if (!LargeObjectExists(object->objectId))
 				break;
 			appendStringInfo(&buffer, "%u",
@@ -5392,9 +5072,9 @@ getObjectIdentityParts(const ObjectAddress *object,
 				*objname = list_make1(psprintf("%u", object->objectId));
 			break;
 
-		case OperatorRelationId:
+		case OCLASS_OPERATOR:
 			{
-				uint16		flags = FORMAT_OPERATOR_FORCE_QUALIFY | FORMAT_OPERATOR_INVALID_AS_NULL;
+				bits16		flags = FORMAT_OPERATOR_FORCE_QUALIFY | FORMAT_OPERATOR_INVALID_AS_NULL;
 				char	   *oprname = format_operator_extended(object->objectId,
 															   flags);
 
@@ -5407,7 +5087,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case OperatorClassRelationId:
+		case OCLASS_OPCLASS:
 			{
 				HeapTuple	opcTup;
 				Form_pg_opclass opcForm;
@@ -5448,12 +5128,12 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case OperatorFamilyRelationId:
+		case OCLASS_OPFAMILY:
 			getOpFamilyIdentity(&buffer, object->objectId, objname,
 								missing_ok);
 			break;
 
-		case AccessMethodRelationId:
+		case OCLASS_AM:
 			{
 				char	   *amname;
 
@@ -5471,7 +5151,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
-		case AccessMethodOperatorRelationId:
+		case OCLASS_AMOP:
 			{
 				Relation	amopDesc;
 				HeapTuple	tup;
@@ -5533,7 +5213,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case AccessMethodProcedureRelationId:
+		case OCLASS_AMPROC:
 			{
 				Relation	amprocDesc;
 				ScanKeyData skey[1];
@@ -5595,7 +5275,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case RewriteRelationId:
+		case OCLASS_REWRITE:
 			{
 				Relation	ruleDesc;
 				HeapTuple	tup;
@@ -5628,7 +5308,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TriggerRelationId:
+		case OCLASS_TRIGGER:
 			{
 				Relation	trigDesc;
 				HeapTuple	tup;
@@ -5661,7 +5341,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case NamespaceRelationId:
+		case OCLASS_SCHEMA:
 			{
 				char	   *nspname;
 
@@ -5680,7 +5360,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case StatisticExtRelationId:
+		case OCLASS_STATISTIC_EXT:
 			{
 				HeapTuple	tup;
 				Form_pg_statistic_ext formStatistic;
@@ -5707,7 +5387,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
-		case TSParserRelationId:
+		case OCLASS_TSPARSER:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_parser formParser;
@@ -5734,7 +5414,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TSDictionaryRelationId:
+		case OCLASS_TSDICT:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_dict formDict;
@@ -5761,7 +5441,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TSTemplateRelationId:
+		case OCLASS_TSTEMPLATE:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_template formTmpl;
@@ -5788,7 +5468,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TSConfigRelationId:
+		case OCLASS_TSCONFIG:
 			{
 				HeapTuple	tup;
 				Form_pg_ts_config formCfg;
@@ -5815,7 +5495,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case AuthIdRelationId:
+		case OCLASS_ROLE:
 			{
 				char	   *username;
 
@@ -5829,7 +5509,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case AuthMemRelationId:
+		case OCLASS_ROLE_MEMBERSHIP:
 			{
 				Relation	authMemDesc;
 				ScanKeyData skey[1];
@@ -5863,7 +5543,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 				amForm = (Form_pg_auth_members) GETSTRUCT(tup);
 
-				appendStringInfo(&buffer, "membership of role %s in role %s",
+				appendStringInfo(&buffer, _("membership of role %s in role %s"),
 								 GetUserNameFromId(amForm->member, false),
 								 GetUserNameFromId(amForm->roleid, false));
 
@@ -5872,7 +5552,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case DatabaseRelationId:
+		case OCLASS_DATABASE:
 			{
 				char	   *datname;
 
@@ -5891,7 +5571,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TableSpaceRelationId:
+		case OCLASS_TBLSPACE:
 			{
 				char	   *tblspace;
 
@@ -5910,7 +5590,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ForeignDataWrapperRelationId:
+		case OCLASS_FDW:
 			{
 				ForeignDataWrapper *fdw;
 
@@ -5925,7 +5605,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ForeignServerRelationId:
+		case OCLASS_FOREIGN_SERVER:
 			{
 				ForeignServer *srv;
 
@@ -5941,7 +5621,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case UserMappingRelationId:
+		case OCLASS_USER_MAPPING:
 			{
 				HeapTuple	tup;
 				Oid			useid;
@@ -5981,7 +5661,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case DefaultAclRelationId:
+		case OCLASS_DEFACL:
 			{
 				Relation	defaclrel;
 				ScanKeyData skey[1];
@@ -6053,10 +5733,6 @@ getObjectIdentityParts(const ObjectAddress *object,
 						appendStringInfoString(&buffer,
 											   " on schemas");
 						break;
-					case DEFACLOBJ_LARGEOBJECT:
-						appendStringInfoString(&buffer,
-											   " on large objects");
-						break;
 				}
 
 				if (objname)
@@ -6072,7 +5748,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ExtensionRelationId:
+		case OCLASS_EXTENSION:
 			{
 				char	   *extname;
 
@@ -6090,7 +5766,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case EventTriggerRelationId:
+		case OCLASS_EVENT_TRIGGER:
 			{
 				HeapTuple	tup;
 				Form_pg_event_trigger trigForm;
@@ -6114,7 +5790,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case ParameterAclRelationId:
+		case OCLASS_PARAMETER_ACL:
 			{
 				HeapTuple	tup;
 				Datum		nameDatum;
@@ -6139,7 +5815,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case PolicyRelationId:
+		case OCLASS_POLICY:
 			{
 				Relation	polDesc;
 				HeapTuple	tup;
@@ -6172,149 +5848,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case PropgraphElementRelationId:
-			{
-				HeapTuple	tup;
-				Form_pg_propgraph_element pge;
-
-				tup = SearchSysCache1(PROPGRAPHELOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for property graph element %u", object->objectId);
-					break;
-				}
-				pge = (Form_pg_propgraph_element) GETSTRUCT(tup);
-				appendStringInfo(&buffer, "%s of property graph ", quote_identifier(NameStr(pge->pgealias)));
-
-				getRelationIdentity(&buffer, pge->pgepgid, objname, false);
-				if (objname)
-					*objname = lappend(*objname, pstrdup(NameStr(pge->pgealias)));
-
-				ReleaseSysCache(tup);
-				break;
-			}
-
-		case PropgraphLabelRelationId:
-			{
-				HeapTuple	tup;
-				Form_pg_propgraph_label pgl;
-
-				tup = SearchSysCache1(PROPGRAPHLABELOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for property graph label %u", object->objectId);
-					break;
-				}
-
-				pgl = (Form_pg_propgraph_label) GETSTRUCT(tup);
-				appendStringInfo(&buffer, "%s of property graph ", quote_identifier(NameStr(pgl->pgllabel)));
-				getRelationIdentity(&buffer, pgl->pglpgid, objname, false);
-				if (objname)
-					*objname = lappend(*objname, pstrdup(NameStr(pgl->pgllabel)));
-				ReleaseSysCache(tup);
-				break;
-			}
-
-		case PropgraphPropertyRelationId:
-			{
-				HeapTuple	tup;
-				Form_pg_propgraph_property pgp;
-
-				tup = SearchSysCache1(PROPGRAPHPROPOID, ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for property graph property %u", object->objectId);
-					break;
-				}
-
-				pgp = (Form_pg_propgraph_property) GETSTRUCT(tup);
-				appendStringInfo(&buffer, "%s of property graph ", quote_identifier(NameStr(pgp->pgpname)));
-				getRelationIdentity(&buffer, pgp->pgppgid, objname, false);
-				if (objname)
-					*objname = lappend(*objname, pstrdup(NameStr(pgp->pgpname)));
-				ReleaseSysCache(tup);
-				break;
-			}
-
-		case PropgraphElementLabelRelationId:
-			{
-				Relation	ellabelDesc;
-				HeapTuple	tup;
-				Form_pg_propgraph_element_label pgelform;
-				ObjectAddress oa;
-				char	   *labelname;
-
-				ellabelDesc = table_open(PropgraphElementLabelRelationId, AccessShareLock);
-				tup = get_catalog_object_by_oid(ellabelDesc,
-												Anum_pg_propgraph_element_label_oid,
-												object->objectId);
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for element label %u",
-							 object->objectId);
-
-					table_close(ellabelDesc, AccessShareLock);
-					break;
-				}
-
-				pgelform = (Form_pg_propgraph_element_label) GETSTRUCT(tup);
-
-				labelname = get_propgraph_label_name(pgelform->pgellabelid);
-				appendStringInfo(&buffer, "%s of element ", quote_identifier(labelname));
-				ObjectAddressSet(oa, PropgraphElementRelationId, pgelform->pgelelid);
-				appendStringInfoString(&buffer, getObjectIdentityParts(&oa, objname,
-																	   objargs, false));
-				/* labelname is already pstrdup'ed. */
-				if (objname)
-					*objname = lappend(*objname, labelname);
-
-				table_close(ellabelDesc, AccessShareLock);
-				break;
-			}
-
-		case PropgraphLabelPropertyRelationId:
-			{
-				Relation	lblpropDesc;
-				HeapTuple	tup;
-				Form_pg_propgraph_label_property plpform;
-				ObjectAddress oa;
-				char	   *propname;
-
-				lblpropDesc = table_open(PropgraphLabelPropertyRelationId,
-										 AccessShareLock);
-				tup = get_catalog_object_by_oid(lblpropDesc,
-												Anum_pg_propgraph_label_property_oid,
-												object->objectId);
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "could not find tuple for label property %u",
-							 object->objectId);
-
-					table_close(lblpropDesc, AccessShareLock);
-					break;
-				}
-
-				plpform = (Form_pg_propgraph_label_property) GETSTRUCT(tup);
-
-				propname = get_propgraph_property_name(plpform->plppropid);
-				appendStringInfo(&buffer, "%s of label ", quote_identifier(propname));
-				ObjectAddressSet(oa, PropgraphElementLabelRelationId, plpform->plpellabelid);
-				appendStringInfoString(&buffer, getObjectIdentityParts(&oa, objname,
-																	   objargs, false));
-				/* propname is already pstrdup'ed. */
-				if (objname)
-					*objname = lappend(*objname, propname);
-
-				table_close(lblpropDesc, AccessShareLock);
-				break;
-			}
-
-		case PublicationRelationId:
+		case OCLASS_PUBLICATION:
 			{
 				char	   *pubname;
 
@@ -6329,7 +5863,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case PublicationNamespaceRelationId:
+		case OCLASS_PUBLICATION_NAMESPACE:
 			{
 				char	   *pubname;
 				char	   *nspname;
@@ -6353,7 +5887,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case PublicationRelRelationId:
+		case OCLASS_PUBLICATION_REL:
 			{
 				HeapTuple	tup;
 				char	   *pubname;
@@ -6382,7 +5916,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case SubscriptionRelationId:
+		case OCLASS_SUBSCRIPTION:
 			{
 				char	   *subname;
 
@@ -6397,7 +5931,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
-		case TransformRelationId:
+		case OCLASS_TRANSFORM:
 			{
 				Relation	transformDesc;
 				HeapTuple	tup;
@@ -6439,8 +5973,10 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
-		default:
-			elog(ERROR, "unsupported object class: %u", object->classId);
+			/*
+			 * There's intentionally no default: case here; we want the
+			 * compiler to warn if a new OCLASS hasn't been handled above.
+			 */
 	}
 
 	if (!missing_ok)
@@ -6451,8 +5987,8 @@ getObjectIdentityParts(const ObjectAddress *object,
 		 * cases above leave it as NIL.
 		 */
 		if (objname && *objname == NIL)
-			elog(ERROR, "requested object address for unsupported object class %u: text result \"%s\"",
-				 object->classId, buffer.data);
+			elog(ERROR, "requested object address for unsupported object class %d: text result \"%s\"",
+				 (int) getObjectClass(object), buffer.data);
 	}
 	else
 	{
@@ -6564,8 +6100,8 @@ strlist_to_textarray(List *list)
 								   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(memcxt);
 
-	datums = palloc_array(Datum, list_length(list));
-	nulls = palloc_array(bool, list_length(list));
+	datums = (Datum *) palloc(sizeof(Datum) * list_length(list));
+	nulls = palloc(sizeof(bool) * list_length(list));
 
 	foreach(cell, list)
 	{
@@ -6620,8 +6156,6 @@ get_relkind_objtype(char relkind)
 			return OBJECT_MATVIEW;
 		case RELKIND_FOREIGN_TABLE:
 			return OBJECT_FOREIGN_TABLE;
-		case RELKIND_PROPGRAPH:
-			return OBJECT_PROPGRAPH;
 		case RELKIND_TOASTVALUE:
 			return OBJECT_TABLE;
 		default:

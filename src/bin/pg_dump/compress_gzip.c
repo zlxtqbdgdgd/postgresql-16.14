@@ -3,7 +3,7 @@
  * compress_gzip.c
  *	 Routines for archivers to read or write a gzip compressed data stream.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,7 +18,7 @@
 #include "pg_backup_utils.h"
 
 #ifdef HAVE_LIBZ
-#include <zlib.h>
+#include "zlib.h"
 
 /*
  * We don't use the gzgetc() macro, because zlib's configuration logic is not
@@ -57,8 +57,8 @@ DeflateCompressorInit(CompressorState *cs)
 	GzipCompressorState *gzipcs;
 	z_streamp	zp;
 
-	gzipcs = pg_malloc0_object(GzipCompressorState);
-	zp = gzipcs->zp = pg_malloc_object(z_stream);
+	gzipcs = (GzipCompressorState *) pg_malloc0(sizeof(GzipCompressorState));
+	zp = gzipcs->zp = (z_streamp) pg_malloc(sizeof(z_stream));
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -138,7 +138,7 @@ DeflateCompressorCommon(ArchiveHandle *AH, CompressorState *cs, bool flush)
 				 */
 				size_t		len = gzipcs->outsize - zp->avail_out;
 
-				cs->writeF(AH, out, len);
+				cs->writeF(AH, (char *) out, len);
 			}
 			zp->next_out = out;
 			zp->avail_out = gzipcs->outsize;
@@ -163,7 +163,7 @@ WriteDataToArchiveGzip(ArchiveHandle *AH, CompressorState *cs,
 {
 	GzipCompressorState *gzipcs = (GzipCompressorState *) cs->private_data;
 
-	gzipcs->zp->next_in = data;
+	gzipcs->zp->next_in = (void *) unconstify(void *, data);
 	gzipcs->zp->avail_in = dLen;
 	DeflateCompressorCommon(AH, cs, false);
 }
@@ -178,7 +178,7 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 	char	   *buf;
 	size_t		buflen;
 
-	zp = pg_malloc_object(z_stream);
+	zp = (z_streamp) pg_malloc(sizeof(z_stream));
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -229,9 +229,9 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 	if (inflateEnd(zp) != Z_OK)
 		pg_fatal("could not close compression library: %s", zp->msg);
 
-	pg_free(buf);
-	pg_free(out);
-	pg_free(zp);
+	free(buf);
+	free(out);
+	free(zp);
 }
 
 /* Public routines that support gzip compressed data I/O */
@@ -320,7 +320,7 @@ Gzip_getc(CompressFileHandle *CFH)
 	if (ret == EOF)
 	{
 		if (!gzeof(gzfp))
-			pg_fatal("could not read from input file: %m");
+			pg_fatal("could not read from input file: %s", strerror(errno));
 		else
 			pg_fatal("could not read from input file: end of file");
 	}
@@ -386,24 +386,12 @@ Gzip_open(const char *path, int fd, const char *mode, CompressFileHandle *CFH)
 		strcpy(mode_compression, mode);
 
 	if (fd >= 0)
-	{
-		int			dup_fd = dup(fd);
-
-		if (dup_fd < 0)
-			return false;
-		gzfp = gzdopen(dup_fd, mode_compression);
-		if (gzfp == NULL)
-		{
-			close(dup_fd);
-			return false;
-		}
-	}
+		gzfp = gzdopen(dup(fd), mode_compression);
 	else
-	{
 		gzfp = gzopen(path, mode_compression);
-		if (gzfp == NULL)
-			return false;
-	}
+
+	if (gzfp == NULL)
+		return false;
 
 	CFH->private_data = gzfp;
 
@@ -421,7 +409,7 @@ Gzip_open_write(const char *path, const char *mode, CompressFileHandle *CFH)
 	ret = CFH->open_func(fname, -1, mode, CFH);
 
 	save_errno = errno;
-	pfree(fname);
+	pg_free(fname);
 	errno = save_errno;
 
 	return ret;

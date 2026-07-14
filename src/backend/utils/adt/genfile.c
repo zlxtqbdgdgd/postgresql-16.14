@@ -4,7 +4,7 @@
  *		Functions for direct access to files
  *
  *
- * Copyright (c) 2004-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2004-2023, PostgreSQL Global Development Group
  *
  * Author: Andreas Pflug <pgadmin@pse-consulting.de>
  *
@@ -225,6 +225,52 @@ read_text_file(const char *filename, int64 seek_offset, int64 bytes_to_read,
 	}
 	else
 		return NULL;
+}
+
+/*
+ * Read a section of a file, returning it as text
+ *
+ * This function is kept to support adminpack 1.0.
+ */
+Datum
+pg_read_file(PG_FUNCTION_ARGS)
+{
+	text	   *filename_t = PG_GETARG_TEXT_PP(0);
+	int64		seek_offset = 0;
+	int64		bytes_to_read = -1;
+	bool		missing_ok = false;
+	char	   *filename;
+	text	   *result;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to read files with adminpack 1.0"),
+		/* translator: %s is a SQL function name */
+				 errhint("Consider using %s, which is part of core, instead.",
+						 "pg_read_file()")));
+
+	/* handle optional arguments */
+	if (PG_NARGS() >= 3)
+	{
+		seek_offset = PG_GETARG_INT64(1);
+		bytes_to_read = PG_GETARG_INT64(2);
+
+		if (bytes_to_read < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("requested length cannot be negative")));
+	}
+	if (PG_NARGS() >= 4)
+		missing_ok = PG_GETARG_BOOL(3);
+
+	filename = convert_and_check_filename(filename_t);
+
+	result = read_text_file(filename, seek_offset, bytes_to_read, missing_ok);
+	if (result)
+		PG_RETURN_TEXT_P(result);
+	else
+		PG_RETURN_NULL();
 }
 
 /*
@@ -454,7 +500,6 @@ pg_stat_file(PG_FUNCTION_ARGS)
 					   "creation", TIMESTAMPTZOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 6,
 					   "isdir", BOOLOID, -1, 0);
-	TupleDescFinalize(tupdesc);
 	BlessTupleDesc(tupdesc);
 
 	memset(isnull, false, sizeof(isnull));
@@ -691,36 +736,25 @@ pg_ls_archive_statusdir(PG_FUNCTION_ARGS)
 }
 
 /*
- * Function to return the list of files in the WAL summaries directory.
- */
-Datum
-pg_ls_summariesdir(PG_FUNCTION_ARGS)
-{
-	return pg_ls_dir_files(fcinfo, XLOGDIR "/summaries", true);
-}
-
-/*
- * Function to return the list of files in the PG_LOGICAL_SNAPSHOTS_DIR
- * directory.
+ * Function to return the list of files in the pg_logical/snapshots directory.
  */
 Datum
 pg_ls_logicalsnapdir(PG_FUNCTION_ARGS)
 {
-	return pg_ls_dir_files(fcinfo, PG_LOGICAL_SNAPSHOTS_DIR, false);
+	return pg_ls_dir_files(fcinfo, "pg_logical/snapshots", false);
 }
 
 /*
- * Function to return the list of files in the PG_LOGICAL_MAPPINGS_DIR
- * directory.
+ * Function to return the list of files in the pg_logical/mappings directory.
  */
 Datum
 pg_ls_logicalmapdir(PG_FUNCTION_ARGS)
 {
-	return pg_ls_dir_files(fcinfo, PG_LOGICAL_MAPPINGS_DIR, false);
+	return pg_ls_dir_files(fcinfo, "pg_logical/mappings", false);
 }
 
 /*
- * Function to return the list of files in the PG_REPLSLOT_DIR/<slot_name>
+ * Function to return the list of files in the pg_replslot/<replication_slot>
  * directory.
  */
 Datum
@@ -740,7 +774,6 @@ pg_ls_replslotdir(PG_FUNCTION_ARGS)
 				 errmsg("replication slot \"%s\" does not exist",
 						slotname)));
 
-	snprintf(path, sizeof(path), "%s/%s", PG_REPLSLOT_DIR, slotname);
-
+	snprintf(path, sizeof(path), "pg_replslot/%s", slotname);
 	return pg_ls_dir_files(fcinfo, path, false);
 }

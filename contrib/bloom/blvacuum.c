@@ -3,7 +3,7 @@
  * blvacuum.c
  *		Bloom VACUUM functions.
  *
- * Copyright (c) 2016-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blvacuum.c
@@ -14,10 +14,13 @@
 
 #include "access/genam.h"
 #include "bloom.h"
+#include "catalog/storage.h"
 #include "commands/vacuum.h"
+#include "miscadmin.h"
+#include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
-#include "storage/read_stream.h"
+#include "storage/lmgr.h"
 
 
 /*
@@ -41,11 +44,9 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	Page		page;
 	BloomMetaPageData *metaData;
 	GenericXLogState *gxlogState;
-	BlockRangeReadStreamPrivate p;
-	ReadStream *stream;
 
 	if (stats == NULL)
-		stats = palloc0_object(IndexBulkDeleteResult);
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
 	initBloomState(&state, index);
 
@@ -54,34 +55,16 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * they can't contain tuples to delete.
 	 */
 	npages = RelationGetNumberOfBlocks(index);
-
-	/* Scan all blocks except the metapage using streaming reads */
-	p.current_blocknum = BLOOM_HEAD_BLKNO;
-	p.last_exclusive = npages;
-
-	/*
-	 * It is safe to use batchmode as block_range_read_stream_cb takes no
-	 * locks.
-	 */
-	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
-										READ_STREAM_FULL |
-										READ_STREAM_USE_BATCHING,
-										info->strategy,
-										index,
-										MAIN_FORKNUM,
-										block_range_read_stream_cb,
-										&p,
-										0);
-
 	for (blkno = BLOOM_HEAD_BLKNO; blkno < npages; blkno++)
 	{
 		BloomTuple *itup,
 				   *itupPtr,
 				   *itupEnd;
 
-		vacuum_delay_point(false);
+		vacuum_delay_point();
 
-		buffer = read_stream_next_buffer(stream, NULL);
+		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
+									RBM_NORMAL, info->strategy);
 
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		gxlogState = GenericXLogStart(index);
@@ -115,7 +98,8 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			{
 				/* No; copy it to itupPtr++, but skip copy if not needed */
 				if (itupPtr != itup)
-					memmove(itupPtr, itup, state.sizeOfBloomTuple);
+					memmove((Pointer) itupPtr, (Pointer) itup,
+							state.sizeOfBloomTuple);
 				itupPtr = BloomPageGetNextTuple(&state, itupPtr);
 			}
 
@@ -142,7 +126,7 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			if (BloomPageGetMaxOffset(page) == 0)
 				BloomPageSetDeleted(page);
 			/* Adjust pd_lower */
-			((PageHeader) page)->pd_lower = (char *) itupPtr - page;
+			((PageHeader) page)->pd_lower = (Pointer) itupPtr - page;
 			/* Finish WAL-logging */
 			GenericXLogFinish(gxlogState);
 		}
@@ -153,9 +137,6 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		}
 		UnlockReleaseBuffer(buffer);
 	}
-
-	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
-	read_stream_end(stream);
 
 	/*
 	 * Update the metapage's notFullPage list with whatever we found.  Our
@@ -190,14 +171,12 @@ blvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	Relation	index = info->index;
 	BlockNumber npages,
 				blkno;
-	BlockRangeReadStreamPrivate p;
-	ReadStream *stream;
 
 	if (info->analyze_only)
 		return stats;
 
 	if (stats == NULL)
-		stats = palloc0_object(IndexBulkDeleteResult);
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
 	/*
 	 * Iterate over the pages: insert deleted pages into FSM and collect
@@ -207,35 +186,17 @@ blvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	stats->num_pages = npages;
 	stats->pages_free = 0;
 	stats->num_index_tuples = 0;
-
-	/* Scan all blocks except the metapage using streaming reads */
-	p.current_blocknum = BLOOM_HEAD_BLKNO;
-	p.last_exclusive = npages;
-
-	/*
-	 * It is safe to use batchmode as block_range_read_stream_cb takes no
-	 * locks.
-	 */
-	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
-										READ_STREAM_FULL |
-										READ_STREAM_USE_BATCHING,
-										info->strategy,
-										index,
-										MAIN_FORKNUM,
-										block_range_read_stream_cb,
-										&p,
-										0);
-
 	for (blkno = BLOOM_HEAD_BLKNO; blkno < npages; blkno++)
 	{
 		Buffer		buffer;
 		Page		page;
 
-		vacuum_delay_point(false);
+		vacuum_delay_point();
 
-		buffer = read_stream_next_buffer(stream, NULL);
+		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
+									RBM_NORMAL, info->strategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buffer);
+		page = (Page) BufferGetPage(buffer);
 
 		if (PageIsNew(page) || BloomPageIsDeleted(page))
 		{
@@ -249,9 +210,6 @@ blvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 		UnlockReleaseBuffer(buffer);
 	}
-
-	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
-	read_stream_end(stream);
 
 	IndexFreeSpaceMapVacuum(info->index);
 

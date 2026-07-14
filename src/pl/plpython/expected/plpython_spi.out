@@ -319,9 +319,12 @@ assert len(res.fetch(3)) == 1
 assert len(res.fetch(3)) == 0
 assert len(res.fetch(3)) == 0
 try:
-    # use next() and not __next__(), the method name changed in
+    # use next() or __next__(), the method name changed in
     # http://www.python.org/dev/peps/pep-3114/
-    next(res)
+    try:
+        res.next()
+    except AttributeError:
+        res.__next__()
 except StopIteration:
     pass
 else:
@@ -331,7 +334,11 @@ CREATE FUNCTION cursor_mix_next_and_fetch() RETURNS int AS $$
 res = plpy.cursor("select fname, lname from users order by fname")
 assert len(res.fetch(2)) == 2
 
-item = next(res)
+item = None
+try:
+    item = res.next()
+except AttributeError:
+    item = res.__next__()
 assert item['fname'] == 'rick'
 
 assert len(res.fetch(2)) == 1
@@ -350,7 +357,10 @@ CREATE FUNCTION next_after_close() RETURNS int AS $$
 res = plpy.cursor("select fname, lname from users")
 res.close()
 try:
-    next(res)
+    try:
+        res.next()
+    except AttributeError:
+        res.__next__()
 except ValueError:
     pass
 else:
@@ -360,7 +370,10 @@ CREATE FUNCTION cursor_fetch_next_empty() RETURNS int AS $$
 res = plpy.cursor("select fname, lname from users where false")
 assert len(res.fetch(1)) == 0
 try:
-    next(res)
+    try:
+        res.next()
+    except AttributeError:
+        res.__next__()
 except StopIteration:
     pass
 else:
@@ -451,54 +464,3 @@ SELECT plan_composite_args();
  (3,label)
 (1 row)
 
--- A custom argument sequence whose length matches the plan but whose
--- __getitem__ raises should be reported as an error, not crash the backend.
-CREATE FUNCTION plan_broken_arg_sequence() RETURNS void AS $$
-plan = plpy.prepare("select $1", ["int4"])
-class C:
-    def __len__(self):
-        return 1
-    def __getitem__(self, i):
-        raise ValueError('getitem failed')
-plpy.execute(plan, C())
-$$ LANGUAGE plpython3u;
-SELECT plan_broken_arg_sequence();
-ERROR:  spiexceptions.ExternalRoutineException: could not get element 0 from sequence
-DETAIL:  ValueError: getitem failed
-CONTEXT:  Traceback (most recent call last):
-  PL/Python function "plan_broken_arg_sequence", line 8, in <module>
-    plpy.execute(plan, C())
-PL/Python function "plan_broken_arg_sequence"
--- Likewise for the type-name list passed to plpy.prepare().
-CREATE FUNCTION prepare_broken_type_sequence() RETURNS void AS $$
-class C:
-    def __len__(self):
-        return 1
-    def __getitem__(self, i):
-        raise ValueError('getitem failed')
-plpy.prepare("select $1", C())
-$$ LANGUAGE plpython3u;
-SELECT prepare_broken_type_sequence();
-ERROR:  spiexceptions.ExternalRoutineException: could not get element 0 from sequence
-DETAIL:  ValueError: getitem failed
-CONTEXT:  Traceback (most recent call last):
-  PL/Python function "prepare_broken_type_sequence", line 7, in <module>
-    plpy.prepare("select $1", C())
-PL/Python function "prepare_broken_type_sequence"
--- Likewise for the argument sequence passed to plpy.cursor().
-CREATE FUNCTION cursor_broken_arg_sequence() RETURNS void AS $$
-plan = plpy.prepare("select $1", ["int4"])
-class C:
-    def __len__(self):
-        return 1
-    def __getitem__(self, i):
-        raise ValueError('getitem failed')
-plpy.cursor(plan, C())
-$$ LANGUAGE plpython3u;
-SELECT cursor_broken_arg_sequence();
-ERROR:  spiexceptions.ExternalRoutineException: could not get element 0 from sequence
-DETAIL:  ValueError: getitem failed
-CONTEXT:  Traceback (most recent call last):
-  PL/Python function "cursor_broken_arg_sequence", line 8, in <module>
-    plpy.cursor(plan, C())
-PL/Python function "cursor_broken_arg_sequence"

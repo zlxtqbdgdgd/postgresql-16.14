@@ -3,7 +3,7 @@
  * compress_lz4.c
  *	 Routines for archivers to write a LZ4 compressed data stream.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,8 +14,9 @@
 #include "postgres_fe.h"
 #include <unistd.h>
 
-#include "compress_lz4.h"
 #include "pg_backup_utils.h"
+
+#include "compress_lz4.h"
 
 #ifdef USE_LZ4
 #include <lz4frame.h>
@@ -60,17 +61,27 @@ typedef struct LZ4State
 	bool		compressing;
 
 	/*
-	 * I/O buffer area.
+	 * Used by the Compressor API to mark if the compression headers have been
+	 * written after initialization.
 	 */
-	char	   *buffer;			/* buffer for compressed data */
-	size_t		buflen;			/* allocated size of buffer */
-	size_t		bufdata;		/* amount of valid data currently in buffer */
-	/* These fields are used only while decompressing: */
-	size_t		bufnext;		/* next buffer position to decompress */
-	char	   *outbuf;			/* buffer for decompressed data */
-	size_t		outbuflen;		/* allocated size of outbuf */
-	size_t		outbufdata;		/* amount of valid data currently in outbuf */
-	size_t		outbufnext;		/* next outbuf position to return */
+	bool		needs_header_flush;
+
+	size_t		buflen;
+	char	   *buffer;
+
+	/*
+	 * Used by the Stream API to store already uncompressed data that the
+	 * caller has not consumed.
+	 */
+	size_t		overflowalloclen;
+	size_t		overflowlen;
+	char	   *overflowbuf;
+
+	/*
+	 * Used by both APIs to keep track of the compressed data length stored in
+	 * the buffer.
+	 */
+	size_t		compressedlen;
 
 	/*
 	 * Used by both APIs to keep track of error codes.
@@ -93,21 +104,7 @@ LZ4State_compression_init(LZ4State *state)
 {
 	size_t		status;
 
-	/*
-	 * Compute size needed for buffer, assuming we will present at most
-	 * DEFAULT_IO_BUFFER_SIZE input bytes at a time.
-	 */
 	state->buflen = LZ4F_compressBound(DEFAULT_IO_BUFFER_SIZE, &state->prefs);
-
-	/*
-	 * Add some slop to ensure we're not forced to flush every time.
-	 *
-	 * The present slop factor of 50% is chosen so that the typical output
-	 * block size is about 128K when DEFAULT_IO_BUFFER_SIZE = 128K.  We might
-	 * need a different slop factor to maintain that equivalence if
-	 * DEFAULT_IO_BUFFER_SIZE is changed dramatically.
-	 */
-	state->buflen += state->buflen / 2;
 
 	/*
 	 * LZ4F_compressBegin requires a buffer that is greater or equal to
@@ -124,10 +121,6 @@ LZ4State_compression_init(LZ4State *state)
 	}
 
 	state->buffer = pg_malloc(state->buflen);
-
-	/*
-	 * Insert LZ4 header into buffer.
-	 */
 	status = LZ4F_compressBegin(state->ctx,
 								state->buffer, state->buflen,
 								&state->prefs);
@@ -137,7 +130,7 @@ LZ4State_compression_init(LZ4State *state)
 		return false;
 	}
 
-	state->bufdata = status;
+	state->compressedlen = status;
 
 	return true;
 }
@@ -166,8 +159,8 @@ ReadDataFromArchiveLZ4(ArchiveHandle *AH, CompressorState *cs)
 		pg_fatal("could not create LZ4 decompression context: %s",
 				 LZ4F_getErrorName(status));
 
-	outbuf = pg_malloc(DEFAULT_IO_BUFFER_SIZE);
-	readbuf = pg_malloc(DEFAULT_IO_BUFFER_SIZE);
+	outbuf = pg_malloc0(DEFAULT_IO_BUFFER_SIZE);
+	readbuf = pg_malloc0(DEFAULT_IO_BUFFER_SIZE);
 	readbuflen = DEFAULT_IO_BUFFER_SIZE;
 	while ((r = cs->readF(AH, &readbuf, &readbuflen)) > 0)
 	{
@@ -182,6 +175,7 @@ ReadDataFromArchiveLZ4(ArchiveHandle *AH, CompressorState *cs)
 			size_t		out_size = DEFAULT_IO_BUFFER_SIZE;
 			size_t		read_size = readend - readp;
 
+			memset(outbuf, 0, DEFAULT_IO_BUFFER_SIZE);
 			status = LZ4F_decompress(ctx, outbuf, &out_size,
 									 readp, &read_size, &dec_opt);
 			if (LZ4F_isError(status))
@@ -208,37 +202,36 @@ WriteDataToArchiveLZ4(ArchiveHandle *AH, CompressorState *cs,
 {
 	LZ4State   *state = (LZ4State *) cs->private_data;
 	size_t		remaining = dLen;
+	size_t		status;
+	size_t		chunk;
+
+	/* Write the header if not yet written. */
+	if (state->needs_header_flush)
+	{
+		cs->writeF(AH, state->buffer, state->compressedlen);
+		state->needs_header_flush = false;
+	}
 
 	while (remaining > 0)
 	{
-		size_t		chunk;
-		size_t		required;
-		size_t		status;
 
-		/* We don't try to present more than DEFAULT_IO_BUFFER_SIZE bytes */
-		chunk = Min(remaining, (size_t) DEFAULT_IO_BUFFER_SIZE);
+		if (remaining > DEFAULT_IO_BUFFER_SIZE)
+			chunk = DEFAULT_IO_BUFFER_SIZE;
+		else
+			chunk = remaining;
 
-		/* If not enough space, must flush buffer */
-		required = LZ4F_compressBound(chunk, &state->prefs);
-		if (required > state->buflen - state->bufdata)
-		{
-			cs->writeF(AH, state->buffer, state->bufdata);
-			state->bufdata = 0;
-		}
-
+		remaining -= chunk;
 		status = LZ4F_compressUpdate(state->ctx,
-									 state->buffer + state->bufdata,
-									 state->buflen - state->bufdata,
+									 state->buffer, state->buflen,
 									 data, chunk, NULL);
 
 		if (LZ4F_isError(status))
 			pg_fatal("could not compress data: %s",
 					 LZ4F_getErrorName(status));
 
-		state->bufdata += status;
+		cs->writeF(AH, state->buffer, status);
 
-		data = ((const char *) data) + chunk;
-		remaining -= chunk;
+		data = ((char *) data) + chunk;
 	}
 }
 
@@ -246,32 +239,29 @@ static void
 EndCompressorLZ4(ArchiveHandle *AH, CompressorState *cs)
 {
 	LZ4State   *state = (LZ4State *) cs->private_data;
-	size_t		required;
 	size_t		status;
 
 	/* Nothing needs to be done */
 	if (!state)
 		return;
 
-	/* We might need to flush the buffer to make room for LZ4F_compressEnd */
-	required = LZ4F_compressBound(0, &state->prefs);
-	if (required > state->buflen - state->bufdata)
-	{
-		cs->writeF(AH, state->buffer, state->bufdata);
-		state->bufdata = 0;
-	}
+	/*
+	 * Write the header if not yet written. The caller is not required to call
+	 * writeData if the relation does not contain any data. Thus it is
+	 * possible to reach here without having flushed the header. Do it before
+	 * ending the compression.
+	 */
+	if (state->needs_header_flush)
+		cs->writeF(AH, state->buffer, state->compressedlen);
 
 	status = LZ4F_compressEnd(state->ctx,
-							  state->buffer + state->bufdata,
-							  state->buflen - state->bufdata,
+							  state->buffer, state->buflen,
 							  NULL);
 	if (LZ4F_isError(status))
 		pg_fatal("could not end compression: %s",
 				 LZ4F_getErrorName(status));
-	state->bufdata += status;
 
-	/* Write the final bufferload */
-	cs->writeF(AH, state->buffer, state->bufdata);
+	cs->writeF(AH, state->buffer, status);
 
 	status = LZ4F_freeCompressionContext(state->ctx);
 	if (LZ4F_isError(status))
@@ -305,7 +295,7 @@ InitCompressorLZ4(CompressorState *cs, const pg_compress_specification compressi
 	if (cs->readF)
 		return;
 
-	state = pg_malloc0_object(LZ4State);
+	state = pg_malloc0(sizeof(*state));
 	if (cs->compression_spec.level >= 0)
 		state->prefs.compressionLevel = cs->compression_spec.level;
 
@@ -313,6 +303,8 @@ InitCompressorLZ4(CompressorState *cs, const pg_compress_specification compressi
 		pg_fatal("could not initialize LZ4 compression: %s",
 				 LZ4F_getErrorName(state->errcode));
 
+	/* Remember that the header has not been written. */
+	state->needs_header_flush = true;
 	cs->private_data = state;
 }
 
@@ -324,16 +316,15 @@ InitCompressorLZ4(CompressorState *cs, const pg_compress_specification compressi
 
 /*
  * LZ4 equivalent to feof() or gzeof().  Return true iff there is no
- * more buffered data and the end of the input file has been reached.
+ * decompressed output in the overflow buffer and the end of the backing file
+ * is reached.
  */
 static bool
 LZ4Stream_eof(CompressFileHandle *CFH)
 {
 	LZ4State   *state = (LZ4State *) CFH->private_data;
 
-	return state->outbufnext >= state->outbufdata &&
-		state->bufnext >= state->bufdata &&
-		feof(state->fp);
+	return state->overflowlen == 0 && feof(state->fp);
 }
 
 static const char *
@@ -355,15 +346,13 @@ LZ4Stream_get_error(CompressFileHandle *CFH)
  *
  * Creates the necessary contexts for either compression or decompression. When
  * compressing data (indicated by compressing=true), it additionally writes the
- * LZ4 header in the output buffer.
- *
- * It's expected that a not-yet-initialized LZ4State will be zero-filled.
+ * LZ4 header in the output stream.
  *
  * Returns true on success. In case of a failure returns false, and stores the
  * error code in state->errcode.
  */
 static bool
-LZ4Stream_init(LZ4State *state, bool compressing)
+LZ4Stream_init(LZ4State *state, int size, bool compressing)
 {
 	size_t		status;
 
@@ -372,10 +361,19 @@ LZ4Stream_init(LZ4State *state, bool compressing)
 
 	state->compressing = compressing;
 
+	/* When compressing, write LZ4 header to the output stream. */
 	if (state->compressing)
 	{
+
 		if (!LZ4State_compression_init(state))
 			return false;
+
+		errno = 0;
+		if (fwrite(state->buffer, 1, state->compressedlen, state->fp) != state->compressedlen)
+		{
+			errno = (errno) ? errno : ENOSPC;
+			return false;
+		}
 	}
 	else
 	{
@@ -386,10 +384,12 @@ LZ4Stream_init(LZ4State *state, bool compressing)
 			return false;
 		}
 
-		state->buflen = DEFAULT_IO_BUFFER_SIZE;
+		state->buflen = Max(size, DEFAULT_IO_BUFFER_SIZE);
 		state->buffer = pg_malloc(state->buflen);
-		state->outbuflen = DEFAULT_IO_BUFFER_SIZE;
-		state->outbuf = pg_malloc(state->outbuflen);
+
+		state->overflowalloclen = state->buflen;
+		state->overflowbuf = pg_malloc(state->overflowalloclen);
+		state->overflowlen = 0;
 	}
 
 	state->inited = true;
@@ -397,11 +397,53 @@ LZ4Stream_init(LZ4State *state, bool compressing)
 }
 
 /*
+ * Read already decompressed content from the overflow buffer into 'ptr' up to
+ * 'size' bytes, if available. If the eol_flag is set, then stop at the first
+ * occurrence of the newline char prior to 'size' bytes.
+ *
+ * Any unread content in the overflow buffer is moved to the beginning.
+ *
+ * Returns the number of bytes read from the overflow buffer (and copied into
+ * the 'ptr' buffer), or 0 if the overflow buffer is empty.
+ */
+static int
+LZ4Stream_read_overflow(LZ4State *state, void *ptr, int size, bool eol_flag)
+{
+	char	   *p;
+	int			readlen = 0;
+
+	if (state->overflowlen == 0)
+		return 0;
+
+	if (state->overflowlen >= size)
+		readlen = size;
+	else
+		readlen = state->overflowlen;
+
+	if (eol_flag && (p = memchr(state->overflowbuf, '\n', readlen)))
+		/* Include the line terminating char */
+		readlen = p - state->overflowbuf + 1;
+
+	memcpy(ptr, state->overflowbuf, readlen);
+	state->overflowlen -= readlen;
+
+	if (state->overflowlen > 0)
+		memmove(state->overflowbuf, state->overflowbuf + readlen, state->overflowlen);
+
+	return readlen;
+}
+
+/*
  * The workhorse for reading decompressed content out of an LZ4 compressed
  * stream.
  *
  * It will read up to 'ptrsize' decompressed content, or up to the new line
- * char if one is found first when the eol_flag is set.
+ * char if found first when the eol_flag is set. It is possible that the
+ * decompressed output generated by reading any compressed input via the
+ * LZ4F API, exceeds 'ptrsize'. Any exceeding decompressed content is stored
+ * at an overflow buffer within LZ4State. Of course, when the function is
+ * called, it will first try to consume any decompressed content already
+ * present in the overflow buffer, before decompressing new content.
  *
  * Returns the number of bytes of decompressed data copied into the ptr
  * buffer, or -1 in case of error.
@@ -410,85 +452,62 @@ static int
 LZ4Stream_read_internal(LZ4State *state, void *ptr, int ptrsize, bool eol_flag)
 {
 	int			dsize = 0;
-	int			remaining = ptrsize;
+	int			rsize;
+	int			size = ptrsize;
+	bool		eol_found = false;
+
+	void	   *readbuf;
 
 	/* Lazy init */
-	if (!LZ4Stream_init(state, false /* decompressing */ ))
+	if (!LZ4Stream_init(state, size, false /* decompressing */ ))
 	{
 		pg_log_error("unable to initialize LZ4 library: %s",
 					 LZ4F_getErrorName(state->errcode));
 		return -1;
 	}
 
-	/* Loop until postcondition is satisfied */
-	while (remaining > 0)
+	/* No work needs to be done for a zero-sized output buffer */
+	if (size <= 0)
+		return 0;
+
+	/* Verify that there is enough space in the outbuf */
+	if (size > state->buflen)
 	{
-		/*
-		 * If we already have some decompressed data, return that.
-		 */
-		if (state->outbufnext < state->outbufdata)
+		state->buflen = size;
+		state->buffer = pg_realloc(state->buffer, size);
+	}
+
+	/* use already decompressed content if available */
+	dsize = LZ4Stream_read_overflow(state, ptr, size, eol_flag);
+	if (dsize == size || (eol_flag && memchr(ptr, '\n', dsize)))
+		return dsize;
+
+	readbuf = pg_malloc(size);
+
+	do
+	{
+		char	   *rp;
+		char	   *rend;
+
+		rsize = fread(readbuf, 1, size, state->fp);
+		if (rsize < size && !feof(state->fp))
 		{
-			char	   *outptr = state->outbuf + state->outbufnext;
-			size_t		readlen = state->outbufdata - state->outbufnext;
-			bool		eol_found = false;
-
-			if (readlen > remaining)
-				readlen = remaining;
-			/* If eol_flag is set, don't read beyond a newline */
-			if (eol_flag)
-			{
-				char	   *eolptr = memchr(outptr, '\n', readlen);
-
-				if (eolptr)
-				{
-					readlen = eolptr - outptr + 1;
-					eol_found = true;
-				}
-			}
-			memcpy(ptr, outptr, readlen);
-			ptr = ((char *) ptr) + readlen;
-			state->outbufnext += readlen;
-			dsize += readlen;
-			remaining -= readlen;
-			if (eol_found || remaining == 0)
-				break;
-			/* We must have emptied outbuf */
-			Assert(state->outbufnext >= state->outbufdata);
+			pg_log_error("could not read from input file: %m");
+			return -1;
 		}
 
-		/*
-		 * If we don't have any pending compressed data, load more into
-		 * state->buffer.
-		 */
-		if (state->bufnext >= state->bufdata)
-		{
-			size_t		rsize;
+		rp = (char *) readbuf;
+		rend = (char *) readbuf + rsize;
 
-			rsize = fread(state->buffer, 1, state->buflen, state->fp);
-			if (rsize < state->buflen && !feof(state->fp))
-			{
-				pg_log_error("could not read from input file: %m");
-				return -1;
-			}
-			if (rsize == 0)
-				break;			/* must be EOF */
-			state->bufdata = rsize;
-			state->bufnext = 0;
-		}
-
-		/*
-		 * Decompress some data into state->outbuf.
-		 */
+		while (rp < rend)
 		{
 			size_t		status;
-			size_t		outlen = state->outbuflen;
-			size_t		inlen = state->bufdata - state->bufnext;
+			size_t		outlen = state->buflen;
+			size_t		read_remain = rend - rp;
 
-			status = LZ4F_decompress(state->dtx,
-									 state->outbuf, &outlen,
-									 state->buffer + state->bufnext,
-									 &inlen,
-									 NULL);
+			memset(state->buffer, 0, outlen);
+			status = LZ4F_decompress(state->dtx, state->buffer, &outlen,
+									 rp, &read_remain, NULL);
 			if (LZ4F_isError(status))
 			{
 				state->errcode = status;
@@ -496,11 +515,54 @@ LZ4Stream_read_internal(LZ4State *state, void *ptr, int ptrsize, bool eol_flag)
 							 LZ4F_getErrorName(state->errcode));
 				return -1;
 			}
-			state->bufnext += inlen;
-			state->outbufdata = outlen;
-			state->outbufnext = 0;
+
+			rp += read_remain;
+
+			/*
+			 * fill in what space is available in ptr if the eol flag is set,
+			 * either skip if one already found or fill up to EOL if present
+			 * in the outbuf
+			 */
+			if (outlen > 0 && dsize < size && eol_found == false)
+			{
+				char	   *p;
+				size_t		lib = (!eol_flag) ? size - dsize : size - 1 - dsize;
+				size_t		len = outlen < lib ? outlen : lib;
+
+				if (eol_flag &&
+					(p = memchr(state->buffer, '\n', outlen)) &&
+					(size_t) (p - state->buffer + 1) <= len)
+				{
+					len = p - state->buffer + 1;
+					eol_found = true;
+				}
+
+				memcpy((char *) ptr + dsize, state->buffer, len);
+				dsize += len;
+
+				/* move what did not fit, if any, at the beginning of the buf */
+				if (len < outlen)
+					memmove(state->buffer, state->buffer + len, outlen - len);
+				outlen -= len;
+			}
+
+			/* if there is available output, save it */
+			if (outlen > 0)
+			{
+				while (state->overflowlen + outlen > state->overflowalloclen)
+				{
+					state->overflowalloclen *= 2;
+					state->overflowbuf = pg_realloc(state->overflowbuf,
+													state->overflowalloclen);
+				}
+
+				memcpy(state->overflowbuf + state->overflowlen, state->buffer, outlen);
+				state->overflowlen += outlen;
+			}
 		}
-	}
+	} while (rsize == size && dsize < size && eol_found == false);
+
+	pg_free(readbuf);
 
 	return dsize;
 }
@@ -512,45 +574,33 @@ static void
 LZ4Stream_write(const void *ptr, size_t size, CompressFileHandle *CFH)
 {
 	LZ4State   *state = (LZ4State *) CFH->private_data;
-	size_t		remaining = size;
+	size_t		status;
+	int			remaining = size;
 
 	/* Lazy init */
-	if (!LZ4Stream_init(state, true))
+	if (!LZ4Stream_init(state, size, true))
 		pg_fatal("unable to initialize LZ4 library: %s",
 				 LZ4F_getErrorName(state->errcode));
 
 	while (remaining > 0)
 	{
-		size_t		chunk;
-		size_t		required;
-		size_t		status;
+		int			chunk = Min(remaining, DEFAULT_IO_BUFFER_SIZE);
 
-		/* We don't try to present more than DEFAULT_IO_BUFFER_SIZE bytes */
-		chunk = Min(remaining, (size_t) DEFAULT_IO_BUFFER_SIZE);
+		remaining -= chunk;
 
-		/* If not enough space, must flush buffer */
-		required = LZ4F_compressBound(chunk, &state->prefs);
-		if (required > state->buflen - state->bufdata)
-		{
-			errno = 0;
-			if (fwrite(state->buffer, 1, state->bufdata, state->fp) != state->bufdata)
-			{
-				errno = (errno) ? errno : ENOSPC;
-				pg_fatal("error during writing: %m");
-			}
-			state->bufdata = 0;
-		}
-
-		status = LZ4F_compressUpdate(state->ctx,
-									 state->buffer + state->bufdata,
-									 state->buflen - state->bufdata,
+		status = LZ4F_compressUpdate(state->ctx, state->buffer, state->buflen,
 									 ptr, chunk, NULL);
 		if (LZ4F_isError(status))
 			pg_fatal("error during writing: %s", LZ4F_getErrorName(status));
-		state->bufdata += status;
+
+		errno = 0;
+		if (fwrite(state->buffer, 1, status, state->fp) != status)
+		{
+			errno = (errno) ? errno : ENOSPC;
+			pg_fatal("error during writing: %m");
+		}
 
 		ptr = ((const char *) ptr) + chunk;
-		remaining -= chunk;
 	}
 }
 
@@ -626,7 +676,6 @@ LZ4Stream_close(CompressFileHandle *CFH)
 {
 	FILE	   *fp;
 	LZ4State   *state = (LZ4State *) CFH->private_data;
-	size_t		required;
 	size_t		status;
 	int			ret;
 	bool		success = true;
@@ -636,24 +685,7 @@ LZ4Stream_close(CompressFileHandle *CFH)
 	{
 		if (state->compressing)
 		{
-			/* We might need to flush the buffer to make room */
-			required = LZ4F_compressBound(0, &state->prefs);
-			if (required > state->buflen - state->bufdata)
-			{
-				errno = 0;
-				if (fwrite(state->buffer, 1, state->bufdata, state->fp) != state->bufdata)
-				{
-					errno = (errno) ? errno : ENOSPC;
-					pg_log_error("could not write to output file: %m");
-					success = false;
-				}
-				state->bufdata = 0;
-			}
-
-			status = LZ4F_compressEnd(state->ctx,
-									  state->buffer + state->bufdata,
-									  state->buflen - state->bufdata,
-									  NULL);
+			status = LZ4F_compressEnd(state->ctx, state->buffer, state->buflen, NULL);
 			if (LZ4F_isError(status))
 			{
 				pg_log_error("could not end compression: %s",
@@ -661,14 +693,14 @@ LZ4Stream_close(CompressFileHandle *CFH)
 				success = false;
 			}
 			else
-				state->bufdata += status;
-
-			errno = 0;
-			if (fwrite(state->buffer, 1, state->bufdata, state->fp) != state->bufdata)
 			{
-				errno = (errno) ? errno : ENOSPC;
-				pg_log_error("could not write to output file: %m");
-				success = false;
+				errno = 0;
+				if (fwrite(state->buffer, 1, status, state->fp) != status)
+				{
+					errno = (errno) ? errno : ENOSPC;
+					pg_log_error("could not write to output file: %m");
+					success = false;
+				}
 			}
 
 			status = LZ4F_freeCompressionContext(state->ctx);
@@ -688,7 +720,7 @@ LZ4Stream_close(CompressFileHandle *CFH)
 							 LZ4F_getErrorName(status));
 				success = false;
 			}
-			pg_free(state->outbuf);
+			pg_free(state->overflowbuf);
 		}
 
 		pg_free(state->buffer);
@@ -715,30 +747,13 @@ LZ4Stream_open(const char *path, int fd, const char *mode,
 	LZ4State   *state = (LZ4State *) CFH->private_data;
 
 	if (fd >= 0)
-	{
-		int			dup_fd = dup(fd);
-
-		if (dup_fd < 0)
-		{
-			state->errcode = errno;
-			return false;
-		}
-		state->fp = fdopen(dup_fd, mode);
-		if (state->fp == NULL)
-		{
-			state->errcode = errno;
-			close(dup_fd);
-			return false;
-		}
-	}
+		state->fp = fdopen(dup(fd), mode);
 	else
-	{
 		state->fp = fopen(path, mode);
-		if (state->fp == NULL)
-		{
-			state->errcode = errno;
-			return false;
-		}
+	if (state->fp == NULL)
+	{
+		state->errcode = errno;
+		return false;
 	}
 
 	return true;
@@ -755,7 +770,7 @@ LZ4Stream_open_write(const char *path, const char *mode, CompressFileHandle *CFH
 	ret = CFH->open_func(fname, -1, mode, CFH);
 
 	save_errno = errno;
-	pfree(fname);
+	pg_free(fname);
 	errno = save_errno;
 
 	return ret;
@@ -781,7 +796,7 @@ InitCompressFileHandleLZ4(CompressFileHandle *CFH,
 	CFH->get_error_func = LZ4Stream_get_error;
 
 	CFH->compression_spec = compression_spec;
-	state = pg_malloc0_object(LZ4State);
+	state = pg_malloc0(sizeof(*state));
 	if (CFH->compression_spec.level >= 0)
 		state->prefs.compressionLevel = CFH->compression_spec.level;
 

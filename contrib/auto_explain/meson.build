@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 auto_explain_sources = files(
   'auto_explain.c',
@@ -23,7 +23,6 @@ tests += {
   'regress': {
     'sql': [
       'alter_reset',
-      'extension_options',
     ],
   },
   'tap': {

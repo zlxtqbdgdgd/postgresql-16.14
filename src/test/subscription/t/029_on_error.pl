@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Tests for disable_on_error and SKIP transaction features.
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -30,7 +30,7 @@ sub test_skip_lsn
 	# ERROR with its CONTEXT when retrieving this information.
 	my $contents = slurp_file($node_subscriber->logfile, $offset);
 	$contents =~
-	  qr/conflict detected on relation "public.tbl".*\n.*DETAIL:.* Could not apply remote change.*\n.*Key already exists in unique index "tbl_pkey", modified by .*origin.* in transaction \d+ at .*: key .*, local row .*\n.*CONTEXT:.* for replication target relation "public.tbl" in transaction \d+, finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/m
+	  qr/duplicate key value violates unique constraint "tbl_pkey".*\n.*DETAIL:.*\n.*CONTEXT:.* for replication target relation "public.tbl" in transaction \d+, finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/m
 	  or die "could not get error-LSN";
 	my $lsn = $1;
 
@@ -83,7 +83,6 @@ $node_subscriber->append_conf(
 	'postgresql.conf',
 	qq[
 max_prepared_transactions = 10
-track_commit_timestamp = on
 ]);
 $node_subscriber->start;
 
@@ -93,14 +92,13 @@ $node_subscriber->start;
 $node_publisher->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT, t BYTEA);
-ALTER TABLE tbl REPLICA IDENTITY FULL;
+CREATE TABLE tbl (i INT, t TEXT);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 $node_subscriber->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT PRIMARY KEY, t BYTEA);
+CREATE TABLE tbl (i INT PRIMARY KEY, t TEXT);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 
@@ -146,14 +144,13 @@ COMMIT;
 test_skip_lsn($node_publisher, $node_subscriber,
 	"(2, NULL)", "2", "test skipping transaction");
 
-# Test for PREPARE and COMMIT PREPARED. Update the data and PREPARE the
-# transaction, raising an error on the subscriber due to violation of the
-# unique constraint on tbl. Then skip the transaction.
+# Test for PREPARE and COMMIT PREPARED. Insert the same data to tbl and
+# PREPARE the transaction, raising an error. Then skip the transaction.
 $node_publisher->safe_psql(
 	'postgres',
 	qq[
 BEGIN;
-UPDATE tbl SET i = 2;
+INSERT INTO tbl VALUES (1, NULL);
 PREPARE TRANSACTION 'gtx';
 COMMIT PREPARED 'gtx';
 ]);
@@ -167,11 +164,10 @@ $node_publisher->safe_psql(
 	'postgres',
 	qq[
 BEGIN;
-INSERT INTO tbl SELECT i, sha256(i::text::bytea) FROM generate_series(1, 10000) s(i);
+INSERT INTO tbl SELECT i, md5(i::text) FROM generate_series(1, 10000) s(i);
 COMMIT;
 ]);
-test_skip_lsn($node_publisher, $node_subscriber,
-	"(4, sha256(4::text::bytea))",
+test_skip_lsn($node_publisher, $node_subscriber, "(4, md5(4::text))",
 	"4", "test skipping stream-commit");
 
 $result = $node_subscriber->safe_psql('postgres',

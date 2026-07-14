@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 ecpglib_sources = files(
   'connect.c',
@@ -25,7 +25,6 @@ if host_system == 'windows'
 endif
 
 # see src/interfaces/libpq/meson.build
-if build_static_lib
 ecpglib_st = static_library('libecpg',
   ecpglib_sources,
   include_directories: ecpglib_inc,
@@ -36,9 +35,7 @@ ecpglib_st = static_library('libecpg',
   kwargs: default_lib_args,
 )
 ecpg_targets += ecpglib_st
-endif
 
-if build_shared_lib
 ecpglib_so = shared_library('libecpg',
   ecpglib_sources + ecpglib_so_sources,
   include_directories: ecpglib_inc,
@@ -46,7 +43,7 @@ ecpglib_so = shared_library('libecpg',
   c_pch: pch_postgres_fe_h,
   dependencies: [frontend_shlib_code, libpq, thread_dep],
   link_with: ecpg_pgtypes_so,
-  soversion: host_system not in ['aix', 'windows'] ? '6' : '',
+  soversion: host_system != 'windows' ? '6' : '',
   darwin_versions: ['6', '6.' + pg_version_major.to_string()],
   version: '6.' + pg_version_major.to_string(),
   link_args: export_fmt.format(export_file.full_path()),
@@ -54,7 +51,6 @@ ecpglib_so = shared_library('libecpg',
   kwargs: default_lib_args,
 )
 ecpg_targets += ecpglib_so
-endif
 
 pkgconfig.generate(
   name: 'libecpg',

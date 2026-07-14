@@ -89,7 +89,7 @@ gbt_num_compress(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 
 		memcpy(&r[0], leaf, tinfo->size);
 		memcpy(&r[tinfo->size], leaf, tinfo->size);
-		retval = palloc_object(GISTENTRY);
+		retval = palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(r), entry->rel, entry->page,
 					  entry->offset, false);
 	}
@@ -119,44 +119,44 @@ gbt_num_fetch(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 	switch (tinfo->t)
 	{
 		case gbt_t_bool:
-			datum = BoolGetDatum(*(bool *) DatumGetPointer(entry->key));
+			datum = BoolGetDatum(*(bool *) entry->key);
 			break;
 		case gbt_t_int2:
-			datum = Int16GetDatum(*(int16 *) DatumGetPointer(entry->key));
+			datum = Int16GetDatum(*(int16 *) entry->key);
 			break;
 		case gbt_t_int4:
-			datum = Int32GetDatum(*(int32 *) DatumGetPointer(entry->key));
+			datum = Int32GetDatum(*(int32 *) entry->key);
 			break;
 		case gbt_t_int8:
-			datum = Int64GetDatum(*(int64 *) DatumGetPointer(entry->key));
+			datum = Int64GetDatum(*(int64 *) entry->key);
 			break;
 		case gbt_t_oid:
 		case gbt_t_enum:
-			datum = ObjectIdGetDatum(*(Oid *) DatumGetPointer(entry->key));
+			datum = ObjectIdGetDatum(*(Oid *) entry->key);
 			break;
 		case gbt_t_float4:
-			datum = Float4GetDatum(*(float4 *) DatumGetPointer(entry->key));
+			datum = Float4GetDatum(*(float4 *) entry->key);
 			break;
 		case gbt_t_float8:
-			datum = Float8GetDatum(*(float8 *) DatumGetPointer(entry->key));
+			datum = Float8GetDatum(*(float8 *) entry->key);
 			break;
 		case gbt_t_date:
-			datum = DateADTGetDatum(*(DateADT *) DatumGetPointer(entry->key));
+			datum = DateADTGetDatum(*(DateADT *) entry->key);
 			break;
 		case gbt_t_time:
-			datum = TimeADTGetDatum(*(TimeADT *) DatumGetPointer(entry->key));
+			datum = TimeADTGetDatum(*(TimeADT *) entry->key);
 			break;
 		case gbt_t_ts:
-			datum = TimestampGetDatum(*(Timestamp *) DatumGetPointer(entry->key));
+			datum = TimestampGetDatum(*(Timestamp *) entry->key);
 			break;
 		case gbt_t_cash:
-			datum = CashGetDatum(*(Cash *) DatumGetPointer(entry->key));
+			datum = CashGetDatum(*(Cash *) entry->key);
 			break;
 		default:
 			datum = entry->key;
 	}
 
-	retval = palloc_object(GISTENTRY);
+	retval = palloc(sizeof(GISTENTRY));
 	gistentryinit(*retval, datum, entry->rel, entry->page, entry->offset,
 				  false);
 	return retval;
@@ -165,8 +165,8 @@ gbt_num_fetch(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 
 
 /*
- * The GiST union method for numerical values
- */
+** The GiST union method for numerical values
+*/
 
 void *
 gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_ninfo *tinfo, FmgrInfo *flinfo)
@@ -181,8 +181,8 @@ gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_nin
 	cur = (GBT_NUMKEY *) DatumGetPointer((entryvec->vector[0].key));
 
 
-	o.lower = &out[0];
-	o.upper = &out[tinfo->size];
+	o.lower = &((GBT_NUMKEY *) out)[0];
+	o.upper = &((GBT_NUMKEY *) out)[tinfo->size];
 
 	memcpy(out, cur, 2 * tinfo->size);
 
@@ -205,8 +205,8 @@ gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_nin
 
 
 /*
- * The GiST same method for numerical values
- */
+** The GiST same method for numerical values
+*/
 
 bool
 gbt_num_same(const GBT_NUMKEY *a, const GBT_NUMKEY *b, const gbtree_ninfo *tinfo, FmgrInfo *flinfo)
@@ -262,87 +262,55 @@ gbt_num_bin_union(Datum *u, GBT_NUMKEY *e, const gbtree_ninfo *tinfo, FmgrInfo *
 bool
 gbt_num_consistent(const GBT_NUMKEY_R *key,
 				   const void *query,
-				   StrategyNumber strategy,
+				   const StrategyNumber *strategy,
 				   bool is_leaf,
 				   const gbtree_ninfo *tinfo,
 				   FmgrInfo *flinfo)
 {
 	bool		retval;
 
-	/*
-	 * On leaf pages we directly apply the check "key->lower OP query"; we
-	 * need not consider key->upper since it will be equal to key->lower.
-	 *
-	 * On internal pages we mostly need to check "is lower bound below query?"
-	 * and/or "is upper bound above query?", where we must allow equality in
-	 * both cases.
-	 */
-#define lower_is_below_query() \
-	tinfo->f_le(key->lower, query, flinfo)
-#define upper_is_above_query() \
-	tinfo->f_ge(key->upper, query, flinfo)
-
-	switch (strategy)
+	switch (*strategy)
 	{
 		case BTLessEqualStrategyNumber:
-			if (is_leaf)
-				retval = tinfo->f_le(key->lower, query, flinfo);
-			else
-				retval = lower_is_below_query();
+			retval = tinfo->f_ge(query, key->lower, flinfo);
 			break;
 		case BTLessStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_lt(key->lower, query, flinfo);
+				retval = tinfo->f_gt(query, key->lower, flinfo);
 			else
-				retval = lower_is_below_query();
+				retval = tinfo->f_ge(query, key->lower, flinfo);
 			break;
 		case BTEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_eq(key->lower, query, flinfo);
+				retval = tinfo->f_eq(query, key->lower, flinfo);
 			else
-				retval = lower_is_below_query() && upper_is_above_query();
+				retval = (tinfo->f_le(key->lower, query, flinfo) &&
+						  tinfo->f_le(query, key->upper, flinfo));
 			break;
 		case BTGreaterStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_gt(key->lower, query, flinfo);
+				retval = tinfo->f_lt(query, key->upper, flinfo);
 			else
-				retval = upper_is_above_query();
+				retval = tinfo->f_le(query, key->upper, flinfo);
 			break;
 		case BTGreaterEqualStrategyNumber:
-			if (is_leaf)
-				retval = tinfo->f_ge(key->lower, query, flinfo);
-			else
-				retval = upper_is_above_query();
+			retval = tinfo->f_le(query, key->upper, flinfo);
 			break;
 		case BtreeGistNotEqualStrategyNumber:
-			if (is_leaf)
-				retval = !(tinfo->f_eq(key->lower, query, flinfo));
-			else
-			{
-				/*
-				 * If the upper/lower bounds are equal, then all entries below
-				 * this node must have exactly that value.  So we can avoid
-				 * descending if the query equals both bounds.  In all other
-				 * cases, we must descend.
-				 */
-				retval = !(tinfo->f_eq(key->lower, query, flinfo) &&
-						   tinfo->f_eq(key->upper, query, flinfo));
-			}
+			retval = (!(tinfo->f_eq(query, key->lower, flinfo) &&
+						tinfo->f_eq(query, key->upper, flinfo)));
 			break;
 		default:
 			retval = false;
 	}
-
-#undef lower_is_below_query
-#undef upper_is_above_query
 
 	return retval;
 }
 
 
 /*
- * The GiST distance method (for KNN-Gist)
- */
+** The GiST distance method (for KNN-Gist)
+*/
 
 float8
 gbt_num_distance(const GBT_NUMKEY_R *key,

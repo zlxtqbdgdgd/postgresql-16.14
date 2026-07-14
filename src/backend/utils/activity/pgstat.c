@@ -12,8 +12,7 @@
  * Statistics are loaded from the filesystem during startup (by the startup
  * process), unless preceded by a crash, in which case all stats are
  * discarded. They are written out by the checkpointer process just before
- * shutting down (if the stats kind allows it), except when shutting down in
- * immediate mode.
+ * shutting down, except when shutting down in immediate mode.
  *
  * Fixed-numbered stats are stored in plain (non-dynamic) shared memory.
  *
@@ -50,16 +49,8 @@
  * pgStatPending list. Pending statistics updates are flushed out by
  * pgstat_report_stat().
  *
- * It is possible for external modules to define custom statistics kinds,
- * that can use the same properties as any built-in stats kinds.  Each custom
- * stats kind needs to assign a unique ID to ensure that it does not overlap
- * with other extensions.  In order to reserve a unique stats kind ID, refer
- * to https://wiki.postgresql.org/wiki/CustomCumulativeStats.
- *
  * The behavior of different kinds of statistics is determined by the kind's
- * entry in pgstat_kind_builtin_infos for all the built-in statistics kinds
- * defined, and pgstat_kind_custom_infos for custom kinds registered at
- * startup by pgstat_register_kind().  See PgStat_KindInfo for details.
+ * entry in pgstat_kind_infos, see PgStat_KindInfo for details.
  *
  * The consistency of read accesses to statistics can be configured using the
  * stats_fetch_consistency GUC (see config.sgml and monitoring.sgml for the
@@ -77,13 +68,11 @@
  *
  * Each statistics kind is handled in a dedicated file:
  * - pgstat_archiver.c
- * - pgstat_backend.c
  * - pgstat_bgwriter.c
  * - pgstat_checkpointer.c
  * - pgstat_database.c
  * - pgstat_function.c
  * - pgstat_io.c
- * - pgstat_lock.c
  * - pgstat_relation.c
  * - pgstat_replslot.c
  * - pgstat_slru.c
@@ -94,7 +83,7 @@
  * specific kinds of stats.
  *
  *
- * Copyright (c) 2001-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat.c
@@ -104,12 +93,16 @@
 
 #include <unistd.h>
 
+#include "access/transam.h"
 #include "access/xact.h"
 #include "lib/dshash.h"
 #include "pgstat.h"
+#include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/pg_shmem.h"
+#include "storage/shmem.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
@@ -137,15 +130,6 @@
 
 #define PGSTAT_SNAPSHOT_HASH_SIZE	512
 
-/* ---------
- * Identifiers in stats file.
- * ---------
- */
-#define PGSTAT_FILE_ENTRY_END	'E' /* end of file */
-#define PGSTAT_FILE_ENTRY_FIXED	'F' /* fixed-numbered stats entry */
-#define PGSTAT_FILE_ENTRY_NAME	'N' /* stats entry identified by name */
-#define PGSTAT_FILE_ENTRY_HASH	'S' /* stats entry identified by
-									 * PgStat_HashKey */
 
 /* hash table for statistics snapshots entry */
 typedef struct PgStat_SnapshotEntry
@@ -184,8 +168,6 @@ typedef struct PgStat_SnapshotEntry
 static void pgstat_write_statsfile(void);
 static void pgstat_read_statsfile(void);
 
-static void pgstat_init_snapshot_fixed(void);
-
 static void pgstat_reset_after_failure(void);
 
 static bool pgstat_flush_pending_entries(bool nowait);
@@ -194,7 +176,7 @@ static void pgstat_prep_snapshot(void);
 static void pgstat_build_snapshot(void);
 static void pgstat_build_snapshot_fixed(PgStat_Kind kind);
 
-static inline bool pgstat_is_kind_valid(PgStat_Kind kind);
+static inline bool pgstat_is_kind_valid(int ikind);
 
 
 /* ----------
@@ -213,11 +195,6 @@ int			pgstat_fetch_consistency = PGSTAT_FETCH_CONSISTENCY_CACHE;
 
 PgStat_LocalState pgStatLocal;
 
-/*
- * Track pending reports for fixed-numbered stats, used by
- * pgstat_report_stat().
- */
-bool		pgstat_report_fixed = false;
 
 /* ----------
  * Local data
@@ -268,7 +245,7 @@ static bool pgstat_is_shutdown = false;
 
 
 /*
- * The different kinds of built-in statistics.
+ * The different kinds of statistics.
  *
  * If reasonably possible, handling specific to one kind of stats should go
  * through this abstraction, rather than making more of pgstat.c aware.
@@ -280,7 +257,7 @@ static bool pgstat_is_shutdown = false;
  * seem to be a great way of doing that, given the split across multiple
  * files.
  */
-static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE] = {
+static const PgStat_KindInfo pgstat_kind_infos[PGSTAT_NUM_KINDS] = {
 
 	/* stats kinds for variable-numbered objects */
 
@@ -288,7 +265,6 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "database",
 
 		.fixed_amount = false,
-		.write_to_file = true,
 		/* so pg_stat_database entries can be seen in all databases */
 		.accessed_across_databases = true,
 
@@ -305,7 +281,6 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "relation",
 
 		.fixed_amount = false,
-		.write_to_file = true,
 
 		.shared_size = sizeof(PgStatShared_Relation),
 		.shared_data_off = offsetof(PgStatShared_Relation, stats),
@@ -314,14 +289,12 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 
 		.flush_pending_cb = pgstat_relation_flush_cb,
 		.delete_pending_cb = pgstat_relation_delete_pending_cb,
-		.reset_timestamp_cb = pgstat_relation_reset_timestamp_cb,
 	},
 
 	[PGSTAT_KIND_FUNCTION] = {
 		.name = "function",
 
 		.fixed_amount = false,
-		.write_to_file = true,
 
 		.shared_size = sizeof(PgStatShared_Function),
 		.shared_data_off = offsetof(PgStatShared_Function, stats),
@@ -329,16 +302,15 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.pending_size = sizeof(PgStat_FunctionCounts),
 
 		.flush_pending_cb = pgstat_function_flush_cb,
-		.reset_timestamp_cb = pgstat_function_reset_timestamp_cb,
 	},
 
 	[PGSTAT_KIND_REPLSLOT] = {
 		.name = "replslot",
 
 		.fixed_amount = false,
-		.write_to_file = true,
 
 		.accessed_across_databases = true,
+		.named_on_disk = true,
 
 		.shared_size = sizeof(PgStatShared_ReplSlot),
 		.shared_data_off = offsetof(PgStatShared_ReplSlot, stats),
@@ -353,7 +325,6 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "subscription",
 
 		.fixed_amount = false,
-		.write_to_file = true,
 		/* so pg_stat_subscription_stats entries can be seen in all databases */
 		.accessed_across_databases = true,
 
@@ -366,21 +337,6 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_timestamp_cb = pgstat_subscription_reset_timestamp_cb,
 	},
 
-	[PGSTAT_KIND_BACKEND] = {
-		.name = "backend",
-
-		.fixed_amount = false,
-		.write_to_file = false,
-
-		.accessed_across_databases = true,
-
-		.shared_size = sizeof(PgStatShared_Backend),
-		.shared_data_off = offsetof(PgStatShared_Backend, stats),
-		.shared_data_len = sizeof(((PgStatShared_Backend *) 0)->stats),
-
-		.flush_static_cb = pgstat_backend_flush_cb,
-		.reset_timestamp_cb = pgstat_backend_reset_timestamp_cb,
-	},
 
 	/* stats for fixed-numbered (mostly 1) objects */
 
@@ -388,14 +344,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "archiver",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, archiver),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, archiver),
-		.shared_data_off = offsetof(PgStatShared_Archiver, stats),
-		.shared_data_len = sizeof(((PgStatShared_Archiver *) 0)->stats),
-
-		.init_shmem_cb = pgstat_archiver_init_shmem_cb,
 		.reset_all_cb = pgstat_archiver_reset_all_cb,
 		.snapshot_cb = pgstat_archiver_snapshot_cb,
 	},
@@ -404,14 +353,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "bgwriter",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, bgwriter),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, bgwriter),
-		.shared_data_off = offsetof(PgStatShared_BgWriter, stats),
-		.shared_data_len = sizeof(((PgStatShared_BgWriter *) 0)->stats),
-
-		.init_shmem_cb = pgstat_bgwriter_init_shmem_cb,
 		.reset_all_cb = pgstat_bgwriter_reset_all_cb,
 		.snapshot_cb = pgstat_bgwriter_snapshot_cb,
 	},
@@ -420,14 +362,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "checkpointer",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, checkpointer),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, checkpointer),
-		.shared_data_off = offsetof(PgStatShared_Checkpointer, stats),
-		.shared_data_len = sizeof(((PgStatShared_Checkpointer *) 0)->stats),
-
-		.init_shmem_cb = pgstat_checkpointer_init_shmem_cb,
 		.reset_all_cb = pgstat_checkpointer_reset_all_cb,
 		.snapshot_cb = pgstat_checkpointer_snapshot_cb,
 	},
@@ -436,49 +371,16 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "io",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, io),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, io),
-		.shared_data_off = offsetof(PgStatShared_IO, stats),
-		.shared_data_len = sizeof(((PgStatShared_IO *) 0)->stats),
-
-		.flush_static_cb = pgstat_io_flush_cb,
-		.init_shmem_cb = pgstat_io_init_shmem_cb,
 		.reset_all_cb = pgstat_io_reset_all_cb,
 		.snapshot_cb = pgstat_io_snapshot_cb,
-	},
-
-	[PGSTAT_KIND_LOCK] = {
-		.name = "lock",
-
-		.fixed_amount = true,
-		.write_to_file = true,
-
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, lock),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, lock),
-		.shared_data_off = offsetof(PgStatShared_Lock, stats),
-		.shared_data_len = sizeof(((PgStatShared_Lock *) 0)->stats),
-
-		.flush_static_cb = pgstat_lock_flush_cb,
-		.init_shmem_cb = pgstat_lock_init_shmem_cb,
-		.reset_all_cb = pgstat_lock_reset_all_cb,
-		.snapshot_cb = pgstat_lock_snapshot_cb,
 	},
 
 	[PGSTAT_KIND_SLRU] = {
 		.name = "slru",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, slru),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, slru),
-		.shared_data_off = offsetof(PgStatShared_SLRU, stats),
-		.shared_data_len = sizeof(((PgStatShared_SLRU *) 0)->stats),
-
-		.flush_static_cb = pgstat_slru_flush_cb,
-		.init_shmem_cb = pgstat_slru_init_shmem_cb,
 		.reset_all_cb = pgstat_slru_reset_all_cb,
 		.snapshot_cb = pgstat_slru_snapshot_cb,
 	},
@@ -487,30 +389,12 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.name = "wal",
 
 		.fixed_amount = true,
-		.write_to_file = true,
 
-		.snapshot_ctl_off = offsetof(PgStat_Snapshot, wal),
-		.shared_ctl_off = offsetof(PgStat_ShmemControl, wal),
-		.shared_data_off = offsetof(PgStatShared_Wal, stats),
-		.shared_data_len = sizeof(((PgStatShared_Wal *) 0)->stats),
-
-		.init_backend_cb = pgstat_wal_init_backend_cb,
-		.flush_static_cb = pgstat_wal_flush_cb,
-		.init_shmem_cb = pgstat_wal_init_shmem_cb,
 		.reset_all_cb = pgstat_wal_reset_all_cb,
 		.snapshot_cb = pgstat_wal_snapshot_cb,
 	},
 };
 
-/*
- * Information about custom statistics kinds.
- *
- * These are saved in a different array than the built-in kinds to save
- * in clarity with the initializations.
- *
- * Indexed by PGSTAT_KIND_CUSTOM_MIN, of size PGSTAT_KIND_CUSTOM_SIZE.
- */
-static const PgStat_KindInfo **pgstat_kind_custom_infos = NULL;
 
 /* ------------------------------------------------------------
  * Functions managing the state of the stats system for all backends.
@@ -541,7 +425,6 @@ pgstat_discard_stats(void)
 
 	/* NB: this needs to be done even in single user mode */
 
-	/* First, cleanup the main pgstats file */
 	ret = unlink(PGSTAT_STAT_PERMANENT_FILENAME);
 	if (ret != 0)
 	{
@@ -561,15 +444,6 @@ pgstat_discard_stats(void)
 				(errcode_for_file_access(),
 				 errmsg_internal("unlinked permanent statistics file \"%s\"",
 								 PGSTAT_STAT_PERMANENT_FILENAME)));
-	}
-
-	/* Finish callbacks, if required */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-	{
-		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-
-		if (kind_info && kind_info->finish)
-			kind_info->finish(STATS_DISCARD);
 	}
 
 	/*
@@ -649,10 +523,6 @@ pgstat_shutdown_hook(int code, Datum arg)
 	Assert(dlist_is_empty(&pgStatPending));
 	dlist_init(&pgStatPending);
 
-	/* drop the backend stats entry */
-	if (!pgstat_drop_entry(PGSTAT_KIND_BACKEND, InvalidOid, MyProcNumber, false))
-		pgstat_request_entry_refs_gc();
-
 	pgstat_detach_shmem();
 
 #ifdef USE_ASSERT_CHECKING
@@ -673,18 +543,7 @@ pgstat_initialize(void)
 
 	pgstat_attach_shmem();
 
-	pgstat_init_snapshot_fixed();
-
-	/* Backend initialization callbacks */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-	{
-		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-
-		if (kind_info == NULL || kind_info->init_backend_cb == NULL)
-			continue;
-
-		kind_info->init_backend_cb();
-	}
+	pgstat_init_wal();
 
 	/* Set up a process-exit hook to clean up */
 	before_shmem_exit(pgstat_shutdown_hook, 0);
@@ -740,7 +599,9 @@ pgstat_report_stat(bool force)
 
 	/* Don't expend a clock check if nothing to do */
 	if (dlist_is_empty(&pgStatPending) &&
-		!pgstat_report_fixed)
+		!have_iostats &&
+		!have_slrustats &&
+		!pgstat_have_pending_wal())
 	{
 		return 0;
 	}
@@ -792,24 +653,17 @@ pgstat_report_stat(bool force)
 
 	partial_flush = false;
 
-	/* flush of variable-numbered stats tracked in pending entries list */
+	/* flush database / relation / function / ... stats */
 	partial_flush |= pgstat_flush_pending_entries(nowait);
 
-	/* flush of other stats kinds */
-	if (pgstat_report_fixed)
-	{
-		for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-		{
-			const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+	/* flush IO stats */
+	partial_flush |= pgstat_flush_io(nowait);
 
-			if (!kind_info)
-				continue;
-			if (!kind_info->flush_static_cb)
-				continue;
+	/* flush wal stats */
+	partial_flush |= pgstat_flush_wal(nowait);
 
-			partial_flush |= kind_info->flush_static_cb(nowait);
-		}
-	}
+	/* flush SLRU stats */
+	partial_flush |= pgstat_slru_flush(nowait);
 
 	last_flush = now;
 
@@ -830,7 +684,6 @@ pgstat_report_stat(bool force)
 	}
 
 	pending_since = 0;
-	pgstat_report_fixed = false;
 
 	return 0;
 }
@@ -851,7 +704,7 @@ pgstat_force_next_flush(void)
 static bool
 match_db_entries(PgStatShared_HashEntry *entry, Datum match_data)
 {
-	return entry->key.dboid == MyDatabaseId;
+	return entry->key.dboid == DatumGetObjectId(MyDatabaseId);
 }
 
 /*
@@ -880,7 +733,7 @@ pgstat_reset_counters(void)
  * GRANT system.
  */
 void
-pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
+pgstat_reset(PgStat_Kind kind, Oid dboid, Oid objoid)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 	TimestampTz ts = GetCurrentTimestamp();
@@ -889,7 +742,7 @@ pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
 	Assert(!pgstat_get_kind_info(kind)->fixed_amount);
 
 	/* reset the "single counter" */
-	pgstat_reset_entry(kind, dboid, objid, ts);
+	pgstat_reset_entry(kind, dboid, objoid, ts);
 
 	if (!kind_info->accessed_across_databases)
 		pgstat_reset_database_timestamp(dboid, ts);
@@ -934,8 +787,6 @@ pgstat_clear_snapshot(void)
 
 	memset(&pgStatLocal.snapshot.fixed_valid, 0,
 		   sizeof(pgStatLocal.snapshot.fixed_valid));
-	memset(&pgStatLocal.snapshot.custom_valid, 0,
-		   sizeof(pgStatLocal.snapshot.custom_valid));
 	pgStatLocal.snapshot.stats = NULL;
 	pgStatLocal.snapshot.mode = PGSTAT_FETCH_CONSISTENCY_NONE;
 
@@ -960,9 +811,9 @@ pgstat_clear_snapshot(void)
 }
 
 void *
-pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
+pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, Oid objoid)
 {
-	PgStat_HashKey key = {0};
+	PgStat_HashKey key;
 	PgStat_EntryRef *entry_ref;
 	void	   *stats_data;
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
@@ -971,18 +822,14 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 	Assert(!kind_info->fixed_amount);
 
-	/*
-	 * Initialize *may_free to false.  We'll change it to true later if we end
-	 * up allocating the result in the caller's context and not caching it.
-	 */
-	if (may_free)
-		*may_free = false;
-
 	pgstat_prep_snapshot();
+
+	/* clear padding */
+	memset(&key, 0, sizeof(struct PgStat_HashKey));
 
 	key.kind = kind;
 	key.dboid = dboid;
-	key.objid = objid;
+	key.objoid = objoid;
 
 	/* if we need to build a full snapshot, do so */
 	if (pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_SNAPSHOT)
@@ -1008,7 +855,7 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 
 	pgStatLocal.snapshot.mode = pgstat_fetch_consistency;
 
-	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, false, NULL);
+	entry_ref = pgstat_get_entry_ref(kind, dboid, objoid, false, NULL);
 
 	if (entry_ref == NULL || entry_ref->shared_entry->dropped)
 	{
@@ -1031,21 +878,12 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 	 * repeated accesses.
 	 */
 	if (pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_NONE)
-	{
 		stats_data = palloc(kind_info->shared_data_len);
-
-		/*
-		 * Since we allocated the result in the caller's context and aren't
-		 * caching it, the caller can safely pfree() it.
-		 */
-		if (may_free)
-			*may_free = true;
-	}
 	else
 		stats_data = MemoryContextAlloc(pgStatLocal.snapshot.context,
 										kind_info->shared_data_len);
 
-	(void) pgstat_lock_entry_shared(entry_ref, false);
+	pgstat_lock_entry_shared(entry_ref, false);
 	memcpy(stats_data,
 		   pgstat_get_entry_data(kind, entry_ref->shared_stats),
 		   kind_info->shared_data_len);
@@ -1086,13 +924,13 @@ pgstat_get_stat_snapshot_timestamp(bool *have_snapshot)
 }
 
 bool
-pgstat_have_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
+pgstat_have_entry(PgStat_Kind kind, Oid dboid, Oid objoid)
 {
 	/* fixed-numbered stats always exist */
 	if (pgstat_get_kind_info(kind)->fixed_amount)
 		return true;
 
-	return pgstat_get_entry_ref(kind, dboid, objid, false, NULL) != NULL;
+	return pgstat_get_entry_ref(kind, dboid, objoid, false, NULL) != NULL;
 }
 
 /*
@@ -1115,29 +953,7 @@ pgstat_snapshot_fixed(PgStat_Kind kind)
 	else
 		pgstat_build_snapshot_fixed(kind);
 
-	if (pgstat_is_kind_builtin(kind))
-		Assert(pgStatLocal.snapshot.fixed_valid[kind]);
-	else if (pgstat_is_kind_custom(kind))
-		Assert(pgStatLocal.snapshot.custom_valid[kind - PGSTAT_KIND_CUSTOM_MIN]);
-}
-
-static void
-pgstat_init_snapshot_fixed(void)
-{
-	/*
-	 * Initialize fixed-numbered statistics data in snapshots, only for custom
-	 * stats kinds.
-	 */
-	for (PgStat_Kind kind = PGSTAT_KIND_CUSTOM_MIN; kind <= PGSTAT_KIND_CUSTOM_MAX; kind++)
-	{
-		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-
-		if (!kind_info || !kind_info->fixed_amount)
-			continue;
-
-		pgStatLocal.snapshot.custom_data[kind - PGSTAT_KIND_CUSTOM_MIN] =
-			MemoryContextAlloc(TopMemoryContext, kind_info->shared_data_len);
-	}
+	Assert(pgStatLocal.snapshot.fixed_valid[kind]);
 }
 
 static void
@@ -1216,7 +1032,7 @@ pgstat_build_snapshot(void)
 		Assert(!found);
 
 		entry->data = MemoryContextAlloc(pgStatLocal.snapshot.context,
-										 pgstat_get_entry_len(kind));
+										 kind_info->shared_size);
 
 		/*
 		 * Acquire the LWLock directly instead of using
@@ -1225,7 +1041,7 @@ pgstat_build_snapshot(void)
 		LWLockAcquire(&stats_data->lock, LW_SHARED);
 		memcpy(entry->data,
 			   pgstat_get_entry_data(kind, stats_data),
-			   pgstat_get_entry_len(kind));
+			   kind_info->shared_size);
 		LWLockRelease(&stats_data->lock);
 	}
 	dshash_seq_term(&hstat);
@@ -1233,12 +1049,10 @@ pgstat_build_snapshot(void)
 	/*
 	 * Build snapshot of all fixed-numbered stats.
 	 */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+	for (int kind = PGSTAT_KIND_FIRST_VALID; kind <= PGSTAT_KIND_LAST; kind++)
 	{
 		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 
-		if (!kind_info)
-			continue;
 		if (!kind_info->fixed_amount)
 		{
 			Assert(kind_info->snapshot_cb == NULL);
@@ -1255,20 +1069,6 @@ static void
 pgstat_build_snapshot_fixed(PgStat_Kind kind)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-	int			idx;
-	bool	   *valid;
-
-	/* Position in fixed_valid or custom_valid */
-	if (pgstat_is_kind_builtin(kind))
-	{
-		idx = kind;
-		valid = pgStatLocal.snapshot.fixed_valid;
-	}
-	else
-	{
-		idx = kind - PGSTAT_KIND_CUSTOM_MIN;
-		valid = pgStatLocal.snapshot.custom_valid;
-	}
 
 	Assert(kind_info->fixed_amount);
 	Assert(kind_info->snapshot_cb != NULL);
@@ -1276,21 +1076,21 @@ pgstat_build_snapshot_fixed(PgStat_Kind kind)
 	if (pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_NONE)
 	{
 		/* rebuild every time */
-		valid[idx] = false;
+		pgStatLocal.snapshot.fixed_valid[kind] = false;
 	}
-	else if (valid[idx])
+	else if (pgStatLocal.snapshot.fixed_valid[kind])
 	{
 		/* in snapshot mode we shouldn't get called again */
 		Assert(pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_CACHE);
 		return;
 	}
 
-	Assert(!valid[idx]);
+	Assert(!pgStatLocal.snapshot.fixed_valid[kind]);
 
 	kind_info->snapshot_cb();
 
-	Assert(!valid[idx]);
-	valid[idx] = true;
+	Assert(!pgStatLocal.snapshot.fixed_valid[kind]);
+	pgStatLocal.snapshot.fixed_valid[kind] = true;
 }
 
 
@@ -1307,7 +1107,7 @@ pgstat_build_snapshot_fixed(PgStat_Kind kind)
  * created, false otherwise.
  */
 PgStat_EntryRef *
-pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *created_entry)
+pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, Oid objoid, bool *created_entry)
 {
 	PgStat_EntryRef *entry_ref;
 
@@ -1322,7 +1122,7 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
 								  ALLOCSET_SMALL_SIZES);
 	}
 
-	entry_ref = pgstat_get_entry_ref(kind, dboid, objid,
+	entry_ref = pgstat_get_entry_ref(kind, dboid, objoid,
 									 true, created_entry);
 
 	if (entry_ref->pending == NULL)
@@ -1345,11 +1145,11 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
  * that it shouldn't be needed.
  */
 PgStat_EntryRef *
-pgstat_fetch_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
+pgstat_fetch_pending_entry(PgStat_Kind kind, Oid dboid, Oid objoid)
 {
 	PgStat_EntryRef *entry_ref;
 
-	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, false, NULL);
+	entry_ref = pgstat_get_entry_ref(kind, dboid, objoid, false, NULL);
 
 	if (entry_ref == NULL || entry_ref->pending == NULL)
 		return NULL;
@@ -1378,7 +1178,8 @@ pgstat_delete_pending_entry(PgStat_EntryRef *entry_ref)
 }
 
 /*
- * Flush out pending variable-numbered stats.
+ * Flush out pending stats for database objects (databases, relations,
+ * functions).
  */
 static bool
 pgstat_flush_pending_entries(bool nowait)
@@ -1445,159 +1246,30 @@ pgstat_flush_pending_entries(bool nowait)
 PgStat_Kind
 pgstat_get_kind_from_str(char *kind_str)
 {
-	for (PgStat_Kind kind = PGSTAT_KIND_BUILTIN_MIN; kind <= PGSTAT_KIND_BUILTIN_MAX; kind++)
+	for (int kind = PGSTAT_KIND_FIRST_VALID; kind <= PGSTAT_KIND_LAST; kind++)
 	{
-		if (pg_strcasecmp(kind_str, pgstat_kind_builtin_infos[kind].name) == 0)
+		if (pg_strcasecmp(kind_str, pgstat_kind_infos[kind].name) == 0)
 			return kind;
-	}
-
-	/* Check the custom set of cumulative stats */
-	if (pgstat_kind_custom_infos)
-	{
-		for (PgStat_Kind kind = PGSTAT_KIND_CUSTOM_MIN; kind <= PGSTAT_KIND_CUSTOM_MAX; kind++)
-		{
-			uint32		idx = kind - PGSTAT_KIND_CUSTOM_MIN;
-
-			if (pgstat_kind_custom_infos[idx] &&
-				pg_strcasecmp(kind_str, pgstat_kind_custom_infos[idx]->name) == 0)
-				return kind;
-		}
 	}
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("invalid statistics kind: \"%s\"", kind_str)));
-	return PGSTAT_KIND_INVALID; /* avoid compiler warnings */
+	return PGSTAT_KIND_DATABASE;	/* avoid compiler warnings */
 }
 
 static inline bool
-pgstat_is_kind_valid(PgStat_Kind kind)
+pgstat_is_kind_valid(int ikind)
 {
-	return pgstat_is_kind_builtin(kind) || pgstat_is_kind_custom(kind);
+	return ikind >= PGSTAT_KIND_FIRST_VALID && ikind <= PGSTAT_KIND_LAST;
 }
 
 const PgStat_KindInfo *
 pgstat_get_kind_info(PgStat_Kind kind)
 {
-	if (pgstat_is_kind_builtin(kind))
-		return &pgstat_kind_builtin_infos[kind];
+	Assert(pgstat_is_kind_valid(kind));
 
-	if (pgstat_is_kind_custom(kind))
-	{
-		uint32		idx = kind - PGSTAT_KIND_CUSTOM_MIN;
-
-		if (pgstat_kind_custom_infos == NULL ||
-			pgstat_kind_custom_infos[idx] == NULL)
-			return NULL;
-		return pgstat_kind_custom_infos[idx];
-	}
-
-	return NULL;
-}
-
-/*
- * Register a new stats kind.
- *
- * PgStat_Kinds must be globally unique across all extensions. Refer
- * to https://wiki.postgresql.org/wiki/CustomCumulativeStats to reserve a
- * unique ID for your extension, to avoid conflicts with other extension
- * developers. During development, use PGSTAT_KIND_EXPERIMENTAL to avoid
- * needlessly reserving a new ID.
- */
-void
-pgstat_register_kind(PgStat_Kind kind, const PgStat_KindInfo *kind_info)
-{
-	uint32		idx = kind - PGSTAT_KIND_CUSTOM_MIN;
-
-	if (kind_info->name == NULL || strlen(kind_info->name) == 0)
-		ereport(ERROR,
-				(errmsg("failed to register custom cumulative statistics with ID %u", kind),
-				 errhint("Provide a non-empty name for the custom cumulative statistics.")));
-
-	if (!pgstat_is_kind_custom(kind))
-		ereport(ERROR, (errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-						errhint("Provide a custom cumulative statistics ID between %u and %u.",
-								PGSTAT_KIND_CUSTOM_MIN, PGSTAT_KIND_CUSTOM_MAX)));
-
-	if (!process_shared_preload_libraries_in_progress)
-		ereport(ERROR,
-				(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-				 errdetail("Custom cumulative statistics must be registered while initializing modules in \"%s\".",
-						   "shared_preload_libraries")));
-
-	/*
-	 * Check some data for fixed-numbered stats.
-	 */
-	if (kind_info->fixed_amount)
-	{
-		if (kind_info->shared_size == 0)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics require a shared memory size for fixed-numbered objects.")));
-		if (kind_info->init_shmem_cb == NULL)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics require a \"%s\" callback for fixed-numbered objects.",
-							 "init_shmem_cb")));
-		if (kind_info->reset_all_cb == NULL)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics require a \"%s\" callback for fixed-numbered objects.",
-							 "reset_all_cb")));
-		if (kind_info->snapshot_cb == NULL)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics require a \"%s\" callback for fixed-numbered objects.",
-							 "snapshot_cb")));
-		if (kind_info->track_entry_count)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics cannot use entry count tracking for fixed-numbered objects.")));
-	}
-	else
-	{
-		if (kind_info->pending_size > 0 && kind_info->flush_pending_cb == NULL)
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errhint("Custom cumulative statistics require a \"%s\" callback when pending size is set.",
-							 "flush_pending_cb")));
-	}
-
-	/*
-	 * If pgstat_kind_custom_infos is not available yet, allocate it.
-	 */
-	if (pgstat_kind_custom_infos == NULL)
-	{
-		pgstat_kind_custom_infos = (const PgStat_KindInfo **)
-			MemoryContextAllocZero(TopMemoryContext,
-								   sizeof(PgStat_KindInfo *) * PGSTAT_KIND_CUSTOM_SIZE);
-	}
-
-	if (pgstat_kind_custom_infos[idx] != NULL &&
-		pgstat_kind_custom_infos[idx]->name != NULL)
-		ereport(ERROR,
-				(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-				 errdetail("Custom cumulative statistics \"%s\" already registered with the same ID.",
-						   pgstat_kind_custom_infos[idx]->name)));
-
-	/* check for existing custom stats with the same name */
-	for (PgStat_Kind existing_kind = PGSTAT_KIND_CUSTOM_MIN; existing_kind <= PGSTAT_KIND_CUSTOM_MAX; existing_kind++)
-	{
-		uint32		existing_idx = existing_kind - PGSTAT_KIND_CUSTOM_MIN;
-
-		if (pgstat_kind_custom_infos[existing_idx] == NULL)
-			continue;
-		if (!pg_strcasecmp(pgstat_kind_custom_infos[existing_idx]->name, kind_info->name))
-			ereport(ERROR,
-					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
-					 errdetail("Existing cumulative statistics with ID %u has the same name.", existing_kind)));
-	}
-
-	/* Register it */
-	pgstat_kind_custom_infos[idx] = kind_info;
-	ereport(LOG,
-			(errmsg("registered custom cumulative statistics \"%s\" with ID %u",
-					kind_info->name, kind)));
+	return &pgstat_kind_infos[kind];
 }
 
 /*
@@ -1619,17 +1291,19 @@ pgstat_assert_is_up(void)
  * ------------------------------------------------------------
  */
 
-/* helper for pgstat_write_statsfile() */
-void
-pgstat_write_chunk(FILE *fpout, void *ptr, size_t len)
+/* helpers for pgstat_write_statsfile() */
+static void
+write_chunk(FILE *fpout, void *ptr, size_t len)
 {
 	int			rc;
 
 	rc = fwrite(ptr, len, 1, fpout);
 
-	/* We check for errors with ferror() when done writing the stats. */
+	/* we'll check for errors with ferror once at the end */
 	(void) rc;
 }
+
+#define write_chunk_s(fpout, ptr) write_chunk(fpout, ptr, sizeof(*ptr))
 
 /*
  * This function is called in the last process that is accessing the shared
@@ -1646,9 +1320,6 @@ pgstat_write_statsfile(void)
 	PgStatShared_HashEntry *ps;
 
 	pgstat_assert_is_up();
-
-	/* should be called only by the checkpointer or single user mode */
-	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
 
 	/* we're shutting down, so it's ok to just override this */
 	pgstat_fetch_consistency = PGSTAT_FETCH_CONSISTENCY_NONE;
@@ -1672,34 +1343,49 @@ pgstat_write_statsfile(void)
 	 * Write the file header --- currently just a format ID.
 	 */
 	format_id = PGSTAT_FILE_FORMAT_ID;
-	pgstat_write_chunk_s(fpout, &format_id);
+	write_chunk_s(fpout, &format_id);
 
-	/* Write various stats structs for fixed number of objects */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-	{
-		char	   *ptr;
-		const PgStat_KindInfo *info = pgstat_get_kind_info(kind);
+	/*
+	 * XXX: The following could now be generalized to just iterate over
+	 * pgstat_kind_infos instead of knowing about the different kinds of
+	 * stats.
+	 */
 
-		if (!info || !info->fixed_amount)
-			continue;
+	/*
+	 * Write archiver stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_ARCHIVER);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.archiver);
 
-		if (pgstat_is_kind_builtin(kind))
-			Assert(info->snapshot_ctl_off != 0);
+	/*
+	 * Write bgwriter stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_BGWRITER);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.bgwriter);
 
-		/* skip if no need to write to file */
-		if (!info->write_to_file)
-			continue;
+	/*
+	 * Write checkpointer stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_CHECKPOINTER);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.checkpointer);
 
-		pgstat_build_snapshot_fixed(kind);
-		if (pgstat_is_kind_builtin(kind))
-			ptr = ((char *) &pgStatLocal.snapshot) + info->snapshot_ctl_off;
-		else
-			ptr = pgStatLocal.snapshot.custom_data[kind - PGSTAT_KIND_CUSTOM_MIN];
+	/*
+	 * Write IO stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_IO);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.io);
 
-		fputc(PGSTAT_FILE_ENTRY_FIXED, fpout);
-		pgstat_write_chunk_s(fpout, &kind);
-		pgstat_write_chunk(fpout, ptr, info->shared_data_len);
-	}
+	/*
+	 * Write SLRU stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_SLRU);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.slru);
+
+	/*
+	 * Write WAL stats struct
+	 */
+	pgstat_build_snapshot_fixed(PGSTAT_KIND_WAL);
+	write_chunk_s(fpout, &pgStatLocal.snapshot.wal);
 
 	/*
 	 * Walk through the stats entries
@@ -1725,18 +1411,6 @@ pgstat_write_statsfile(void)
 		if (ps->dropped)
 			continue;
 
-		/*
-		 * This discards data related to custom stats kinds that are unknown
-		 * to this process.
-		 */
-		if (!pgstat_is_kind_valid(ps->key.kind))
-		{
-			elog(WARNING, "found unknown stats entry %u/%u/%" PRIu64,
-				 ps->key.kind, ps->key.dboid,
-				 ps->key.objid);
-			continue;
-		}
-
 		shstats = (PgStatShared_Common *) dsa_get_address(pgStatLocal.dsa, ps->body);
 
 		kind_info = pgstat_get_kind_info(ps->key.kind);
@@ -1744,15 +1418,11 @@ pgstat_write_statsfile(void)
 		/* if not dropped the valid-entry refcount should exist */
 		Assert(pg_atomic_read_u32(&ps->refcount) > 0);
 
-		/* skip if no need to write to file */
-		if (!kind_info->write_to_file)
-			continue;
-
 		if (!kind_info->to_serialized_name)
 		{
 			/* normal stats entry, identified by PgStat_HashKey */
-			fputc(PGSTAT_FILE_ENTRY_HASH, fpout);
-			pgstat_write_chunk_s(fpout, &ps->key);
+			fputc('S', fpout);
+			write_chunk_s(fpout, &ps->key);
 		}
 		else
 		{
@@ -1761,28 +1431,24 @@ pgstat_write_statsfile(void)
 
 			kind_info->to_serialized_name(&ps->key, shstats, &name);
 
-			fputc(PGSTAT_FILE_ENTRY_NAME, fpout);
-			pgstat_write_chunk_s(fpout, &ps->key.kind);
-			pgstat_write_chunk_s(fpout, &name);
+			fputc('N', fpout);
+			write_chunk_s(fpout, &ps->key.kind);
+			write_chunk_s(fpout, &name);
 		}
 
 		/* Write except the header part of the entry */
-		pgstat_write_chunk(fpout,
-						   pgstat_get_entry_data(ps->key.kind, shstats),
-						   pgstat_get_entry_len(ps->key.kind));
-
-		/* Write more data for the entry, if required */
-		if (kind_info->to_serialized_data)
-			kind_info->to_serialized_data(&ps->key, shstats, fpout);
+		write_chunk(fpout,
+					pgstat_get_entry_data(ps->key.kind, shstats),
+					pgstat_get_entry_len(ps->key.kind));
 	}
 	dshash_seq_term(&hstat);
 
 	/*
 	 * No more output to be done. Close the temp file and replace the old
 	 * pgstat.stat with it.  The ferror() check replaces testing for error
-	 * after each individual fputc or fwrite (in pgstat_write_chunk()) above.
+	 * after each individual fputc or fwrite (in write_chunk()) above.
 	 */
-	fputc(PGSTAT_FILE_ENTRY_END, fpout);
+	fputc('E', fpout);
 
 	if (ferror(fpout))
 	{
@@ -1801,31 +1467,27 @@ pgstat_write_statsfile(void)
 						tmpfile)));
 		unlink(tmpfile);
 	}
-	else if (durable_rename(tmpfile, statfile, LOG) < 0)
+	else if (rename(tmpfile, statfile) < 0)
 	{
-		/* durable_rename already emitted log message */
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename temporary statistics file \"%s\" to \"%s\": %m",
+						tmpfile, statfile)));
 		unlink(tmpfile);
-	}
-
-	/* Finish callbacks, if required */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-	{
-		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-
-		if (kind_info && kind_info->finish)
-			kind_info->finish(STATS_WRITE);
 	}
 }
 
-/* helper for pgstat_read_statsfile() */
-bool
-pgstat_read_chunk(FILE *fpin, void *ptr, size_t len)
+/* helpers for pgstat_read_statsfile() */
+static bool
+read_chunk(FILE *fpin, void *ptr, size_t len)
 {
 	return fread(ptr, 1, len, fpin) == len;
 }
 
+#define read_chunk_s(fpin, ptr) read_chunk(fpin, ptr, sizeof(*ptr))
+
 /*
- * Reads in existing statistics file into memory.
+ * Reads in existing statistics file into the shared stats hash.
  *
  * This function is called in the only process that is accessing the shared
  * stats so locking is not required.
@@ -1867,22 +1529,55 @@ pgstat_read_statsfile(void)
 	/*
 	 * Verify it's of the expected format.
 	 */
-	if (!pgstat_read_chunk_s(fpin, &format_id))
-	{
-		elog(WARNING, "could not read format ID");
+	if (!read_chunk_s(fpin, &format_id) ||
+		format_id != PGSTAT_FILE_FORMAT_ID)
 		goto error;
-	}
-
-	if (format_id != PGSTAT_FILE_FORMAT_ID)
-	{
-		elog(WARNING, "found incorrect format ID %d (expected %d)",
-			 format_id, PGSTAT_FILE_FORMAT_ID);
-		goto error;
-	}
 
 	/*
-	 * We found an existing statistics file. Read it and put all the stats
-	 * data into place.
+	 * XXX: The following could now be generalized to just iterate over
+	 * pgstat_kind_infos instead of knowing about the different kinds of
+	 * stats.
+	 */
+
+	/*
+	 * Read archiver stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->archiver.stats))
+		goto error;
+
+	/*
+	 * Read bgwriter stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->bgwriter.stats))
+		goto error;
+
+	/*
+	 * Read checkpointer stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->checkpointer.stats))
+		goto error;
+
+	/*
+	 * Read IO stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->io.stats))
+		goto error;
+
+	/*
+	 * Read SLRU stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->slru.stats))
+		goto error;
+
+	/*
+	 * Read WAL stats struct
+	 */
+	if (!read_chunk_s(fpin, &shmem->wal.stats))
+		goto error;
+
+	/*
+	 * We found an existing statistics file. Read it and put all the hash
+	 * table entries into place.
 	 */
 	for (;;)
 	{
@@ -1890,146 +1585,48 @@ pgstat_read_statsfile(void)
 
 		switch (t)
 		{
-			case PGSTAT_FILE_ENTRY_FIXED:
-				{
-					PgStat_Kind kind;
-					const PgStat_KindInfo *info;
-					char	   *ptr;
-
-					/* entry for fixed-numbered stats */
-					if (!pgstat_read_chunk_s(fpin, &kind))
-					{
-						elog(WARNING, "could not read stats kind for entry of type %c", t);
-						goto error;
-					}
-
-					if (!pgstat_is_kind_valid(kind))
-					{
-						elog(WARNING, "invalid stats kind %u for entry of type %c",
-							 kind, t);
-						goto error;
-					}
-
-					info = pgstat_get_kind_info(kind);
-					if (!info)
-					{
-						elog(WARNING, "could not find information of kind %u for entry of type %c",
-							 kind, t);
-						goto error;
-					}
-
-					if (!info->fixed_amount)
-					{
-						elog(WARNING, "invalid fixed_amount in stats kind %u for entry of type %c",
-							 kind, t);
-						goto error;
-					}
-
-					/* Load back stats into shared memory */
-					if (pgstat_is_kind_builtin(kind))
-						ptr = ((char *) shmem) + info->shared_ctl_off +
-							info->shared_data_off;
-					else
-					{
-						int			idx = kind - PGSTAT_KIND_CUSTOM_MIN;
-
-						ptr = ((char *) shmem->custom_data[idx]) +
-							info->shared_data_off;
-					}
-
-					if (!pgstat_read_chunk(fpin, ptr, info->shared_data_len))
-					{
-						elog(WARNING, "could not read data of stats kind %u for entry of type %c with size %u",
-							 kind, t, info->shared_data_len);
-						goto error;
-					}
-
-					break;
-				}
-			case PGSTAT_FILE_ENTRY_HASH:
-			case PGSTAT_FILE_ENTRY_NAME:
+			case 'S':
+			case 'N':
 				{
 					PgStat_HashKey key;
 					PgStatShared_HashEntry *p;
 					PgStatShared_Common *header;
-					const PgStat_KindInfo *kind_info = NULL;
 
 					CHECK_FOR_INTERRUPTS();
 
-					if (t == PGSTAT_FILE_ENTRY_HASH)
+					if (t == 'S')
 					{
 						/* normal stats entry, identified by PgStat_HashKey */
-						if (!pgstat_read_chunk_s(fpin, &key))
-						{
-							elog(WARNING, "could not read key for entry of type %c", t);
+						if (!read_chunk_s(fpin, &key))
 							goto error;
-						}
 
 						if (!pgstat_is_kind_valid(key.kind))
-						{
-							elog(WARNING, "invalid stats kind for entry %u/%u/%" PRIu64 " of type %c",
-								 key.kind, key.dboid,
-								 key.objid, t);
 							goto error;
-						}
-
-						kind_info = pgstat_get_kind_info(key.kind);
-						if (!kind_info)
-						{
-							elog(WARNING, "could not find information of kind for entry %u/%u/%" PRIu64 " of type %c",
-								 key.kind, key.dboid,
-								 key.objid, t);
-							goto error;
-						}
 					}
 					else
 					{
 						/* stats entry identified by name on disk (e.g. slots) */
+						const PgStat_KindInfo *kind_info = NULL;
 						PgStat_Kind kind;
 						NameData	name;
 
-						if (!pgstat_read_chunk_s(fpin, &kind))
-						{
-							elog(WARNING, "could not read stats kind for entry of type %c", t);
+						if (!read_chunk_s(fpin, &kind))
 							goto error;
-						}
-						if (!pgstat_read_chunk_s(fpin, &name))
-						{
-							elog(WARNING, "could not read name of stats kind %u for entry of type %c",
-								 kind, t);
+						if (!read_chunk_s(fpin, &name))
 							goto error;
-						}
 						if (!pgstat_is_kind_valid(kind))
-						{
-							elog(WARNING, "invalid stats kind %u for entry of type %c",
-								 kind, t);
 							goto error;
-						}
 
 						kind_info = pgstat_get_kind_info(kind);
-						if (!kind_info)
-						{
-							elog(WARNING, "could not find information of kind %u for entry of type %c",
-								 kind, t);
-							goto error;
-						}
 
 						if (!kind_info->from_serialized_name)
-						{
-							elog(WARNING, "invalid from_serialized_name in stats kind %u for entry of type %c",
-								 kind, t);
 							goto error;
-						}
 
 						if (!kind_info->from_serialized_name(&name, &key))
 						{
 							/* skip over data for entry we don't care about */
 							if (fseek(fpin, pgstat_get_entry_len(kind), SEEK_CUR) != 0)
-							{
-								elog(WARNING, "could not seek \"%s\" of stats kind %u for entry of type %c",
-									 NameStr(name), kind, t);
 								goto error;
-							}
 
 							continue;
 						}
@@ -2048,9 +1645,8 @@ pgstat_read_statsfile(void)
 					if (found)
 					{
 						dshash_release_lock(pgStatLocal.shared_hash, p);
-						elog(WARNING, "found duplicate stats entry %u/%u/%" PRIu64 " of type %c",
-							 key.kind, key.dboid,
-							 key.objid, t);
+						elog(WARNING, "found duplicate stats entry %d/%u/%u",
+							 key.kind, key.dboid, key.objoid);
 						goto error;
 					}
 
@@ -2063,70 +1659,34 @@ pgstat_read_statsfile(void)
 						 * WARNING, but it would mean that all the statistics
 						 * are discarded when the environment fails on OOM.
 						 */
-						elog(ERROR, "could not allocate entry %u/%u/%" PRIu64 " of type %c",
-							 key.kind, key.dboid,
-							 key.objid, t);
+						elog(ERROR,	"could not allocate entry %d/%u/%u",
+							 key.kind, key.dboid, key.objoid);
 					}
 
-					if (!pgstat_read_chunk(fpin,
-										   pgstat_get_entry_data(key.kind, header),
-										   pgstat_get_entry_len(key.kind)))
-					{
-						elog(WARNING, "could not read data for entry %u/%u/%" PRIu64 " of type %c",
-							 key.kind, key.dboid,
-							 key.objid, t);
+					if (!read_chunk(fpin,
+									pgstat_get_entry_data(key.kind, header),
+									pgstat_get_entry_len(key.kind)))
 						goto error;
-					}
-
-					/* read more data for the entry, if required */
-					if (kind_info->from_serialized_data)
-					{
-						if (!kind_info->from_serialized_data(&key, header, fpin))
-						{
-							elog(WARNING, "could not read auxiliary data for entry %u/%u/%" PRIu64 " of type %c",
-								 key.kind, key.dboid,
-								 key.objid, t);
-							goto error;
-						}
-					}
 
 					break;
 				}
-			case PGSTAT_FILE_ENTRY_END:
-
-				/*
-				 * check that PGSTAT_FILE_ENTRY_END actually signals end of
-				 * file
-				 */
+			case 'E':
+				/* check that 'E' actually signals end of file */
 				if (fgetc(fpin) != EOF)
-				{
-					elog(WARNING, "could not read end-of-file");
 					goto error;
-				}
 
 				goto done;
 
 			default:
-				elog(WARNING, "could not read entry of type %c", t);
 				goto error;
 		}
 	}
 
 done:
-	/* First, cleanup the main stats file */
 	FreeFile(fpin);
 
 	elog(DEBUG2, "removing permanent stats file \"%s\"", statfile);
 	unlink(statfile);
-
-	/* Finish callbacks, if required */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
-	{
-		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-
-		if (kind_info && kind_info->finish)
-			kind_info->finish(STATS_READ);
-	}
 
 	return;
 
@@ -2149,11 +1709,11 @@ pgstat_reset_after_failure(void)
 	TimestampTz ts = GetCurrentTimestamp();
 
 	/* reset fixed-numbered stats */
-	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+	for (int kind = PGSTAT_KIND_FIRST_VALID; kind <= PGSTAT_KIND_LAST; kind++)
 	{
 		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 
-		if (!kind_info || !kind_info->fixed_amount)
+		if (!kind_info->fixed_amount)
 			continue;
 
 		kind_info->reset_all_cb(ts);

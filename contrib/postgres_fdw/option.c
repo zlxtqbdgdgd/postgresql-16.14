@@ -3,7 +3,7 @@
  * option.c
  *		  FDW and GUC option handling for postgres_fdw
  *
- * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/option.c
@@ -20,8 +20,8 @@
 #include "commands/extension.h"
 #include "libpq/libpq-be.h"
 #include "postgres_fdw.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 #include "utils/varlena.h"
 
 /*
@@ -39,6 +39,12 @@ typedef struct PgFdwOption
  * Allocated and filled in InitPgFdwOptions.
  */
 static PgFdwOption *postgres_fdw_options;
+
+/*
+ * Valid options for libpq.
+ * Allocated and filled in InitPgFdwOptions.
+ */
+static PQconninfoOption *libpq_options;
 
 /*
  * GUC parameters
@@ -120,9 +126,7 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 			strcmp(def->defname, "async_capable") == 0 ||
 			strcmp(def->defname, "parallel_commit") == 0 ||
 			strcmp(def->defname, "parallel_abort") == 0 ||
-			strcmp(def->defname, "keep_connections") == 0 ||
-			strcmp(def->defname, "restore_stats") == 0 ||
-			strcmp(def->defname, "use_scram_passthrough") == 0)
+			strcmp(def->defname, "keep_connections") == 0)
 		{
 			/* these accept only boolean values */
 			(void) defGetBoolean(def);
@@ -236,7 +240,6 @@ static void
 InitPgFdwOptions(void)
 {
 	int			num_libpq_opts;
-	PQconninfoOption *libpq_options;
 	PQconninfoOption *lopt;
 	PgFdwOption *popt;
 
@@ -276,12 +279,6 @@ InitPgFdwOptions(void)
 		/* sampling is available on both server and table */
 		{"analyze_sampling", ForeignServerRelationId, false},
 		{"analyze_sampling", ForeignTableRelationId, false},
-		/* restore_stats is available on both server and table */
-		{"restore_stats", ForeignServerRelationId, false},
-		{"restore_stats", ForeignTableRelationId, false},
-
-		{"use_scram_passthrough", ForeignServerRelationId, false},
-		{"use_scram_passthrough", UserMappingRelationId, false},
 
 		/*
 		 * sslcert and sslkey are in fact libpq options, but we repeat them
@@ -308,8 +305,8 @@ InitPgFdwOptions(void)
 	 * Get list of valid libpq options.
 	 *
 	 * To avoid unnecessary work, we get the list once and use it throughout
-	 * the lifetime of this backend process.  Hence, we'll allocate it in
-	 * TopMemoryContext.
+	 * the lifetime of this backend process.  We don't need to care about
+	 * memory context issues, because PQconndefaults allocates with malloc.
 	 */
 	libpq_options = PQconndefaults();
 	if (!libpq_options)			/* assume reason for failure is OOM */
@@ -326,11 +323,19 @@ InitPgFdwOptions(void)
 	/*
 	 * Construct an array which consists of all valid options for
 	 * postgres_fdw, by appending FDW-specific options to libpq options.
+	 *
+	 * We use plain malloc here to allocate postgres_fdw_options because it
+	 * lives as long as the backend process does.  Besides, keeping
+	 * libpq_options in memory allows us to avoid copying every keyword
+	 * string.
 	 */
 	postgres_fdw_options = (PgFdwOption *)
-		MemoryContextAlloc(TopMemoryContext,
-						   sizeof(PgFdwOption) * num_libpq_opts +
-						   sizeof(non_libpq_options));
+		malloc(sizeof(PgFdwOption) * num_libpq_opts +
+			   sizeof(non_libpq_options));
+	if (postgres_fdw_options == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
 
 	popt = postgres_fdw_options;
 	for (lopt = libpq_options; lopt->keyword; lopt++)
@@ -341,15 +346,8 @@ InitPgFdwOptions(void)
 			strcmp(lopt->keyword, "client_encoding") == 0)
 			continue;
 
-		/*
-		 * Disallow OAuth options for now, since the builtin flow communicates
-		 * on stderr by default and can't cache tokens yet.
-		 */
-		if (strncmp(lopt->keyword, "oauth_", strlen("oauth_")) == 0)
-			continue;
-
-		popt->keyword = MemoryContextStrdup(TopMemoryContext,
-											lopt->keyword);
+		/* We don't have to copy keyword string, as described above. */
+		popt->keyword = lopt->keyword;
 
 		/*
 		 * "user" and any secret options are allowed only on user mappings.
@@ -363,9 +361,6 @@ InitPgFdwOptions(void)
 
 		popt++;
 	}
-
-	/* Done with libpq's output structure. */
-	PQconninfoFree(libpq_options);
 
 	/* Append FDW-specific options and dummy terminator. */
 	memcpy(popt, non_libpq_options, sizeof(non_libpq_options));
@@ -527,7 +522,7 @@ process_pgfdw_appname(const char *appname)
 				appendStringInfoString(&buf, application_name);
 				break;
 			case 'c':
-				appendStringInfo(&buf, "%" PRIx64 ".%x", MyStartTime, MyProcPid);
+				appendStringInfo(&buf, "%" INT64_MODIFIER "x.%x", MyStartTime, MyProcPid);
 				break;
 			case 'C':
 				appendStringInfoString(&buf, cluster_name);

@@ -3,7 +3,7 @@
  * csvlog.c
  *	  CSV logging
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,14 +16,16 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "libpq/libpq.h"
 #include "lib/stringinfo.h"
-#include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/syslogger.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/backend_status.h"
+#include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
@@ -120,7 +122,7 @@ write_csvlog(ErrorData *edata)
 	appendStringInfoChar(&buf, ',');
 
 	/* session id */
-	appendStringInfo(&buf, "%" PRIx64 ".%x", MyStartTime, MyProcPid);
+	appendStringInfo(&buf, "%" INT64_MODIFIER "x.%x", MyStartTime, MyProcPid);
 	appendStringInfoChar(&buf, ',');
 
 	/* Line number */
@@ -150,8 +152,8 @@ write_csvlog(ErrorData *edata)
 
 	/* Virtual transaction id */
 	/* keep VXID format in sync with lockfuncs.c */
-	if (MyProc != NULL && MyProc->vxid.procNumber != INVALID_PROC_NUMBER)
-		appendStringInfo(&buf, "%d/%u", MyProc->vxid.procNumber, MyProc->vxid.lxid);
+	if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
+		appendStringInfo(&buf, "%d/%u", MyProc->backendId, MyProc->lxid);
 	appendStringInfoChar(&buf, ',');
 
 	/* Transaction id */
@@ -248,12 +250,12 @@ write_csvlog(ErrorData *edata)
 	appendStringInfoChar(&buf, ',');
 
 	/* query id */
-	appendStringInfo(&buf, "%" PRId64, pgstat_get_my_query_id());
+	appendStringInfo(&buf, "%lld", (long long) pgstat_get_my_query_id());
 
 	appendStringInfoChar(&buf, '\n');
 
 	/* If in the syslogger process, try to write messages direct to file */
-	if (syslogger_setup_done)
+	if (MyBackendType == B_LOGGER)
 		write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_CSVLOG);
 	else
 		write_pipe_chunks(buf.data, buf.len, LOG_DESTINATION_CSVLOG);

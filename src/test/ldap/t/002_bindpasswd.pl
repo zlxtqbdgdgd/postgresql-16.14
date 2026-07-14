@@ -1,8 +1,8 @@
 
-# Copyright (c) 2023-2026, PostgreSQL Global Development Group
+# Copyright (c) 2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use FindBin;
 use lib "$FindBin::RealBin/..";
@@ -18,7 +18,7 @@ if ($ENV{with_ldap} ne 'yes')
 {
 	plan skip_all => 'LDAP not supported by this build';
 }
-elsif (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
+elsif ($ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
 {
 	plan skip_all =>
 	  'Potentially unsafe test LDAP not enabled in PG_TEST_EXTRA';
@@ -43,7 +43,7 @@ note "setting up PostgreSQL instance";
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = all\n");
+$node->append_conf('postgresql.conf', "log_connections = on\n");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE USER test0;');

@@ -24,7 +24,7 @@
  * with collations that match the remote table's columns, which we can
  * consider to be user error.
  *
- * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/deparse.c
@@ -39,7 +39,6 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
-#include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -48,6 +47,7 @@
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "optimizer/optimizer.h"
@@ -60,6 +60,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "commands/tablecmds.h"
 
 /*
  * Global context for foreign_expr_walker's search of an expression tree.
@@ -82,7 +83,7 @@ typedef enum
 								 * it has default collation that is not
 								 * traceable to a foreign Var */
 	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
-	FDW_COLLATE_UNSAFE,			/* collation is non-default and derives from
+	FDW_COLLATE_UNSAFE			/* collation is non-default and derives from
 								 * something other than a foreign Var */
 } FDWCollateState;
 
@@ -161,7 +162,6 @@ static void deparseDistinctExpr(DistinctExpr *node, deparse_expr_cxt *context);
 static void deparseScalarArrayOpExpr(ScalarArrayOpExpr *node,
 									 deparse_expr_cxt *context);
 static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
-static void deparseArrayCoerceExpr(ArrayCoerceExpr *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context);
@@ -180,15 +180,11 @@ static void appendConditions(List *exprs, deparse_expr_cxt *context);
 static void deparseFromExprForRel(StringInfo buf, PlannerInfo *root,
 								  RelOptInfo *foreignrel, bool use_alias,
 								  Index ignore_rel, List **ignore_conds,
-								  List **additional_conds,
 								  List **params_list);
-static void appendWhereClause(List *exprs, List *additional_conds,
-							  deparse_expr_cxt *context);
 static void deparseFromExpr(List *quals, deparse_expr_cxt *context);
 static void deparseRangeTblRef(StringInfo buf, PlannerInfo *root,
 							   RelOptInfo *foreignrel, bool make_subquery,
-							   Index ignore_rel, List **ignore_conds,
-							   List **additional_conds, List **params_list);
+							   Index ignore_rel, List **ignore_conds, List **params_list);
 static void deparseAggref(Aggref *node, deparse_expr_cxt *context);
 static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendOrderBySuffix(Oid sortop, Oid sortcoltype, bool nulls_first,
@@ -457,11 +453,6 @@ foreign_expr_walker(Node *node,
 											  AuthIdRelationId, fpinfo))
 								return false;
 							break;
-						case REGDATABASEOID:
-							if (!is_shippable(DatumGetObjectId(c->constvalue),
-											  DatabaseRelationId, fpinfo))
-								return false;
-							break;
 					}
 				}
 
@@ -692,34 +683,6 @@ foreign_expr_walker(Node *node,
 				 * an input foreign Var (same logic as for a real function).
 				 */
 				collation = r->resultcollid;
-				if (collation == InvalidOid)
-					state = FDW_COLLATE_NONE;
-				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-						 collation == inner_cxt.collation)
-					state = FDW_COLLATE_SAFE;
-				else if (collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
-			}
-			break;
-		case T_ArrayCoerceExpr:
-			{
-				ArrayCoerceExpr *e = (ArrayCoerceExpr *) node;
-
-				/*
-				 * Recurse to input subexpression.
-				 */
-				if (!foreign_expr_walker((Node *) e->arg,
-										 glob_cxt, &inner_cxt, case_arg_cxt))
-					return false;
-
-				/*
-				 * T_ArrayCoerceExpr must not introduce a collation not
-				 * derived from an input foreign Var (same logic as for a
-				 * function).
-				 */
-				collation = e->resultcollid;
 				if (collation == InvalidOid)
 					state = FDW_COLLATE_NONE;
 				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
@@ -1189,7 +1152,7 @@ is_foreign_pathkey(PlannerInfo *root,
 static char *
 deparse_type_name(Oid type_oid, int32 typemod)
 {
-	uint16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+	bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
 
 	if (!is_builtin(type_oid))
 		flags |= FORMAT_TYPE_FORCE_QUALIFY;
@@ -1407,7 +1370,6 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	RelOptInfo *scanrel = context->scanrel;
-	List	   *additional_conds = NIL;
 
 	/* For upper relations, scanrel must be either a joinrel or a baserel */
 	Assert(!IS_UPPER_REL(context->foreignrel) ||
@@ -1417,11 +1379,14 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	appendStringInfoString(buf, " FROM ");
 	deparseFromExprForRel(buf, context->root, scanrel,
 						  (bms_membership(scanrel->relids) == BMS_MULTIPLE),
-						  (Index) 0, NULL, &additional_conds,
-						  context->params_list);
-	appendWhereClause(quals, additional_conds, context);
-	if (additional_conds != NIL)
-		list_free_deep(additional_conds);
+						  (Index) 0, NULL, context->params_list);
+
+	/* Construct WHERE clause */
+	if (quals != NIL)
+	{
+		appendStringInfoString(buf, " WHERE ");
+		appendConditions(quals, context);
+	}
 }
 
 /*
@@ -1458,8 +1423,10 @@ deparseTargetList(StringInfo buf,
 	first = true;
 	for (i = 1; i <= tupdesc->natts; i++)
 	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+
 		/* Ignore dropped attributes. */
-		if (TupleDescCompactAttr(tupdesc, i - 1)->attisdropped)
+		if (attr->attisdropped)
 			continue;
 
 		if (have_wholerow ||
@@ -1631,42 +1598,6 @@ appendConditions(List *exprs, deparse_expr_cxt *context)
 	reset_transmission_modes(nestlevel);
 }
 
-/*
- * Append WHERE clause, containing conditions from exprs and additional_conds,
- * to context->buf.
- */
-static void
-appendWhereClause(List *exprs, List *additional_conds, deparse_expr_cxt *context)
-{
-	StringInfo	buf = context->buf;
-	bool		need_and = false;
-	ListCell   *lc;
-
-	if (exprs != NIL || additional_conds != NIL)
-		appendStringInfoString(buf, " WHERE ");
-
-	/*
-	 * If there are some filters, append them.
-	 */
-	if (exprs != NIL)
-	{
-		appendConditions(exprs, context);
-		need_and = true;
-	}
-
-	/*
-	 * If there are some EXISTS conditions, coming from SEMI-JOINS, append
-	 * them.
-	 */
-	foreach(lc, additional_conds)
-	{
-		if (need_and)
-			appendStringInfoString(buf, " AND ");
-		appendStringInfoString(buf, (char *) lfirst(lc));
-		need_and = true;
-	}
-}
-
 /* Output join name for given join type */
 const char *
 get_jointype_name(JoinType jointype)
@@ -1684,9 +1615,6 @@ get_jointype_name(JoinType jointype)
 
 		case JOIN_FULL:
 			return "FULL";
-
-		case JOIN_SEMI:
-			return "SEMI";
 
 		default:
 			/* Shouldn't come here, but protect from buggy code. */
@@ -1784,14 +1712,11 @@ deparseSubqueryTargetList(deparse_expr_cxt *context)
  * of DELETE; it deparses the join relation as if the relation never contained
  * the target relation, and creates a List of conditions to be deparsed into
  * the top-level WHERE clause, which is returned to *ignore_conds.
- *
- * 'additional_conds' is a pointer to a list of strings to be appended to
- * the WHERE clause, coming from lower-level SEMI-JOINs.
  */
 static void
 deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 					  bool use_alias, Index ignore_rel, List **ignore_conds,
-					  List **additional_conds, List **params_list)
+					  List **params_list)
 {
 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 
@@ -1803,8 +1728,6 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		RelOptInfo *innerrel = fpinfo->innerrel;
 		bool		outerrel_is_target = false;
 		bool		innerrel_is_target = false;
-		List	   *additional_conds_i = NIL;
-		List	   *additional_conds_o = NIL;
 
 		if (ignore_rel > 0 && bms_is_member(ignore_rel, foreignrel->relids))
 		{
@@ -1841,8 +1764,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 			initStringInfo(&join_sql_o);
 			deparseRangeTblRef(&join_sql_o, root, outerrel,
 							   fpinfo->make_outerrel_subquery,
-							   ignore_rel, ignore_conds, &additional_conds_o,
-							   params_list);
+							   ignore_rel, ignore_conds, params_list);
 
 			/*
 			 * If inner relation is the target relation, skip deparsing it.
@@ -1858,12 +1780,6 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 				Assert(fpinfo->jointype == JOIN_INNER);
 				Assert(fpinfo->joinclauses == NIL);
 				appendBinaryStringInfo(buf, join_sql_o.data, join_sql_o.len);
-				/* Pass EXISTS conditions to upper level */
-				if (additional_conds_o != NIL)
-				{
-					Assert(*additional_conds == NIL);
-					*additional_conds = additional_conds_o;
-				}
 				return;
 			}
 		}
@@ -1874,54 +1790,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 			initStringInfo(&join_sql_i);
 			deparseRangeTblRef(&join_sql_i, root, innerrel,
 							   fpinfo->make_innerrel_subquery,
-							   ignore_rel, ignore_conds, &additional_conds_i,
-							   params_list);
-
-			/*
-			 * SEMI-JOIN is deparsed as the EXISTS subquery. It references
-			 * outer and inner relations, so it should be evaluated as the
-			 * condition in the upper-level WHERE clause. We deparse the
-			 * condition and pass it to upper level callers as an
-			 * additional_conds list. Upper level callers are responsible for
-			 * inserting conditions from the list where appropriate.
-			 */
-			if (fpinfo->jointype == JOIN_SEMI)
-			{
-				deparse_expr_cxt context;
-				StringInfoData str;
-
-				/* Construct deparsed condition from this SEMI-JOIN */
-				initStringInfo(&str);
-				appendStringInfo(&str, "EXISTS (SELECT NULL FROM %s",
-								 join_sql_i.data);
-
-				context.buf = &str;
-				context.foreignrel = foreignrel;
-				context.scanrel = foreignrel;
-				context.root = root;
-				context.params_list = params_list;
-
-				/*
-				 * Append SEMI-JOIN clauses and EXISTS conditions from lower
-				 * levels to the current EXISTS subquery
-				 */
-				appendWhereClause(fpinfo->joinclauses, additional_conds_i, &context);
-
-				/*
-				 * EXISTS conditions, coming from lower join levels, have just
-				 * been processed.
-				 */
-				if (additional_conds_i != NIL)
-				{
-					list_free_deep(additional_conds_i);
-					additional_conds_i = NIL;
-				}
-
-				/* Close parentheses for EXISTS subquery */
-				appendStringInfoChar(&str, ')');
-
-				*additional_conds = lappend(*additional_conds, str.data);
-			}
+							   ignore_rel, ignore_conds, params_list);
 
 			/*
 			 * If outer relation is the target relation, skip deparsing it.
@@ -1932,12 +1801,6 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 				Assert(fpinfo->jointype == JOIN_INNER);
 				Assert(fpinfo->joinclauses == NIL);
 				appendBinaryStringInfo(buf, join_sql_i.data, join_sql_i.len);
-				/* Pass EXISTS conditions to the upper call */
-				if (additional_conds_i != NIL)
-				{
-					Assert(*additional_conds == NIL);
-					*additional_conds = additional_conds_i;
-				}
 				return;
 			}
 		}
@@ -1946,65 +1809,33 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		Assert(!outerrel_is_target && !innerrel_is_target);
 
 		/*
-		 * For semijoin FROM clause is deparsed as an outer relation. An inner
-		 * relation and join clauses are converted to EXISTS condition and
-		 * passed to the upper level.
+		 * For a join relation FROM clause entry is deparsed as
+		 *
+		 * ((outer relation) <join type> (inner relation) ON (joinclauses))
 		 */
-		if (fpinfo->jointype == JOIN_SEMI)
+		appendStringInfo(buf, "(%s %s JOIN %s ON ", join_sql_o.data,
+						 get_jointype_name(fpinfo->jointype), join_sql_i.data);
+
+		/* Append join clause; (TRUE) if no join clause */
+		if (fpinfo->joinclauses)
 		{
-			appendBinaryStringInfo(buf, join_sql_o.data, join_sql_o.len);
-		}
-		else
-		{
-			/*
-			 * For a join relation FROM clause, entry is deparsed as
-			 *
-			 * ((outer relation) <join type> (inner relation) ON
-			 * (joinclauses))
-			 */
-			appendStringInfo(buf, "(%s %s JOIN %s ON ", join_sql_o.data,
-							 get_jointype_name(fpinfo->jointype), join_sql_i.data);
+			deparse_expr_cxt context;
 
-			/* Append join clause; (TRUE) if no join clause */
-			if (fpinfo->joinclauses)
-			{
-				deparse_expr_cxt context;
+			context.buf = buf;
+			context.foreignrel = foreignrel;
+			context.scanrel = foreignrel;
+			context.root = root;
+			context.params_list = params_list;
 
-				context.buf = buf;
-				context.foreignrel = foreignrel;
-				context.scanrel = foreignrel;
-				context.root = root;
-				context.params_list = params_list;
-
-				appendStringInfoChar(buf, '(');
-				appendConditions(fpinfo->joinclauses, &context);
-				appendStringInfoChar(buf, ')');
-			}
-			else
-				appendStringInfoString(buf, "(TRUE)");
-
-			/* End the FROM clause entry. */
+			appendStringInfoChar(buf, '(');
+			appendConditions(fpinfo->joinclauses, &context);
 			appendStringInfoChar(buf, ')');
 		}
+		else
+			appendStringInfoString(buf, "(TRUE)");
 
-		/*
-		 * Construct additional_conds to be passed to the upper caller from
-		 * current level additional_conds and additional_conds, coming from
-		 * inner and outer rels.
-		 */
-		if (additional_conds_o != NIL)
-		{
-			*additional_conds = list_concat(*additional_conds,
-											additional_conds_o);
-			list_free(additional_conds_o);
-		}
-
-		if (additional_conds_i != NIL)
-		{
-			*additional_conds = list_concat(*additional_conds,
-											additional_conds_i);
-			list_free(additional_conds_i);
-		}
+		/* End the FROM clause entry. */
+		appendStringInfoChar(buf, ')');
 	}
 	else
 	{
@@ -2032,13 +1863,11 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 
 /*
  * Append FROM clause entry for the given relation into buf.
- * Conditions from lower-level SEMI-JOINs are appended to additional_conds
- * and should be added to upper level WHERE clause.
  */
 static void
 deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 				   bool make_subquery, Index ignore_rel, List **ignore_conds,
-				   List **additional_conds, List **params_list)
+				   List **params_list)
 {
 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 
@@ -2096,8 +1925,7 @@ deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	}
 	else
 		deparseFromExprForRel(buf, root, foreignrel, true, ignore_rel,
-							  ignore_conds, additional_conds,
-							  params_list);
+							  ignore_conds, params_list);
 }
 
 /*
@@ -2148,7 +1976,7 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 		foreach(lc, targetAttrs)
 		{
 			int			attnum = lfirst_int(lc);
-			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 			if (!first)
 				appendStringInfoString(buf, ", ");
@@ -2214,7 +2042,7 @@ rebuildInsertSql(StringInfo buf, Relation rel,
 		foreach(lc, target_attrs)
 		{
 			int			attnum = lfirst_int(lc);
-			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 			if (!first)
 				appendStringInfoString(buf, ", ");
@@ -2264,7 +2092,7 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 	foreach(lc, targetAttrs)
 	{
 		int			attnum = lfirst_int(lc);
-		CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
@@ -2320,7 +2148,6 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
 	ListCell   *lc,
 			   *lc2;
-	List	   *additional_conds = NIL;
 
 	/* Set up context struct for recursion */
 	context.root = root;
@@ -2362,17 +2189,17 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	{
 		List	   *ignore_conds = NIL;
 
-
 		appendStringInfoString(buf, " FROM ");
 		deparseFromExprForRel(buf, root, foreignrel, true, rtindex,
-							  &ignore_conds, &additional_conds, params_list);
+							  &ignore_conds, params_list);
 		remote_conds = list_concat(remote_conds, ignore_conds);
 	}
 
-	appendWhereClause(remote_conds, additional_conds, &context);
-
-	if (additional_conds != NIL)
-		list_free_deep(additional_conds);
+	if (remote_conds)
+	{
+		appendStringInfoString(buf, " WHERE ");
+		appendConditions(remote_conds, &context);
+	}
 
 	if (foreignrel->reloptkind == RELOPT_JOINREL)
 		deparseExplicitTargetList(returningList, true, retrieved_attrs,
@@ -2428,7 +2255,6 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 					   List **retrieved_attrs)
 {
 	deparse_expr_cxt context;
-	List	   *additional_conds = NIL;
 
 	/* Set up context struct for recursion */
 	context.root = root;
@@ -2448,14 +2274,15 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 
 		appendStringInfoString(buf, " USING ");
 		deparseFromExprForRel(buf, root, foreignrel, true, rtindex,
-							  &ignore_conds, &additional_conds, params_list);
+							  &ignore_conds, params_list);
 		remote_conds = list_concat(remote_conds, ignore_conds);
 	}
 
-	appendWhereClause(remote_conds, additional_conds, &context);
-
-	if (additional_conds != NIL)
-		list_free_deep(additional_conds);
+	if (remote_conds)
+	{
+		appendStringInfoString(buf, " WHERE ");
+		appendConditions(remote_conds, &context);
+	}
 
 	if (foreignrel->reloptkind == RELOPT_JOINREL)
 		deparseExplicitTargetList(returningList, true, retrieved_attrs,
@@ -2541,8 +2368,8 @@ deparseAnalyzeSizeSql(StringInfo buf, Relation rel)
 }
 
 /*
- * Construct SELECT statement to acquire the number of pages, the number of
- * rows, and the relkind of a relation.
+ * Construct SELECT statement to acquire the number of rows and the relkind of
+ * a relation.
  *
  * Note: we just return the remote server's reltuples value, which might
  * be off a good deal, but it doesn't seem worth working harder.  See
@@ -2557,7 +2384,7 @@ deparseAnalyzeInfoSql(StringInfo buf, Relation rel)
 	initStringInfo(&relname);
 	deparseRelation(&relname, rel);
 
-	appendStringInfoString(buf, "SELECT relpages, reltuples, relkind FROM pg_catalog.pg_class WHERE oid = ");
+	appendStringInfoString(buf, "SELECT reltuples, relkind FROM pg_catalog.pg_class WHERE oid = ");
 	deparseStringLiteral(buf, relname.data);
 	appendStringInfoString(buf, "::pg_catalog.regclass");
 }
@@ -2945,9 +2772,6 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			break;
 		case T_RelabelType:
 			deparseRelabelType((RelabelType *) node, context);
-			break;
-		case T_ArrayCoerceExpr:
-			deparseArrayCoerceExpr((ArrayCoerceExpr *) node, context);
 			break;
 		case T_BoolExpr:
 			deparseBoolExpr((BoolExpr *) node, context);
@@ -3538,24 +3362,6 @@ deparseRelabelType(RelabelType *node, deparse_expr_cxt *context)
 }
 
 /*
- * Deparse an ArrayCoerceExpr (array-type conversion) node.
- */
-static void
-deparseArrayCoerceExpr(ArrayCoerceExpr *node, deparse_expr_cxt *context)
-{
-	deparseExpr(node->arg, context);
-
-	/*
-	 * No difference how to deparse explicit cast, but if we omit implicit
-	 * cast in the query, it'll be more user-friendly
-	 */
-	if (node->coerceformat != COERCE_IMPLICIT_CAST)
-		appendStringInfo(context->buf, "::%s",
-						 deparse_type_name(node->resulttype,
-										   node->resulttypmod));
-}
-
-/*
  * Deparse a BoolExpr node.
  */
 static void
@@ -3867,7 +3673,7 @@ appendOrderBySuffix(Oid sortop, Oid sortcoltype, bool nulls_first,
  * Print the representation of a parameter to be sent to the remote side.
  *
  * Note: we always label the Param's type explicitly rather than relying on
- * transmitting a numeric type OID in PQsendQueryParams().  This allows us to
+ * transmitting a numeric type OID in PQexecParams().  This allows us to
  * avoid assuming that types have the same OIDs on the remote side as they
  * do locally --- they need only have the same names.
  */
@@ -4023,17 +3829,17 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 			appendStringInfoString(buf, ", ");
 
 		/*
-		 * Lookup the operator corresponding to the compare type in the
-		 * opclass. The datatype used by the opfamily is not necessarily the
-		 * same as the expression type (for array types for example).
+		 * Lookup the operator corresponding to the strategy in the opclass.
+		 * The datatype used by the opfamily is not necessarily the same as
+		 * the expression type (for array types for example).
 		 */
-		oprid = get_opfamily_member_for_cmptype(pathkey->pk_opfamily,
-												em->em_datatype,
-												em->em_datatype,
-												pathkey->pk_cmptype);
+		oprid = get_opfamily_member(pathkey->pk_opfamily,
+									em->em_datatype,
+									em->em_datatype,
+									pathkey->pk_strategy);
 		if (!OidIsValid(oprid))
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
-				 pathkey->pk_cmptype, em->em_datatype, em->em_datatype,
+				 pathkey->pk_strategy, em->em_datatype, em->em_datatype,
 				 pathkey->pk_opfamily);
 
 		deparseExpr(em_expr, context);

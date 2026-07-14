@@ -3,7 +3,7 @@
  * schemacmds.c
  *	  schema creation/manipulation commands
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,6 +25,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
@@ -33,7 +34,6 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -49,7 +49,7 @@ static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerI
  * a subquery.
  */
 Oid
-CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
+CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 					int stmt_location, int stmt_len)
 {
 	const char *schemaName = stmt->schemaname;
@@ -189,12 +189,12 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 
 	/*
 	 * Examine the list of commands embedded in the CREATE SCHEMA command, and
-	 * do preliminary transformations.  Note that the result is still a list
-	 * of raw parsetrees --- we cannot, in general, run parse analysis on one
-	 * statement until we have actually executed the prior ones.
+	 * reorganize them into a sequentially executable order with no forward
+	 * references.  Note that the result is still a list of raw parsetrees ---
+	 * we cannot, in general, run parse analysis on one statement until we
+	 * have actually executed the prior ones.
 	 */
-	parsetree_list = transformCreateSchemaStmtElements(pstate,
-													   stmt->schemaElts,
+	parsetree_list = transformCreateSchemaStmtElements(stmt->schemaElts,
 													   schemaName);
 
 	/*
@@ -215,11 +215,10 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 		wrapper->utilityStmt = stmt;
 		wrapper->stmt_location = stmt_location;
 		wrapper->stmt_len = stmt_len;
-		wrapper->planOrigin = PLAN_STMT_INTERNAL;
 
 		/* do this step */
 		ProcessUtility(wrapper,
-					   pstate->p_sourcetext,
+					   queryString,
 					   false,
 					   PROCESS_UTILITY_SUBCOMMAND,
 					   NULL,

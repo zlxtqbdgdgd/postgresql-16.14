@@ -3,7 +3,7 @@
  * tsvector_parser.c
  *	  Parser for tsvector
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -58,7 +58,7 @@ init_tsvector_parser(char *input, int flags, Node *escontext)
 {
 	TSVectorParseState state;
 
-	state = palloc_object(struct TSVectorParseStateData);
+	state = (TSVectorParseState) palloc(sizeof(struct TSVectorParseStateData));
 	state->prsbuf = input;
 	state->bufstart = input;
 	state->len = 32;
@@ -206,7 +206,7 @@ gettoken_tsvector(TSVectorParseState state,
 			else if ((state->oprisdelim && ISOPERATOR(state->prsbuf)) ||
 					 (state->is_web && t_iseq(state->prsbuf, '"')))
 				PRSSYNTAXERROR;
-			else if (!isspace((unsigned char) *state->prsbuf))
+			else if (!t_isspace_cstr(state->prsbuf))
 			{
 				curpos += ts_copychar_cstr(curpos, state->prsbuf);
 				statecode = WAITENDWORD;
@@ -234,7 +234,7 @@ gettoken_tsvector(TSVectorParseState state,
 				statecode = WAITNEXTCHAR;
 				oldstate = WAITENDWORD;
 			}
-			else if (isspace((unsigned char) *state->prsbuf) || *(state->prsbuf) == '\0' ||
+			else if (t_isspace_cstr(state->prsbuf) || *(state->prsbuf) == '\0' ||
 					 (state->oprisdelim && ISOPERATOR(state->prsbuf)) ||
 					 (state->is_web && t_iseq(state->prsbuf, '"')))
 			{
@@ -312,18 +312,18 @@ gettoken_tsvector(TSVectorParseState state,
 		}
 		else if (statecode == INPOSINFO)
 		{
-			if (isdigit((unsigned char) *state->prsbuf))
+			if (t_isdigit_cstr(state->prsbuf))
 			{
 				if (posalen == 0)
 				{
 					posalen = 4;
-					pos = palloc_array(WordEntryPos, posalen);
+					pos = (WordEntryPos *) palloc(sizeof(WordEntryPos) * posalen);
 					npos = 0;
 				}
 				else if (npos + 1 >= posalen)
 				{
 					posalen *= 2;
-					pos = repalloc_array(pos, WordEntryPos, posalen);
+					pos = (WordEntryPos *) repalloc(pos, sizeof(WordEntryPos) * posalen);
 				}
 				npos++;
 				WEP_SETPOS(pos[npos - 1], LIMITPOS(atoi(state->prsbuf)));
@@ -367,10 +367,10 @@ gettoken_tsvector(TSVectorParseState state,
 					PRSSYNTAXERROR;
 				WEP_SETWEIGHT(pos[npos - 1], 0);
 			}
-			else if (isspace((unsigned char) *state->prsbuf) ||
+			else if (t_isspace_cstr(state->prsbuf) ||
 					 *(state->prsbuf) == '\0')
 				RETURN_TOKEN;
-			else if (!isdigit((unsigned char) *state->prsbuf))
+			else if (!t_isdigit_cstr(state->prsbuf))
 				PRSSYNTAXERROR;
 		}
 		else					/* internal error */

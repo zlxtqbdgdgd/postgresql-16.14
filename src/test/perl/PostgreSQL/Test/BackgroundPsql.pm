@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 =pod
 
@@ -108,17 +108,14 @@ sub new
 	if ($interactive)
 	{
 		$run = IPC::Run::start $psql_params,
-		  '<pty<' => \$psql->{stdin},
-		  '>pty>' => \$psql->{stdout},
-		  '2>' => \$psql->{stderr},
+		  '<pty<', \$psql->{stdin}, '>pty>', \$psql->{stdout}, '2>',
+		  \$psql->{stderr},
 		  $psql->{timeout};
 	}
 	else
 	{
 		$run = IPC::Run::start $psql_params,
-		  '<' => \$psql->{stdin},
-		  '>' => \$psql->{stdout},
-		  '2>' => \$psql->{stderr},
+		  '<', \$psql->{stdin}, '>', \$psql->{stdout}, '2>', \$psql->{stderr},
 		  $psql->{timeout};
 	}
 
@@ -230,24 +227,18 @@ Executes a query in the current session and returns the output in scalar
 context and (output, error) in list context where error is 1 in case there
 was output generated on stderr when executing the query.
 
-By default, the query and its results are printed to the test output. This
-can be disabled by passing the keyword parameter verbose => false.
-
 =cut
 
 sub query
 {
-	my ($self, $query, %params) = @_;
+	my ($self, $query) = @_;
 	my $ret;
 	my $output;
 	my $query_cnt = $self->{query_cnt}++;
 
-	$params{verbose} = 1 unless defined $params{verbose};
-
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 
-	note "issuing query $query_cnt via background psql: $query"
-	  unless !$params{verbose};
+	note "issuing query $query_cnt via background psql: $query";
 
 	$self->{timeout}->start() if (defined($self->{query_timer_restart}));
 
@@ -281,8 +272,7 @@ sub query
 	  explain {
 		stdout => $self->{stdout},
 		stderr => $self->{stderr},
-	  }
-	  unless !$params{verbose};
+	  };
 
 	die "psql query timed out" if $self->{timeout}->is_expired;
 
@@ -313,9 +303,9 @@ Query failure is determined by it producing output on stderr.
 
 sub query_safe
 {
-	my ($self, $query, %params) = @_;
+	my ($self, $query) = @_;
 
-	my $ret = $self->query($query, %params);
+	my $ret = $self->query($query);
 
 	if ($self->{stderr} ne "")
 	{

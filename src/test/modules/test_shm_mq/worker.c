@@ -9,7 +9,7 @@
  *		but it should be possible to use much of the control logic just
  *		as presented here.
  *
- * Copyright (c) 2013-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_shm_mq/worker.c
@@ -21,8 +21,6 @@
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
-#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
@@ -52,11 +50,17 @@ test_shm_mq_main(Datum main_arg)
 	shm_toc    *toc;
 	shm_mq_handle *inqh;
 	shm_mq_handle *outqh;
-	test_shm_mq_header *hdr;
+	volatile test_shm_mq_header *hdr;
 	int			myworkernumber;
 	PGPROC	   *registrant;
 
-	/* Unblock signals.  The standard signal handlers are OK for us. */
+	/*
+	 * Establish signal handlers.
+	 *
+	 * We want CHECK_FOR_INTERRUPTS() to kill off this worker process just as
+	 * it would a normal user backend.  To make that happen, we use die().
+	 */
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	/*

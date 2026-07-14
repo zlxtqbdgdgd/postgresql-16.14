@@ -2,11 +2,7 @@
  *
  * plpython.h - Python as a procedural language for PostgreSQL
  *
- * Note: this file is #include'd by each of the sub-module header files
- * (plpy_elog.h, etc).  It's therefore unnecessary for any plpython *.c
- * files to include it directly.
- *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/pl/plpython/plpython.h
@@ -24,11 +20,6 @@
 #endif
 
 /*
- * Enable Python Limited API
- */
-#define Py_LIMITED_API 0x03020000
-
-/*
  * Pull in Python headers via a wrapper header, to control the scope of
  * the system_header pragma therein.
  */
@@ -37,5 +28,10 @@
 /* define our text domain for translations */
 #undef TEXTDOMAIN
 #define TEXTDOMAIN PG_TEXTDOMAIN("plpython")
+
+/*
+ * Used throughout, so it's easier to just include it everywhere.
+ */
+#include "plpy_util.h"
 
 #endif							/* PLPYTHON_H */

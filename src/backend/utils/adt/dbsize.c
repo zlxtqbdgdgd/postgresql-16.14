@@ -2,7 +2,7 @@
  * dbsize.c
  *		Database object size functions, and related inquiries
  *
- * Copyright (c) 2002-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/dbsize.c
@@ -15,16 +15,17 @@
 
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
+#include "commands/dbcommands.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
@@ -143,7 +144,7 @@ calculate_database_size(Oid dbOid)
 	totalsize = db_dir_size(pathname);
 
 	/* Scan the non-default tablespaces */
-	snprintf(dirpath, MAXPGPATH, PG_TBLSPC_DIR);
+	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
 	dirdesc = AllocateDir(dirpath);
 
 	while ((direntry = ReadDir(dirdesc, dirpath)) != NULL)
@@ -154,8 +155,8 @@ calculate_database_size(Oid dbOid)
 			strcmp(direntry->d_name, "..") == 0)
 			continue;
 
-		snprintf(pathname, sizeof(pathname), "%s/%s/%s/%u",
-				 PG_TBLSPC_DIR, direntry->d_name, TABLESPACE_VERSION_DIRECTORY, dbOid);
+		snprintf(pathname, sizeof(pathname), "pg_tblspc/%s/%s/%u",
+				 direntry->d_name, TABLESPACE_VERSION_DIRECTORY, dbOid);
 		totalsize += db_dir_size(pathname);
 	}
 
@@ -169,15 +170,6 @@ pg_database_size_oid(PG_FUNCTION_ARGS)
 {
 	Oid			dbOid = PG_GETARG_OID(0);
 	int64		size;
-
-	/*
-	 * Not needed for correctness, but avoid non-user-facing error message
-	 * later if the database doesn't exist.
-	 */
-	if (!SearchSysCacheExists1(DATABASEOID, ObjectIdGetDatum(dbOid)))
-		ereport(ERROR,
-				errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("database with OID %u does not exist", dbOid));
 
 	size = calculate_database_size(dbOid);
 
@@ -236,7 +228,7 @@ calculate_tablespace_size(Oid tblspcOid)
 	else if (tblspcOid == GLOBALTABLESPACE_OID)
 		snprintf(tblspcPath, MAXPGPATH, "global");
 	else
-		snprintf(tblspcPath, MAXPGPATH, "%s/%u/%s", PG_TBLSPC_DIR, tblspcOid,
+		snprintf(tblspcPath, MAXPGPATH, "pg_tblspc/%u/%s", tblspcOid,
 				 TABLESPACE_VERSION_DIRECTORY);
 
 	dirdesc = AllocateDir(tblspcPath);
@@ -283,15 +275,6 @@ pg_tablespace_size_oid(PG_FUNCTION_ARGS)
 	Oid			tblspcOid = PG_GETARG_OID(0);
 	int64		size;
 
-	/*
-	 * Not needed for correctness, but avoid non-user-facing error message
-	 * later if the tablespace doesn't exist.
-	 */
-	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tblspcOid)))
-		ereport(ERROR,
-				errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("tablespace with OID %u does not exist", tblspcOid));
-
 	size = calculate_tablespace_size(tblspcOid);
 
 	if (size < 0)
@@ -323,10 +306,10 @@ pg_tablespace_size_name(PG_FUNCTION_ARGS)
  * is no check here or at the call sites for that.
  */
 static int64
-calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber forknum)
+calculate_relation_size(RelFileLocator *rfn, BackendId backend, ForkNumber forknum)
 {
 	int64		totalsize = 0;
-	RelPathStr	relationpath;
+	char	   *relationpath;
 	char		pathname[MAXPGPATH];
 	unsigned int segcount = 0;
 
@@ -340,10 +323,10 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 
 		if (segcount == 0)
 			snprintf(pathname, MAXPGPATH, "%s",
-					 relationpath.str);
+					 relationpath);
 		else
 			snprintf(pathname, MAXPGPATH, "%s.%u",
-					 relationpath.str, segcount);
+					 relationpath, segcount);
 
 		if (stat(pathname, &fst) < 0)
 		{
@@ -975,8 +958,8 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 	HeapTuple	tuple;
 	Form_pg_class relform;
 	RelFileLocator rlocator;
-	ProcNumber	backend;
-	RelPathStr	path;
+	BackendId	backend;
+	char	   *path;
 
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tuple))
@@ -1020,21 +1003,21 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-			backend = INVALID_PROC_NUMBER;
+			backend = InvalidBackendId;
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relform->relnamespace))
-				backend = ProcNumberForTempRelations();
+				backend = BackendIdForTempRelations();
 			else
 			{
 				/* Do it the hard way. */
-				backend = GetTempNamespaceProcNumber(relform->relnamespace);
-				Assert(backend != INVALID_PROC_NUMBER);
+				backend = GetTempNamespaceBackendId(relform->relnamespace);
+				Assert(backend != InvalidBackendId);
 			}
 			break;
 		default:
 			elog(ERROR, "invalid relpersistence: %c", relform->relpersistence);
-			backend = INVALID_PROC_NUMBER;	/* placate compiler */
+			backend = InvalidBackendId; /* placate compiler */
 			break;
 	}
 
@@ -1042,5 +1025,5 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 
 	path = relpathbackend(rlocator, backend, MAIN_FORKNUM);
 
-	PG_RETURN_TEXT_P(cstring_to_text(path.str));
+	PG_RETURN_TEXT_P(cstring_to_text(path));
 }

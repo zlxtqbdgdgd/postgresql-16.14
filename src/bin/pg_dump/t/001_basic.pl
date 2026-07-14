@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -46,32 +46,14 @@ command_fails_like(
 
 command_fails_like(
 	[ 'pg_dump', '-s', '-a' ],
-	qr/\Qpg_dump: error: options -a\/--data-only and -s\/--schema-only cannot be used together\E/,
-	'pg_dump: options -a/--data-only and -s/--schema-only cannot be used together'
-);
-
-command_fails_like(
-	[ 'pg_dump', '-s', '--statistics-only' ],
-	qr/\Qpg_dump: error: options -s\/--schema-only and --statistics-only cannot be used together\E/,
-	'pg_dump: error: options -s/--schema-only and --statistics-only cannot be used together'
-);
-
-command_fails_like(
-	[ 'pg_dump', '-a', '--statistics-only' ],
-	qr/\Qpg_dump: error: options -a\/--data-only and --statistics-only cannot be used together\E/,
-	'pg_dump: error: options -a/--data-only and --statistics-only cannot be used together'
+	qr/\Qpg_dump: error: options -s\/--schema-only and -a\/--data-only cannot be used together\E/,
+	'pg_dump: options -s/--schema-only and -a/--data-only cannot be used together'
 );
 
 command_fails_like(
 	[ 'pg_dump', '-s', '--include-foreign-data=xxx' ],
-	qr/\Qpg_dump: error: options --include-foreign-data and -s\/--schema-only cannot be used together\E/,
-	'pg_dump: options --include-foreign-data and -s/--schema-only cannot be used together'
-);
-
-command_fails_like(
-	[ 'pg_dump', '--statistics-only', '--no-statistics' ],
-	qr/\Qpg_dump: error: options --statistics-only and --no-statistics cannot be used together\E/,
-	'pg_dump: options --statistics-only and --no-statistics cannot be used together'
+	qr/\Qpg_dump: error: options -s\/--schema-only and --include-foreign-data cannot be used together\E/,
+	'pg_dump: options -s/--schema-only and --include-foreign-data cannot be used together'
 );
 
 command_fails_like(
@@ -100,12 +82,6 @@ command_fails_like(
 	[ 'pg_dump', '-c', '-a' ],
 	qr/\Qpg_dump: error: options -c\/--clean and -a\/--data-only cannot be used together\E/,
 	'pg_dump: options -c/--clean and -a/--data-only cannot be used together');
-
-command_fails_like(
-	[ 'pg_dumpall', '-c', '-a' ],
-	qr/\Qpg_dumpall: error: options -c\/--clean and -a\/--data-only cannot be used together\E/,
-	'pg_dumpall: options -c/--clean and -a/--data-only cannot be used together'
-);
 
 command_fails_like(
 	[ 'pg_restore', '-c', '-a', '-f -' ],

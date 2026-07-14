@@ -2,21 +2,24 @@
  * ginfuncs.c
  *		Functions to investigate the content of GIN indexes
  *
- * Copyright (c) 2014-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/ginfuncs.c
  */
 #include "postgres.h"
 
+#include "access/gin.h"
 #include "access/gin_private.h"
 #include "access/htup_details.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 
 
 PG_FUNCTION_INFO_V1(gin_metapage_info);
@@ -222,7 +225,7 @@ gin_leafpage_items(PG_FUNCTION_ARGS)
 							   opaq->flags,
 							   (GIN_DATA | GIN_LEAF | GIN_COMPRESSED))));
 
-		inter_call_data = palloc_object(gin_leafpage_items_state);
+		inter_call_data = palloc(sizeof(gin_leafpage_items_state));
 
 		/* Build a tuple descriptor for our result type */
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -258,7 +261,7 @@ gin_leafpage_items(PG_FUNCTION_ARGS)
 		memset(nulls, 0, sizeof(nulls));
 
 		values[0] = ItemPointerGetDatum(&cur->first);
-		values[1] = Int16GetDatum(cur->nbytes);
+		values[1] = UInt16GetDatum(cur->nbytes);
 
 		/* build an array of decoded item pointers */
 		tids = ginPostingListDecode(cur, &ndecoded);

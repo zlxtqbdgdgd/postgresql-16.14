@@ -1,10 +1,10 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Verify that ALTER TABLE optimizes certain operations as expected
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -58,9 +58,8 @@ run_sql_command(
 # normal run will verify table data
 $output = run_sql_command('alter table atacc1 alter test_a set not null;');
 ok(!is_table_verified($output), 'with constraint will not scan table');
-like(
-	$output,
-	qr/existing constraints on column "atacc1.test_a" are sufficient to prove that it does not contain nulls/,
+ok( $output =~
+	  m/existing constraints on column "atacc1.test_a" are sufficient to prove that it does not contain nulls/,
 	'test_a proved by constraints');
 
 run_sql_command('alter table atacc1 alter test_a drop not null;');
@@ -71,9 +70,9 @@ $output = run_sql_command(
 );
 ok(is_table_verified($output), 'table was scanned');
 # we may miss debug message for test_a constraint because we need verify table due test_b
-unlike(
-	$output,
-	qr/existing constraints on column "atacc1.test_b" are sufficient to prove that it does not contain nulls/,
+ok( !(  $output =~
+		m/existing constraints on column "atacc1.test_b" are sufficient to prove that it does not contain nulls/
+	),
 	'test_b not proved by wrong constraints');
 run_sql_command(
 	'alter table atacc1 alter test_a drop not null, alter test_b drop not null;'
@@ -87,13 +86,11 @@ $output = run_sql_command(
 	'alter table atacc1 alter test_b set not null, alter test_a set not null;'
 );
 ok(!is_table_verified($output), 'table was not scanned for both columns');
-like(
-	$output,
-	qr/existing constraints on column "atacc1.test_a" are sufficient to prove that it does not contain nulls/,
+ok( $output =~
+	  m/existing constraints on column "atacc1.test_a" are sufficient to prove that it does not contain nulls/,
 	'test_a proved by constraints');
-like(
-	$output,
-	qr/existing constraints on column "atacc1.test_b" are sufficient to prove that it does not contain nulls/,
+ok( $output =~
+	  m/existing constraints on column "atacc1.test_b" are sufficient to prove that it does not contain nulls/,
 	'test_b proved by constraints');
 run_sql_command('drop table atacc1;');
 
@@ -122,9 +119,8 @@ $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION part_3_4 FOR VALUES IN (3, 4);'
 );
 ok(!is_table_verified($output), 'table part_3_4 not scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_3_4" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_3_4" is implied by existing constraints/,
 	'part_3_4 verified by existing constraints');
 
 # test attach default partition
@@ -135,18 +131,16 @@ run_sql_command(
 $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION list_parted2_def default;');
 ok(!is_table_verified($output), 'table list_parted2_def not scanned');
-like(
-	$output,
-	qr/partition constraint for table "list_parted2_def" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "list_parted2_def" is implied by existing constraints/,
 	'list_parted2_def verified by existing constraints');
 
 $output = run_sql_command(
 	'CREATE TABLE part_55_66 PARTITION OF list_parted2 FOR VALUES IN (55, 66);'
 );
 ok(!is_table_verified($output), 'table list_parted2_def not scanned');
-like(
-	$output,
-	qr/updated partition constraint for default partition "list_parted2_def" is implied by existing constraints/,
+ok( $output =~
+	  m/updated partition constraint for default partition "list_parted2_def" is implied by existing constraints/,
 	'updated partition constraint for default partition list_parted2_def');
 
 # test attach another partitioned table
@@ -159,14 +153,11 @@ run_sql_command(
 );
 $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5);');
-unlike($output, qr/verifying table "part_5"/, 'table part_5 not scanned');
-like(
-	$output,
-	qr/verifying table "list_parted2_def"/,
+ok(!($output =~ m/verifying table "part_5"/), 'table part_5 not scanned');
+ok($output =~ m/verifying table "list_parted2_def"/,
 	'list_parted2_def scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_5" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_5" is implied by existing constraints/,
 	'part_5 verified by existing constraints');
 
 run_sql_command(
@@ -180,14 +171,11 @@ run_sql_command(
 );
 $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5);');
-unlike($output, qr/verifying table "part_5"/, 'table part_5 not scanned');
-like(
-	$output,
-	qr/verifying table "list_parted2_def"/,
+ok(!($output =~ m/verifying table "part_5"/), 'table part_5 not scanned');
+ok($output =~ m/verifying table "list_parted2_def"/,
 	'list_parted2_def scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_5" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_5" is implied by existing constraints/,
 	'part_5 verified by existing constraints');
 
 # Check the case where attnos of the partitioning columns in the table being
@@ -202,14 +190,11 @@ run_sql_command(
 	ALTER TABLE part_6 DROP c;');
 $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION part_6 FOR VALUES IN (6);');
-unlike($output, qr/verifying table "part_6"/, 'table part_6 not scanned');
-like(
-	$output,
-	qr/verifying table "list_parted2_def"/,
+ok(!($output =~ m/verifying table "part_6"/), 'table part_6 not scanned');
+ok($output =~ m/verifying table "list_parted2_def"/,
 	'list_parted2_def scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_6" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_6" is implied by existing constraints/,
 	'part_6 verified by existing constraints');
 
 # Similar to above, but the table being attached is a partitioned table
@@ -234,20 +219,17 @@ $output = run_sql_command(
 	'ALTER TABLE part_7 ATTACH PARTITION part_7_a_null FOR VALUES IN (\'a\', null);'
 );
 ok(!is_table_verified($output), 'table not scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_7_a_null" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_7_a_null" is implied by existing constraints/,
 	'part_7_a_null verified by existing constraints');
 $output = run_sql_command(
 	'ALTER TABLE list_parted2 ATTACH PARTITION part_7 FOR VALUES IN (7);');
 ok(!is_table_verified($output), 'tables not scanned');
-like(
-	$output,
-	qr/partition constraint for table "part_7" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "part_7" is implied by existing constraints/,
 	'part_7 verified by existing constraints');
-like(
-	$output,
-	qr/updated partition constraint for default partition "list_parted2_def" is implied by existing constraints/,
+ok( $output =~
+	  m/updated partition constraint for default partition "list_parted2_def" is implied by existing constraints/,
 	'updated partition constraint for default partition list_parted2_def');
 
 run_sql_command(
@@ -263,9 +245,9 @@ $output = run_sql_command(
 	'ALTER TABLE range_parted ATTACH PARTITION range_part1 FOR VALUES FROM (1, 1) TO (1, 10);'
 );
 ok(is_table_verified($output), 'table range_part1 scanned');
-unlike(
-	$output,
-	qr/partition constraint for table "range_part1" is implied by existing constraints/,
+ok( !(  $output =~
+		m/partition constraint for table "range_part1" is implied by existing constraints/
+	),
 	'range_part1 not verified by existing constraints');
 
 run_sql_command(
@@ -277,9 +259,8 @@ $output = run_sql_command(
 	'ALTER TABLE range_parted ATTACH PARTITION range_part2 FOR VALUES FROM (1, 10) TO (1, 20);'
 );
 ok(!is_table_verified($output), 'table range_part2 not scanned');
-like(
-	$output,
-	qr/partition constraint for table "range_part2" is implied by existing constraints/,
+ok( $output =~
+	  m/partition constraint for table "range_part2" is implied by existing constraints/,
 	'range_part2 verified by existing constraints');
 
 # If a partitioned table being created or an existing table being attached
@@ -297,22 +278,19 @@ run_sql_command(
 $output = run_sql_command(
 	'ALTER TABLE quuux ATTACH PARTITION quuux1 FOR VALUES IN (1);');
 ok(is_table_verified($output), 'quuux1 table scanned');
-unlike(
-	$output,
-	qr/partition constraint for table "quuux1" is implied by existing constraints/,
+ok( !(  $output =~
+		m/partition constraint for table "quuux1" is implied by existing constraints/
+	),
 	'quuux1 verified by existing constraints');
 
 run_sql_command('CREATE TABLE quuux2 (a int, b text);');
 $output = run_sql_command(
 	'ALTER TABLE quuux ATTACH PARTITION quuux2 FOR VALUES IN (2);');
-unlike(
-	$output,
-	qr/verifying table "quuux_default1"/,
+ok(!($output =~ m/verifying table "quuux_default1"/),
 	'quuux_default1 not scanned');
-like($output, qr/verifying table "quuux2"/, 'quuux2 scanned');
-like(
-	$output,
-	qr/updated partition constraint for default partition "quuux_default1" is implied by existing constraints/,
+ok($output =~ m/verifying table "quuux2"/, 'quuux2 scanned');
+ok( $output =~
+	  m/updated partition constraint for default partition "quuux_default1" is implied by existing constraints/,
 	'updated partition constraint for default partition quuux_default1');
 run_sql_command('DROP TABLE quuux1, quuux2;');
 
@@ -320,16 +298,15 @@ run_sql_command('DROP TABLE quuux1, quuux2;');
 $output = run_sql_command(
 	'CREATE TABLE quuux1 PARTITION OF quuux FOR VALUES IN (1);');
 ok(!is_table_verified($output), 'tables not scanned');
-unlike(
-	$output,
-	qr/partition constraint for table "quuux1" is implied by existing constraints/,
+ok( !(  $output =~
+		m/partition constraint for table "quuux1" is implied by existing constraints/
+	),
 	'quuux1 verified by existing constraints');
 $output = run_sql_command(
 	'CREATE TABLE quuux2 PARTITION OF quuux FOR VALUES IN (2);');
 ok(!is_table_verified($output), 'tables not scanned');
-like(
-	$output,
-	qr/updated partition constraint for default partition "quuux_default1" is implied by existing constraints/,
+ok( $output =~
+	  m/updated partition constraint for default partition "quuux_default1" is implied by existing constraints/,
 	'updated partition constraint for default partition quuux_default1');
 run_sql_command('DROP TABLE quuux;');
 

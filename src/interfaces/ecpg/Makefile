@@ -2,12 +2,7 @@ subdir = src/interfaces/ecpg
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = \
-	compatlib \
-	ecpglib \
-	include \
-	pgtypeslib \
-	preproc
+SUBDIRS = include pgtypeslib ecpglib compatlib preproc
 
 # Suppress parallel build of subdirectories to avoid a bug in GNU make 3.82, cf
 # https://savannah.gnu.org/bugs/?30653
@@ -28,7 +23,7 @@ install-pgtypeslib-recurse install-ecpglib-recurse install-compatlib-recurse ins
 install-compatlib-recurse: install-ecpglib-recurse
 install-ecpglib-recurse: install-pgtypeslib-recurse
 
-clean distclean:
+clean distclean maintainer-clean:
 	$(MAKE) -C test clean
 
 checktcp: | temp-install

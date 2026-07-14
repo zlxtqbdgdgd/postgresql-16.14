@@ -4,7 +4,7 @@
  *
  *	  Routines for tsearch manipulation commands
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "common/string.h"
@@ -40,8 +41,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
 #include "tsearch/ts_cache.h"
-#include "tsearch/ts_public.h"
-#include "utils/acl.h"
+#include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -1027,7 +1027,7 @@ DefineTSConfiguration(List *names, List *parameters, ObjectAddress *copied)
 		 * know that they will be used.
 		 */
 		max_slots = MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_ts_config_map);
-		slot = palloc_array(TupleTableSlot *, max_slots);
+		slot = palloc(sizeof(TupleTableSlot *) * max_slots);
 
 		ScanKeyInit(&skey,
 					Anum_pg_ts_config_map_mapcfg,
@@ -1058,10 +1058,10 @@ DefineTSConfiguration(List *names, List *parameters, ObjectAddress *copied)
 			memset(slot[slot_stored_count]->tts_isnull, false,
 				   slot[slot_stored_count]->tts_tupleDescriptor->natts * sizeof(bool));
 
-			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapcfg - 1] = ObjectIdGetDatum(cfgOid);
-			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_maptokentype - 1] = Int32GetDatum(cfgmap->maptokentype);
-			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapseqno - 1] = Int32GetDatum(cfgmap->mapseqno);
-			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapdict - 1] = ObjectIdGetDatum(cfgmap->mapdict);
+			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapcfg - 1] = cfgOid;
+			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_maptokentype - 1] = cfgmap->maptokentype;
+			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapseqno - 1] = cfgmap->mapseqno;
+			slot[slot_stored_count]->tts_values[Anum_pg_ts_config_map_mapdict - 1] = cfgmap->mapdict;
 
 			ExecStoreVirtualTuple(slot[slot_stored_count]);
 			slot_stored_count++;
@@ -1261,7 +1261,7 @@ getTokenTypes(Oid prsId, List *tokennames)
 		{
 			if (strcmp(strVal(val), list[j].alias) == 0)
 			{
-				TSTokenTypeItem *ts = palloc0_object(TSTokenTypeItem);
+				TSTokenTypeItem *ts = (TSTokenTypeItem *) palloc0(sizeof(TSTokenTypeItem));
 
 				ts->num = list[j].lexid;
 				ts->name = pstrdup(strVal(val));
@@ -1344,7 +1344,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	 * Convert list of dictionary names to array of dict OIDs
 	 */
 	ndict = list_length(stmt->dicts);
-	dictIds = palloc_array(Oid, ndict);
+	dictIds = (Oid *) palloc(sizeof(Oid) * ndict);
 	i = 0;
 	foreach(c, stmt->dicts)
 	{
@@ -1432,7 +1432,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 		/* Allocate the slots to use and initialize them */
 		nslots = Min(ntoken * ndict,
 					 MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_ts_config_map));
-		slot = palloc_array(TupleTableSlot *, nslots);
+		slot = palloc(sizeof(TupleTableSlot *) * nslots);
 		for (i = 0; i < nslots; i++)
 			slot[i] = MakeSingleTupleTableSlot(RelationGetDescr(relMap),
 											   &TTSOpsHeapTuple);

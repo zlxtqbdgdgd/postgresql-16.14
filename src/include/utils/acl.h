@@ -4,7 +4,7 @@
  *	  Definition of (and support for) access control list data structures.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/acl.h
@@ -148,16 +148,15 @@ typedef struct ArrayType Acl;
 #define ACL_CONNECT_CHR			'c'
 #define ACL_SET_CHR				's'
 #define ACL_ALTER_SYSTEM_CHR	'A'
-#define ACL_MAINTAIN_CHR		'm'
 
 /* string holding all privilege code chars, in order by bitmask position */
-#define ACL_ALL_RIGHTS_STR	"arwdDxtXUCTcsAm"
+#define ACL_ALL_RIGHTS_STR	"arwdDxtXUCTcsA"
 
 /*
  * Bitmasks defining "all rights" for each supported object type
  */
 #define ACL_ALL_RIGHTS_COLUMN		(ACL_INSERT|ACL_SELECT|ACL_UPDATE|ACL_REFERENCES)
-#define ACL_ALL_RIGHTS_RELATION		(ACL_INSERT|ACL_SELECT|ACL_UPDATE|ACL_DELETE|ACL_TRUNCATE|ACL_REFERENCES|ACL_TRIGGER|ACL_MAINTAIN)
+#define ACL_ALL_RIGHTS_RELATION		(ACL_INSERT|ACL_SELECT|ACL_UPDATE|ACL_DELETE|ACL_TRUNCATE|ACL_REFERENCES|ACL_TRIGGER)
 #define ACL_ALL_RIGHTS_SEQUENCE		(ACL_USAGE|ACL_SELECT|ACL_UPDATE)
 #define ACL_ALL_RIGHTS_DATABASE		(ACL_CREATE|ACL_CREATE_TEMP|ACL_CONNECT)
 #define ACL_ALL_RIGHTS_FDW			(ACL_USAGE)
@@ -166,7 +165,6 @@ typedef struct ArrayType Acl;
 #define ACL_ALL_RIGHTS_LANGUAGE		(ACL_USAGE)
 #define ACL_ALL_RIGHTS_LARGEOBJECT	(ACL_SELECT|ACL_UPDATE)
 #define ACL_ALL_RIGHTS_PARAMETER_ACL (ACL_SET|ACL_ALTER_SYSTEM)
-#define ACL_ALL_RIGHTS_PROPGRAPH	(ACL_SELECT)
 #define ACL_ALL_RIGHTS_SCHEMA		(ACL_USAGE|ACL_CREATE)
 #define ACL_ALL_RIGHTS_TABLESPACE	(ACL_CREATE)
 #define ACL_ALL_RIGHTS_TYPE			(ACL_USAGE)
@@ -175,7 +173,7 @@ typedef struct ArrayType Acl;
 typedef enum
 {
 	ACLMASK_ALL,				/* normal case: compute all bits */
-	ACLMASK_ANY,				/* return when result is known nonzero */
+	ACLMASK_ANY					/* return when result is known nonzero */
 } AclMaskHow;
 
 /* result codes for pg_*_aclcheck */
@@ -183,7 +181,7 @@ typedef enum
 {
 	ACLCHECK_OK = 0,
 	ACLCHECK_NO_PRIV,
-	ACLCHECK_NOT_OWNER,
+	ACLCHECK_NOT_OWNER
 } AclResult;
 
 
@@ -224,7 +222,7 @@ extern void check_rolespec_name(const RoleSpec *role, const char *detail_msg);
 extern HeapTuple get_rolespec_tuple(const RoleSpec *role);
 extern char *get_rolespec_name(const RoleSpec *role);
 
-extern void select_best_grantor(const RoleSpec *grantedBy, AclMode privileges,
+extern void select_best_grantor(Oid roleId, AclMode privileges,
 								const Acl *acl, Oid ownerId,
 								Oid *grantorId, AclMode *grantOptions);
 
@@ -241,12 +239,8 @@ extern void RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid);
 extern AclMode pg_class_aclmask(Oid table_oid, Oid roleid,
 								AclMode mask, AclMaskHow how);
 
-/* generic functions */
-extern AclResult object_aclcheck(Oid classid, Oid objectid,
-								 Oid roleid, AclMode mode);
-extern AclResult object_aclcheck_ext(Oid classid, Oid objectid,
-									 Oid roleid, AclMode mode,
-									 bool *is_missing);
+/* generic function */
+extern AclResult object_aclcheck(Oid classid, Oid objectid, Oid roleid, AclMode mode);
 
 /* special cases */
 extern AclResult pg_attribute_aclcheck(Oid table_oid, AttrNumber attnum,
@@ -256,9 +250,6 @@ extern AclResult pg_attribute_aclcheck_ext(Oid table_oid, AttrNumber attnum,
 										   bool *is_missing);
 extern AclResult pg_attribute_aclcheck_all(Oid table_oid, Oid roleid,
 										   AclMode mode, AclMaskHow how);
-extern AclResult pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
-											   AclMode mode, AclMaskHow how,
-											   bool *is_missing);
 extern AclResult pg_class_aclcheck(Oid table_oid, Oid roleid, AclMode mode);
 extern AclResult pg_class_aclcheck_ext(Oid table_oid, Oid roleid,
 									   AclMode mode, bool *is_missing);
@@ -277,10 +268,6 @@ extern void aclcheck_error_type(AclResult aclerr, Oid typeOid);
 
 extern void recordExtObjInitPriv(Oid objoid, Oid classoid);
 extern void removeExtObjInitPriv(Oid objoid, Oid classoid);
-extern void ReplaceRoleInInitPriv(Oid oldroleid, Oid newroleid,
-								  Oid classid, Oid objid, int32 objsubid);
-extern void RemoveRoleFromInitPriv(Oid roleid,
-								   Oid classid, Oid objid, int32 objsubid);
 
 
 /* ownercheck routines just return true (owner) or false (not) */

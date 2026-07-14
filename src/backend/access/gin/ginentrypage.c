@@ -4,7 +4,7 @@
  *	  routines for handling GIN entry tree pages.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,6 +17,7 @@
 #include "access/gin_private.h"
 #include "access/ginxlog.h"
 #include "access/xloginsert.h"
+#include "miscadmin.h"
 #include "utils/rel.h"
 
 static void entrySplitPage(GinBtree btree, Buffer origbuf,
@@ -171,7 +172,7 @@ ginReadTuple(GinState *ginstate, OffsetNumber attnum, IndexTuple itup,
 	{
 		if (nipd > 0)
 		{
-			ipd = ginPostingListDecode(ptr, &ndecoded);
+			ipd = ginPostingListDecode((GinPostingList *) ptr, &ndecoded);
 			if (nipd != ndecoded)
 				elog(ERROR, "number of items mismatch in GIN entry tuple, %d in tuple header, %d decoded",
 					 nipd, ndecoded);
@@ -183,7 +184,7 @@ ginReadTuple(GinState *ginstate, OffsetNumber attnum, IndexTuple itup,
 	}
 	else
 	{
-		ipd = palloc_array(ItemPointerData, nipd);
+		ipd = (ItemPointer) palloc(sizeof(ItemPointerData) * nipd);
 		memcpy(ipd, ptr, sizeof(ItemPointerData) * nipd);
 	}
 	*nitems = nipd;
@@ -563,14 +564,12 @@ entryExecPlaceToPage(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 	entryPreparePage(btree, page, off, insertData, updateblkno);
 
 	placed = PageAddItem(page,
-						 insertData->entry,
+						 (Item) insertData->entry,
 						 IndexTupleSize(insertData->entry),
 						 off, false, false);
 	if (placed != off)
 		elog(ERROR, "failed to add item to index page in \"%s\"",
 			 RelationGetRelationName(btree->index));
-
-	MarkBufferDirty(buf);
 
 	if (RelationNeedsWAL(btree->index) && !btree->isBuild)
 	{
@@ -584,10 +583,9 @@ entryExecPlaceToPage(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 		data.isDelete = insertData->isDelete;
 		data.offset = off;
 
-		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterBufData(0, &data,
+		XLogRegisterBufData(0, (char *) &data,
 							offsetof(ginxlogInsertEntry, tuple));
-		XLogRegisterBufData(0, insertData->entry,
+		XLogRegisterBufData(0, (char *) insertData->entry,
 							IndexTupleSize(insertData->entry));
 	}
 }
@@ -684,7 +682,7 @@ entrySplitPage(GinBtree btree, Buffer origbuf,
 			lsize += MAXALIGN(IndexTupleSize(itup)) + sizeof(ItemIdData);
 		}
 
-		if (PageAddItem(page, itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+		if (PageAddItem(page, (Item) itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 			elog(ERROR, "failed to add item to index page in \"%s\"",
 				 RelationGetRelationName(btree->index));
 		ptr += MAXALIGN(IndexTupleSize(itup));
@@ -708,7 +706,7 @@ entryPrepareDownlink(GinBtree btree, Buffer lbuf)
 
 	itup = getRightMostTuple(lpage);
 
-	insertData = palloc_object(GinBtreeEntryInsertData);
+	insertData = palloc(sizeof(GinBtreeEntryInsertData));
 	insertData->entry = GinFormInteriorTuple(itup, lpage, lblkno);
 	insertData->isDelete = false;
 
@@ -727,12 +725,12 @@ ginEntryFillRoot(GinBtree btree, Page root,
 	IndexTuple	itup;
 
 	itup = GinFormInteriorTuple(getRightMostTuple(lpage), lpage, lblkno);
-	if (PageAddItem(root, itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+	if (PageAddItem(root, (Item) itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add item to index root page");
 	pfree(itup);
 
 	itup = GinFormInteriorTuple(getRightMostTuple(rpage), rpage, rblkno);
-	if (PageAddItem(root, itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+	if (PageAddItem(root, (Item) itup, IndexTupleSize(itup), InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add item to index root page");
 	pfree(itup);
 }

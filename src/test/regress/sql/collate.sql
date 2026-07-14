@@ -244,14 +244,6 @@ EXPLAIN (COSTS OFF)
 
 -- CREATE/DROP COLLATION
 
-CREATE COLLATION builtin_c ( PROVIDER = builtin, LOCALE = "C" );
-
-SELECT b FROM collate_test1 ORDER BY b COLLATE builtin_c;
-
-CREATE COLLATION builtin2 ( PROVIDER = builtin ); -- fails
-CREATE COLLATION builtin2 ( PROVIDER = builtin, LOCALE = "en_US" ); -- fails
-CREATE COLLATION builtin2 ( PROVIDER = builtin, LC_CTYPE = "C", LC_COLLATE = "C" ); -- fails
-
 CREATE COLLATION mycoll1 FROM "C";
 CREATE COLLATION mycoll2 ( LC_COLLATE = "POSIX", LC_CTYPE = "POSIX" );
 CREATE COLLATION mycoll3 FROM "default";  -- intentionally unsupported
@@ -301,16 +293,6 @@ CREATE COLLATION coll_dup_chk (LC_COLLATE = "POSIX", LOCALE = '');
 CREATE COLLATION coll_dup_chk (LC_CTYPE = "POSIX", LOCALE = '');
 -- FROM conflicts with any other option
 CREATE COLLATION coll_dup_chk (FROM = "C", VERSION = "1");
-
--- Regex exact-match optimization should use an index even when the expression
--- and index have different collations, so long as the expression's collation
--- is deterministic.  This example tests what we want because the optimizer
--- does not perceive "C" collation (used by the system catalogs) as identical
--- to "POSIX" collation.
-EXPLAIN (COSTS OFF)
-SELECT * FROM pg_class WHERE relname ~ '^pg_class$' COLLATE "POSIX";
-EXPLAIN (COSTS OFF)
-SELECT * FROM pg_class WHERE relname LIKE 'pg\_class' COLLATE "POSIX";
 
 --
 -- Clean up.  Many of these table names will be re-used if the user is

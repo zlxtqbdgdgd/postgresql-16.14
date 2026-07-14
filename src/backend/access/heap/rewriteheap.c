@@ -87,12 +87,12 @@
  * is optimized for bulk inserting a lot of tuples, knowing that we have
  * exclusive access to the heap.  raw_heap_insert builds new pages in
  * local storage.  When a page is full, or at the end of the process,
- * we insert it to WAL as a single record and then write it to disk with
- * the bulk smgr writer.  Note, however, that any data sent to the new
+ * we insert it to WAL as a single record and then write it to disk
+ * directly through smgr.  Note, however, that any data sent to the new
  * heap's TOAST table will go through the normal bufmgr.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -111,18 +111,19 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "catalog/catalog.h"
 #include "common/file_utils.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "replication/logical.h"
 #include "replication/slot.h"
 #include "storage/bufmgr.h"
-#include "storage/bulk_write.h"
 #include "storage/fd.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "utils/wait_event.h"
 
 /*
  * State associated with a rewrite operation. This is opaque to the user
@@ -132,9 +133,9 @@ typedef struct RewriteStateData
 {
 	Relation	rs_old_rel;		/* source heap */
 	Relation	rs_new_rel;		/* destination heap */
-	BulkWriteState *rs_bulkstate;	/* writer for the destination */
-	BulkWriteBuffer rs_buffer;	/* page currently being built */
+	Page		rs_buffer;		/* page currently being built */
 	BlockNumber rs_blockno;		/* block where page will go */
+	bool		rs_buffer_valid;	/* T if any tuples in buffer */
 	bool		rs_logical_rewrite; /* do we need to do logical rewriting */
 	TransactionId rs_oldest_xmin;	/* oldest xmin used by caller to determine
 									 * tuple visibility */
@@ -151,7 +152,7 @@ typedef struct RewriteStateData
 	HTAB	   *rs_old_new_tid_map; /* unmatched B tuples */
 	HTAB	   *rs_logical_mappings;	/* logical remapping files */
 	uint32		rs_num_rewrite_mappings;	/* # in memory mappings */
-} RewriteStateData;
+}			RewriteStateData;
 
 /*
  * The lookup keys for the hash tables are tuple TID and xmin (we must check
@@ -250,18 +251,18 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	old_cxt = MemoryContextSwitchTo(rw_cxt);
 
 	/* Create and fill in the state struct */
-	state = palloc0_object(RewriteStateData);
+	state = palloc0(sizeof(RewriteStateData));
 
 	state->rs_old_rel = old_heap;
 	state->rs_new_rel = new_heap;
-	state->rs_buffer = NULL;
+	state->rs_buffer = (Page) palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
 	/* new_heap needn't be empty, just locked */
 	state->rs_blockno = RelationGetNumberOfBlocks(new_heap);
+	state->rs_buffer_valid = false;
 	state->rs_oldest_xmin = oldest_xmin;
 	state->rs_freeze_xid = freeze_xid;
 	state->rs_cutoff_multi = cutoff_multi;
 	state->rs_cxt = rw_cxt;
-	state->rs_bulkstate = smgr_bulk_start_rel(new_heap, MAIN_FORKNUM);
 
 	/* Initialize hash tables used to track update chains */
 	hash_ctl.keysize = sizeof(TidHashKey);
@@ -313,13 +314,30 @@ end_heap_rewrite(RewriteState state)
 	}
 
 	/* Write the last page, if any */
-	if (state->rs_buffer)
+	if (state->rs_buffer_valid)
 	{
-		smgr_bulk_write(state->rs_bulkstate, state->rs_blockno, state->rs_buffer, true);
-		state->rs_buffer = NULL;
+		if (RelationNeedsWAL(state->rs_new_rel))
+			log_newpage(&state->rs_new_rel->rd_locator,
+						MAIN_FORKNUM,
+						state->rs_blockno,
+						state->rs_buffer,
+						true);
+
+		PageSetChecksumInplace(state->rs_buffer, state->rs_blockno);
+
+		smgrextend(RelationGetSmgr(state->rs_new_rel), MAIN_FORKNUM,
+				   state->rs_blockno, state->rs_buffer, true);
 	}
 
-	smgr_bulk_finish(state->rs_bulkstate);
+	/*
+	 * When we WAL-logged rel pages, we must nonetheless fsync them.  The
+	 * reason is the same as in storage.c's RelationCopyStorage(): we're
+	 * writing data that's not in shared buffers, and so a CHECKPOINT
+	 * occurring during the rewriteheap operation won't have fsync'd data we
+	 * wrote before the checkpoint.
+	 */
+	if (RelationNeedsWAL(state->rs_new_rel))
+		smgrimmedsync(RelationGetSmgr(state->rs_new_rel), MAIN_FORKNUM);
 
 	logical_end_heap_rewrite(state);
 
@@ -383,9 +401,6 @@ rewrite_heap_tuple(RewriteState state,
 
 	/*
 	 * If the tuple has been updated, check the old-to-new mapping hash table.
-	 *
-	 * Note that this check relies on the HeapTupleSatisfiesVacuum() in
-	 * heapam_relation_copy_for_cluster() to have set hint bits.
 	 */
 	if (!((old_tuple->t_data->t_infomask & HEAP_XMAX_INVALID) ||
 		  HeapTupleHeaderIsOnlyLocked(old_tuple->t_data)) &&
@@ -596,7 +611,7 @@ rewrite_heap_dead_tuple(RewriteState state, HeapTuple old_tuple)
 static void
 raw_heap_insert(RewriteState state, HeapTuple tup)
 {
-	Page		page;
+	Page		page = state->rs_buffer;
 	Size		pageFreeSpace,
 				saveFreeSpace;
 	Size		len;
@@ -618,12 +633,12 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 	}
 	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD)
 	{
-		uint32		options = HEAP_INSERT_SKIP_FSM;
+		int			options = HEAP_INSERT_SKIP_FSM;
 
 		/*
-		 * While rewriting the heap for REPACK, make sure data for the TOAST
-		 * table are not logically decoded.  The main heap is WAL-logged as
-		 * XLOG FPI records, which are not logically decoded.
+		 * While rewriting the heap for VACUUM FULL / CLUSTER, make sure data
+		 * for the TOAST table are not logically decoded.  The main heap is
+		 * WAL-logged as XLOG FPI records, which are not logically decoded.
 		 */
 		options |= HEAP_INSERT_NO_LOGICAL;
 
@@ -649,8 +664,7 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 												   HEAP_DEFAULT_FILLFACTOR);
 
 	/* Now we can check to see if there's enough free space already. */
-	page = (Page) state->rs_buffer;
-	if (page)
+	if (state->rs_buffer_valid)
 	{
 		pageFreeSpace = PageGetHeapFreeSpace(page);
 
@@ -661,23 +675,40 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 			 * contains a tuple.  Hence, unlike RelationGetBufferForTuple(),
 			 * enforce saveFreeSpace unconditionally.
 			 */
-			smgr_bulk_write(state->rs_bulkstate, state->rs_blockno, state->rs_buffer, true);
-			state->rs_buffer = NULL;
-			page = NULL;
+
+			/* XLOG stuff */
+			if (RelationNeedsWAL(state->rs_new_rel))
+				log_newpage(&state->rs_new_rel->rd_locator,
+							MAIN_FORKNUM,
+							state->rs_blockno,
+							page,
+							true);
+
+			/*
+			 * Now write the page. We say skipFsync = true because there's no
+			 * need for smgr to schedule an fsync for this write; we'll do it
+			 * ourselves in end_heap_rewrite.
+			 */
+			PageSetChecksumInplace(page, state->rs_blockno);
+
+			smgrextend(RelationGetSmgr(state->rs_new_rel), MAIN_FORKNUM,
+					   state->rs_blockno, page, true);
+
 			state->rs_blockno++;
+			state->rs_buffer_valid = false;
 		}
 	}
 
-	if (!page)
+	if (!state->rs_buffer_valid)
 	{
 		/* Initialize a new empty page */
-		state->rs_buffer = smgr_bulk_get_buf(state->rs_bulkstate);
-		page = (Page) state->rs_buffer;
 		PageInit(page, BLCKSZ, 0);
+		state->rs_buffer_valid = true;
 	}
 
 	/* And now we can insert the tuple into the page */
-	newoff = PageAddItem(page, heaptup->t_data, heaptup->t_len, InvalidOffsetNumber, false, true);
+	newoff = PageAddItem(page, (Item) heaptup->t_data, heaptup->t_len,
+						 InvalidOffsetNumber, false, true);
 	if (newoff == InvalidOffsetNumber)
 		elog(ERROR, "failed to add tuple");
 
@@ -890,7 +921,7 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 		src->off += len;
 
 		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterData((char *) (&xlrec), sizeof(xlrec));
 		XLogRegisterData(waldata_start, len);
 
 		/* write xlog record */
@@ -964,8 +995,8 @@ logical_rewrite_log_mapping(RewriteState state, TransactionId xid,
 			dboid = MyDatabaseId;
 
 		snprintf(path, MAXPGPATH,
-				 "%s/" LOGICAL_REWRITE_FORMAT,
-				 PG_LOGICAL_MAPPINGS_DIR, dboid, relid,
+				 "pg_logical/mappings/" LOGICAL_REWRITE_FORMAT,
+				 dboid, relid,
 				 LSN_FORMAT_ARGS(state->rs_begin_lsn),
 				 xid, GetCurrentTransactionId());
 
@@ -1084,8 +1115,8 @@ heap_xlog_logical_rewrite(XLogReaderState *r)
 	xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(r);
 
 	snprintf(path, MAXPGPATH,
-			 "%s/" LOGICAL_REWRITE_FORMAT,
-			 PG_LOGICAL_MAPPINGS_DIR, xlrec->mapped_db, xlrec->mapped_rel,
+			 "pg_logical/mappings/" LOGICAL_REWRITE_FORMAT,
+			 xlrec->mapped_db, xlrec->mapped_rel,
 			 LSN_FORMAT_ARGS(xlrec->start_lsn),
 			 xlrec->mapped_xid, XLogRecGetXid(r));
 
@@ -1104,8 +1135,8 @@ heap_xlog_logical_rewrite(XLogReaderState *r)
 	if (ftruncate(fd, xlrec->offset) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not truncate file \"%s\" to %lld: %m",
-						path, (long long int) xlrec->offset)));
+				 errmsg("could not truncate file \"%s\" to %u: %m",
+						path, (uint32) xlrec->offset)));
 	pgstat_report_wait_end();
 
 	data = XLogRecGetData(r) + sizeof(*xlrec);
@@ -1161,7 +1192,7 @@ CheckPointLogicalRewriteHeap(void)
 	XLogRecPtr	redo;
 	DIR		   *mappings_dir;
 	struct dirent *mapping_de;
-	char		path[MAXPGPATH + sizeof(PG_LOGICAL_MAPPINGS_DIR)];
+	char		path[MAXPGPATH + 20];
 
 	/*
 	 * We start of with a minimum of the last redo pointer. No new decoding
@@ -1173,11 +1204,11 @@ CheckPointLogicalRewriteHeap(void)
 	cutoff = ReplicationSlotsComputeLogicalRestartLSN();
 
 	/* don't start earlier than the restart lsn */
-	if (XLogRecPtrIsValid(cutoff) && redo < cutoff)
+	if (cutoff != InvalidXLogRecPtr && redo < cutoff)
 		cutoff = redo;
 
-	mappings_dir = AllocateDir(PG_LOGICAL_MAPPINGS_DIR);
-	while ((mapping_de = ReadDir(mappings_dir, PG_LOGICAL_MAPPINGS_DIR)) != NULL)
+	mappings_dir = AllocateDir("pg_logical/mappings");
+	while ((mapping_de = ReadDir(mappings_dir, "pg_logical/mappings")) != NULL)
 	{
 		Oid			dboid;
 		Oid			relid;
@@ -1192,7 +1223,7 @@ CheckPointLogicalRewriteHeap(void)
 			strcmp(mapping_de->d_name, "..") == 0)
 			continue;
 
-		snprintf(path, sizeof(path), "%s/%s", PG_LOGICAL_MAPPINGS_DIR, mapping_de->d_name);
+		snprintf(path, sizeof(path), "pg_logical/mappings/%s", mapping_de->d_name);
 		de_type = get_dirent_type(path, mapping_de, false, DEBUG1);
 
 		if (de_type != PGFILETYPE_ERROR && de_type != PGFILETYPE_REG)
@@ -1208,7 +1239,7 @@ CheckPointLogicalRewriteHeap(void)
 
 		lsn = ((uint64) hi) << 32 | lo;
 
-		if (lsn < cutoff || !XLogRecPtrIsValid(cutoff))
+		if (lsn < cutoff || cutoff == InvalidXLogRecPtr)
 		{
 			elog(DEBUG1, "removing logical rewrite file \"%s\"", path);
 			if (unlink(path) < 0)
@@ -1252,5 +1283,5 @@ CheckPointLogicalRewriteHeap(void)
 	FreeDir(mappings_dir);
 
 	/* persist directory entries to disk */
-	fsync_fname(PG_LOGICAL_MAPPINGS_DIR, true);
+	fsync_fname("pg_logical/mappings", true);
 }

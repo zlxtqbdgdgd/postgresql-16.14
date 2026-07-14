@@ -81,12 +81,10 @@ bool
 ltree_label_match(const char *pred, size_t pred_len, const char *label,
 				  size_t label_len, bool prefix, bool ci)
 {
-	static pg_locale_t locale = NULL;
 	char	   *fpred;			/* casefolded predicate */
-	size_t		fpred_len = pred_len;
+	size_t		fpred_len;
 	char	   *flabel;			/* casefolded label */
-	size_t		flabel_len = label_len;
-	size_t		len;
+	size_t		flabel_len;
 	bool		res;
 
 	/* fast path for binary match or binary prefix match */
@@ -96,37 +94,10 @@ ltree_label_match(const char *pred, size_t pred_len, const char *label,
 	else if (!ci)
 		return false;
 
-	/*
-	 * Slow path for case-insensitive comparison: case fold and then compare.
-	 * This path is necessary even if pred_len > label_len, because the byte
-	 * lengths may change after casefolding.
-	 */
-	if (!locale)
-		locale = pg_database_locale();
-
-	fpred = palloc(fpred_len + 1);
-	len = pg_strfold(fpred, fpred_len + 1, pred, pred_len, locale);
-	if (len > fpred_len)
-	{
-		/* grow buffer if needed and retry */
-		fpred_len = len;
-		fpred = repalloc(fpred, fpred_len + 1);
-		len = pg_strfold(fpred, fpred_len + 1, pred, pred_len, locale);
-	}
-	Assert(len <= fpred_len);
-	fpred_len = len;
-
-	flabel = palloc(flabel_len + 1);
-	len = pg_strfold(flabel, flabel_len + 1, label, label_len, locale);
-	if (len > flabel_len)
-	{
-		/* grow buffer if needed and retry */
-		flabel_len = len;
-		flabel = repalloc(flabel, flabel_len + 1);
-		len = pg_strfold(flabel, flabel_len + 1, label, label_len, locale);
-	}
-	Assert(len <= flabel_len);
-	flabel_len = len;
+	fpred = str_tolower(pred, pred_len, DEFAULT_COLLATION_OID);
+	fpred_len = strlen(fpred);
+	flabel = str_tolower(label, label_len, DEFAULT_COLLATION_OID);
+	flabel_len = strlen(flabel);
 
 	if ((fpred_len == flabel_len || (prefix && fpred_len < flabel_len)) &&
 		strncmp(fpred, flabel, fpred_len) == 0)

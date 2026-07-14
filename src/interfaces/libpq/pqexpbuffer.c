@@ -15,7 +15,7 @@
  * a usable vsnprintf(), then a copy of our own implementation of it will
  * be linked into libpq.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/pqexpbuffer.c
@@ -38,7 +38,7 @@
 static const char oom_buffer[1] = "";
 
 /* Need a char * for unconstify() compatibility */
-static const char *const oom_buffer_ptr = oom_buffer;
+static const char *oom_buffer_ptr = oom_buffer;
 
 
 /*
@@ -232,7 +232,7 @@ enlargePQExpBuffer(PQExpBuffer str, size_t needed)
  * resetPQExpBuffer() followed by appendPQExpBuffer().
  */
 void
-printfPQExpBuffer(PQExpBuffer str, const char *fmt, ...)
+printfPQExpBuffer(PQExpBuffer str, const char *fmt,...)
 {
 	int			save_errno = errno;
 	va_list		args;
@@ -262,7 +262,7 @@ printfPQExpBuffer(PQExpBuffer str, const char *fmt, ...)
  * strcat.
  */
 void
-appendPQExpBuffer(PQExpBuffer str, const char *fmt, ...)
+appendPQExpBuffer(PQExpBuffer str, const char *fmt,...)
 {
 	int			save_errno = errno;
 	va_list		args;

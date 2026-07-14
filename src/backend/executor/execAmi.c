@@ -3,7 +3,7 @@
  * execAmi.c
  *	  miscellaneous executor access method routines
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/executor/execAmi.c
@@ -14,9 +14,7 @@
 
 #include "access/amapi.h"
 #include "access/htup_details.h"
-#include "catalog/pg_class.h"
-#include "executor/executor.h"
-#include "executor/instrument.h"
+#include "executor/execdebug.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeAppend.h"
 #include "executor/nodeBitmapAnd.h"
@@ -61,7 +59,9 @@
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
 #include "nodes/extensible.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 static bool IndexSupportsBackwardScan(Oid indexid);
@@ -606,7 +606,7 @@ IndexSupportsBackwardScan(Oid indexid)
 	bool		result;
 	HeapTuple	ht_idxrel;
 	Form_pg_class idxrelrec;
-	const IndexAmRoutine *amroutine;
+	IndexAmRoutine *amroutine;
 
 	/* Fetch the pg_class tuple of the index relation */
 	ht_idxrel = SearchSysCache1(RELOID, ObjectIdGetDatum(indexid));
@@ -619,6 +619,7 @@ IndexSupportsBackwardScan(Oid indexid)
 
 	result = amroutine->amcanbackward;
 
+	pfree(amroutine);
 	ReleaseSysCache(ht_idxrel);
 
 	return result;

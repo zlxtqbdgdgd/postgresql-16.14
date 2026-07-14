@@ -3,7 +3,7 @@
  *	  functions related to auxiliary processes.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,44 +15,79 @@
 #include <unistd.h>
 #include <signal.h>
 
-#include "access/xlog.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/auxprocess.h"
+#include "postmaster/bgwriter.h"
+#include "postmaster/startup.h"
+#include "postmaster/walwriter.h"
+#include "replication/walreceiver.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
-#include "storage/procsignal.h"
+#include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
-#include "utils/wait_event.h"
+#include "utils/rel.h"
 
 
 static void ShutdownAuxiliaryProcess(int code, Datum arg);
 
 
+/* ----------------
+ *		global variables
+ * ----------------
+ */
+
+AuxProcType MyAuxProcType = NotAnAuxProcess;	/* declared in miscadmin.h */
+
+
 /*
- *	 AuxiliaryProcessMainCommon
+ *	 AuxiliaryProcessMain
  *
- *	 Common initialization code for auxiliary processes, such as the bgwriter,
- *	 walwriter, walreceiver, and the startup process.
+ *	 The main entry point for auxiliary processes, such as the bgwriter,
+ *	 walwriter, walreceiver, bootstrapper and the shared memory checker code.
+ *
+ *	 This code is here just because of historical reasons.
  */
 void
-AuxiliaryProcessMainCommon(void)
+AuxiliaryProcessMain(AuxProcType auxtype)
 {
 	Assert(IsUnderPostmaster);
 
-	/* Release postmaster's working memory context */
-	if (PostmasterContext)
+	MyAuxProcType = auxtype;
+
+	switch (MyAuxProcType)
 	{
-		MemoryContextDelete(PostmasterContext);
-		PostmasterContext = NULL;
+		case StartupProcess:
+			MyBackendType = B_STARTUP;
+			break;
+		case ArchiverProcess:
+			MyBackendType = B_ARCHIVER;
+			break;
+		case BgWriterProcess:
+			MyBackendType = B_BG_WRITER;
+			break;
+		case CheckpointerProcess:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case WalWriterProcess:
+			MyBackendType = B_WAL_WRITER;
+			break;
+		case WalReceiverProcess:
+			MyBackendType = B_WAL_RECEIVER;
+			break;
+		default:
+			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
+			MyBackendType = B_INVALID;
 	}
 
 	init_ps_display(NULL);
 
-	Assert(GetProcessingMode() == InitProcessing);
-
+	SetProcessingMode(BootstrapProcessing);
 	IgnoreSystemIndexes = true;
 
 	/*
@@ -62,49 +97,26 @@ AuxiliaryProcessMainCommon(void)
 	 */
 
 	/*
-	 * Create a PGPROC so we can use LWLocks and access shared memory.
+	 * Create a PGPROC so we can use LWLocks.  In the EXEC_BACKEND case, this
+	 * was already done by SubPostmasterMain().
 	 */
+#ifndef EXEC_BACKEND
 	InitAuxiliaryProcess();
+#endif
 
 	BaseInit();
 
 	/*
-	 * Prevent consuming interrupts between setting ProcSignalInit and setting
-	 * the initial local data checksum value.  If a barrier is emitted, and
-	 * absorbed, before local cached state is initialized the state transition
-	 * can be invalid.
+	 * Assign the ProcSignalSlot for an auxiliary process.  Since it doesn't
+	 * have a BackendId, the slot is statically allocated based on the
+	 * auxiliary process type (MyAuxProcType).  Backends use slots indexed in
+	 * the range from 1 to MaxBackends (inclusive), so we use MaxBackends +
+	 * AuxProcType + 1 as the index of the slot for an auxiliary process.
+	 *
+	 * This will need rethinking if we ever want more than one of a particular
+	 * auxiliary process type.
 	 */
-	HOLD_INTERRUPTS();
-
-	ProcSignalInit(NULL, 0);
-
-	/*
-	 * Initialize a local cache of the data_checksum_version, to be updated by
-	 * the procsignal-based barriers.
-	 *
-	 * This intentionally happens after initializing the procsignal, otherwise
-	 * we might miss a state change. This means we can get a barrier for the
-	 * state we've just initialized - but it can happen only once.
-	 *
-	 * The postmaster (which is what gets forked into the new child process)
-	 * does not handle barriers, therefore it may not have the current value
-	 * of LocalDataChecksumState value (it'll have the value read from the
-	 * control file, which may be arbitrarily old).
-	 *
-	 * NB: Even if the postmaster handled barriers, the value might still be
-	 * stale, as it might have changed after this process forked.
-	 */
-	InitLocalDataChecksumState();
-
-	RESUME_INTERRUPTS();
-
-	/*
-	 * Initialize the process-local logical info WAL logging state.
-	 *
-	 * This must be called after ProcSignalInit() so that the process can
-	 * participate in procsignal-based barriers that update this state.
-	 */
-	InitializeProcessXLogLogicalInfo();
+	ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
 	/*
 	 * Auxiliary processes don't run transactions, but they may need a
@@ -116,13 +128,43 @@ AuxiliaryProcessMainCommon(void)
 
 	/* Initialize backend status information */
 	pgstat_beinit();
-	pgstat_bestart_initial();
-	pgstat_bestart_final();
+	pgstat_bestart();
 
 	/* register a before-shutdown callback for LWLock cleanup */
 	before_shmem_exit(ShutdownAuxiliaryProcess, 0);
 
 	SetProcessingMode(NormalProcessing);
+
+	switch (MyAuxProcType)
+	{
+		case StartupProcess:
+			StartupProcessMain();
+			proc_exit(1);
+
+		case ArchiverProcess:
+			PgArchiverMain();
+			proc_exit(1);
+
+		case BgWriterProcess:
+			BackgroundWriterMain();
+			proc_exit(1);
+
+		case CheckpointerProcess:
+			CheckpointerMain();
+			proc_exit(1);
+
+		case WalWriterProcess:
+			WalWriterMain();
+			proc_exit(1);
+
+		case WalReceiverProcess:
+			WalReceiverMain();
+			proc_exit(1);
+
+		default:
+			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
+			proc_exit(1);
+	}
 }
 
 /*

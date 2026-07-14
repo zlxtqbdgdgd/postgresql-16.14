@@ -3,7 +3,7 @@
  * nodeFuncs.c
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "utils/builtins.h"
@@ -65,9 +66,6 @@ exprType(const Node *expr)
 			break;
 		case T_WindowFunc:
 			type = ((const WindowFunc *) expr)->wintype;
-			break;
-		case T_MergeSupportFunc:
-			type = ((const MergeSupportFunc *) expr)->msftype;
 			break;
 		case T_SubscriptingRef:
 			type = ((const SubscriptingRef *) expr)->refrestype;
@@ -236,20 +234,6 @@ exprType(const Node *expr)
 		case T_JsonIsPredicate:
 			type = BOOLOID;
 			break;
-		case T_JsonExpr:
-			{
-				const JsonExpr *jexpr = (const JsonExpr *) expr;
-
-				type = jexpr->returning->typid;
-				break;
-			}
-		case T_JsonBehavior:
-			{
-				const JsonBehavior *behavior = (const JsonBehavior *) expr;
-
-				type = exprType(behavior->expr);
-				break;
-			}
 		case T_NullTest:
 			type = BOOLOID;
 			break;
@@ -278,14 +262,8 @@ exprType(const Node *expr)
 				type = exprType((Node *) n->expr);
 			}
 			break;
-		case T_ReturningExpr:
-			type = exprType((Node *) ((const ReturningExpr *) expr)->retexpr);
-			break;
 		case T_PlaceHolderVar:
 			type = exprType((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-			break;
-		case T_GraphPropertyRef:
-			type = ((const GraphPropertyRef *) expr)->typeId;
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
@@ -515,32 +493,14 @@ exprTypmod(const Node *expr)
 			return exprTypmod((Node *) ((const JsonValueExpr *) expr)->formatted_expr);
 		case T_JsonConstructorExpr:
 			return ((const JsonConstructorExpr *) expr)->returning->typmod;
-		case T_JsonExpr:
-			{
-				const JsonExpr *jexpr = (const JsonExpr *) expr;
-
-				return jexpr->returning->typmod;
-			}
-			break;
-		case T_JsonBehavior:
-			{
-				const JsonBehavior *behavior = (const JsonBehavior *) expr;
-
-				return exprTypmod(behavior->expr);
-			}
-			break;
 		case T_CoerceToDomain:
 			return ((const CoerceToDomain *) expr)->resulttypmod;
 		case T_CoerceToDomainValue:
 			return ((const CoerceToDomainValue *) expr)->typeMod;
 		case T_SetToDefault:
 			return ((const SetToDefault *) expr)->typeMod;
-		case T_ReturningExpr:
-			return exprTypmod((Node *) ((const ReturningExpr *) expr)->retexpr);
 		case T_PlaceHolderVar:
 			return exprTypmod((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-		case T_GraphPropertyRef:
-			return ((const GraphPropertyRef *) expr)->typmod;
 		default:
 			break;
 	}
@@ -850,9 +810,6 @@ exprCollation(const Node *expr)
 		case T_WindowFunc:
 			coll = ((const WindowFunc *) expr)->wincollid;
 			break;
-		case T_MergeSupportFunc:
-			coll = ((const MergeSupportFunc *) expr)->msfcollid;
-			break;
 		case T_SubscriptingRef:
 			coll = ((const SubscriptingRef *) expr)->refcollid;
 			break;
@@ -1002,16 +959,8 @@ exprCollation(const Node *expr)
 			{
 				const JsonConstructorExpr *ctor = (const JsonConstructorExpr *) expr;
 
-				/*
-				 * Collation comes from coercion if present, otherwise from
-				 * func.  The func fallback is needed in cases where func
-				 * already produces the final output type and no coercion is
-				 * needed (cf. the JSCTOR_JSON_ARRAY_QUERY case).
-				 */
 				if (ctor->coercion)
 					coll = exprCollation((Node *) ctor->coercion);
-				else if (ctor->func)
-					coll = exprCollation((Node *) ctor->func);
 				else
 					coll = InvalidOid;
 			}
@@ -1019,23 +968,6 @@ exprCollation(const Node *expr)
 		case T_JsonIsPredicate:
 			/* IS JSON's result is boolean ... */
 			coll = InvalidOid;	/* ... so it has no collation */
-			break;
-		case T_JsonExpr:
-			{
-				const JsonExpr *jsexpr = (const JsonExpr *) expr;
-
-				coll = jsexpr->collation;
-			}
-			break;
-		case T_JsonBehavior:
-			{
-				const JsonBehavior *behavior = (const JsonBehavior *) expr;
-
-				if (behavior->expr)
-					coll = exprCollation(behavior->expr);
-				else
-					coll = InvalidOid;
-			}
 			break;
 		case T_NullTest:
 			/* NullTest's result is boolean ... */
@@ -1065,14 +997,8 @@ exprCollation(const Node *expr)
 		case T_InferenceElem:
 			coll = exprCollation((Node *) ((const InferenceElem *) expr)->expr);
 			break;
-		case T_ReturningExpr:
-			coll = exprCollation((Node *) ((const ReturningExpr *) expr)->retexpr);
-			break;
 		case T_PlaceHolderVar:
 			coll = exprCollation((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-			break;
-		case T_GraphPropertyRef:
-			coll = ((const GraphPropertyRef *) expr)->collation;
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
@@ -1134,7 +1060,7 @@ exprInputCollation(const Node *expr)
  *	  Assign collation information to an expression tree node.
  *
  * Note: since this is only used during parse analysis, we don't need to
- * worry about subplans, PlaceHolderVars, or ReturningExprs.
+ * worry about subplans or PlaceHolderVars.
  */
 void
 exprSetCollation(Node *expr, Oid collation)
@@ -1158,9 +1084,6 @@ exprSetCollation(Node *expr, Oid collation)
 			break;
 		case T_WindowFunc:
 			((WindowFunc *) expr)->wincollid = collation;
-			break;
-		case T_MergeSupportFunc:
-			((MergeSupportFunc *) expr)->msfcollid = collation;
 			break;
 		case T_SubscriptingRef:
 			((SubscriptingRef *) expr)->refcollid = collation;
@@ -1272,11 +1195,8 @@ exprSetCollation(Node *expr, Oid collation)
 			{
 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) expr;
 
-				/* See comment in exprCollation() */
 				if (ctor->coercion)
 					exprSetCollation((Node *) ctor->coercion, collation);
-				else if (ctor->func)
-					exprSetCollation((Node *) ctor->func, collation);
 				else
 					Assert(!OidIsValid(collation)); /* result is always a
 													 * json[b] type */
@@ -1284,17 +1204,6 @@ exprSetCollation(Node *expr, Oid collation)
 			break;
 		case T_JsonIsPredicate:
 			Assert(!OidIsValid(collation)); /* result is always boolean */
-			break;
-		case T_JsonExpr:
-			{
-				JsonExpr   *jexpr = (JsonExpr *) expr;
-
-				jexpr->collation = collation;
-			}
-			break;
-		case T_JsonBehavior:
-			Assert(((JsonBehavior *) expr)->expr == NULL ||
-				   exprCollation(((JsonBehavior *) expr)->expr) == collation);
 			break;
 		case T_NullTest:
 			/* NullTest's result is boolean ... */
@@ -1433,9 +1342,6 @@ exprLocation(const Node *expr)
 		case T_WindowFunc:
 			/* function name should always be the first thing */
 			loc = ((const WindowFunc *) expr)->location;
-			break;
-		case T_MergeSupportFunc:
-			loc = ((const MergeSupportFunc *) expr)->location;
 			break;
 		case T_SubscriptingRef:
 			/* just use container argument's location */
@@ -1602,18 +1508,6 @@ exprLocation(const Node *expr)
 		case T_JsonIsPredicate:
 			loc = ((const JsonIsPredicate *) expr)->location;
 			break;
-		case T_JsonExpr:
-			{
-				const JsonExpr *jsexpr = (const JsonExpr *) expr;
-
-				/* consider both function name and leftmost arg */
-				loc = leftmostLoc(jsexpr->location,
-								  exprLocation(jsexpr->formatted_expr));
-			}
-			break;
-		case T_JsonBehavior:
-			loc = exprLocation(((const JsonBehavior *) expr)->expr);
-			break;
 		case T_NullTest:
 			{
 				const NullTest *nexpr = (const NullTest *) expr;
@@ -1646,9 +1540,6 @@ exprLocation(const Node *expr)
 			break;
 		case T_SetToDefault:
 			loc = ((const SetToDefault *) expr)->location;
-			break;
-		case T_ReturningExpr:
-			loc = exprLocation((Node *) ((const ReturningExpr *) expr)->retexpr);
 			break;
 		case T_TargetEntry:
 			/* just use argument's location */
@@ -1745,14 +1636,12 @@ exprLocation(const Node *expr)
 		case T_ColumnDef:
 			loc = ((const ColumnDef *) expr)->location;
 			break;
-		case T_IndexElem:
-			loc = ((const IndexElem *) expr)->location;
-			break;
 		case T_Constraint:
 			loc = ((const Constraint *) expr)->location;
 			break;
 		case T_FunctionParameter:
-			loc = ((const FunctionParameter *) expr)->location;
+			/* just use typename's location */
+			loc = exprLocation((Node *) ((const FunctionParameter *) expr)->argType);
 			break;
 		case T_XmlSerialize:
 			/* XMLSERIALIZE keyword should always be the first thing */
@@ -2049,7 +1938,7 @@ check_functions_in_node(Node *node, check_function_callback checker,
  *			... do special actions for other node types
  *		}
  *		// for any node type not specially processed, do:
- *		return expression_tree_walker(node, my_walker, context);
+ *		return expression_tree_walker(node, my_walker, (void *) context);
  * }
  *
  * The "context" argument points to a struct that holds whatever context
@@ -2146,9 +2035,6 @@ expression_tree_walker_impl(Node *node,
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 		case T_CTESearchClause:
-		case T_GraphLabelRef:
-		case T_GraphPropertyRef:
-		case T_MergeSupportFunc:
 			/* primitive node types with no expression subnodes */
 			break;
 		case T_WithCheckOption:
@@ -2186,16 +2072,6 @@ expression_tree_walker_impl(Node *node,
 				if (LIST_WALK(expr->args))
 					return true;
 				if (WALK(expr->aggfilter))
-					return true;
-				if (WALK(expr->runCondition))
-					return true;
-			}
-			break;
-		case T_WindowFuncRunCondition:
-			{
-				WindowFuncRunCondition *expr = (WindowFuncRunCondition *) node;
-
-				if (WALK(expr->arg))
 					return true;
 			}
 			break;
@@ -2384,31 +2260,6 @@ expression_tree_walker_impl(Node *node,
 			break;
 		case T_JsonIsPredicate:
 			return WALK(((JsonIsPredicate *) node)->expr);
-		case T_JsonExpr:
-			{
-				JsonExpr   *jexpr = (JsonExpr *) node;
-
-				if (WALK(jexpr->formatted_expr))
-					return true;
-				if (WALK(jexpr->path_spec))
-					return true;
-				if (WALK(jexpr->passing_values))
-					return true;
-				/* we assume walker doesn't care about passing_names */
-				if (WALK(jexpr->on_empty))
-					return true;
-				if (WALK(jexpr->on_error))
-					return true;
-			}
-			break;
-		case T_JsonBehavior:
-			{
-				JsonBehavior *behavior = (JsonBehavior *) node;
-
-				if (WALK(behavior->expr))
-					return true;
-			}
-			break;
 		case T_NullTest:
 			return WALK(((NullTest *) node)->arg);
 		case T_BooleanTest:
@@ -2431,6 +2282,8 @@ expression_tree_walker_impl(Node *node,
 				if (WALK(wc->startOffset))
 					return true;
 				if (WALK(wc->endOffset))
+					return true;
+				if (WALK(wc->runCondition))
 					return true;
 			}
 			break;
@@ -2591,24 +2444,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *forPortionOf = (ForPortionOfExpr *) node;
-
-				if (WALK(forPortionOf->rangeVar))
-					return true;
-				if (WALK(forPortionOf->targetFrom))
-					return true;
-				if (WALK(forPortionOf->targetTo))
-					return true;
-				if (WALK(forPortionOf->targetRange))
-					return true;
-				if (WALK(forPortionOf->overlapsExpr))
-					return true;
-				if (WALK(forPortionOf->rangeTargetList))
-					return true;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -2662,8 +2497,6 @@ expression_tree_walker_impl(Node *node,
 			return WALK(((PlaceHolderVar *) node)->phexpr);
 		case T_InferenceElem:
 			return WALK(((InferenceElem *) node)->expr);
-		case T_ReturningExpr:
-			return WALK(((ReturningExpr *) node)->retexpr);
 		case T_AppendRelInfo:
 			{
 				AppendRelInfo *appinfo = (AppendRelInfo *) node;
@@ -2699,32 +2532,6 @@ expression_tree_walker_impl(Node *node,
 				if (WALK(tf->colexprs))
 					return true;
 				if (WALK(tf->coldefexprs))
-					return true;
-				if (WALK(tf->colvalexprs))
-					return true;
-				if (WALK(tf->passingvalexprs))
-					return true;
-			}
-			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->labelexpr))
-					return true;
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (LIST_WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
 					return true;
 			}
 			break;
@@ -2777,10 +2584,6 @@ query_tree_walker_impl(Query *query,
 		return true;
 	if (WALK(query->mergeActionList))
 		return true;
-	if (WALK(query->mergeJoinCondition))
-		return true;
-	if (WALK(query->forPortionOf))
-		return true;
 	if (WALK(query->returningList))
 		return true;
 	if (WALK(query->jointree))
@@ -2825,6 +2628,8 @@ query_tree_walker_impl(Query *query,
 			if (WALK(wc->startOffset))
 				return true;
 			if (WALK(wc->endOffset))
+				return true;
+			if (WALK(wc->runCondition))
 				return true;
 		}
 	}
@@ -2923,21 +2728,10 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 			if (WALK(rte->values_lists))
 				return true;
 			break;
-		case RTE_GRAPH_TABLE:
-			if (WALK(rte->graph_pattern))
-				return true;
-			if (WALK(rte->graph_table_columns))
-				return true;
-			break;
 		case RTE_CTE:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* nothing to do */
-			break;
-		case RTE_GROUP:
-			if (!(flags & QTW_IGNORE_GROUPEXPRS))
-				if (WALK(rte->groupexprs))
-					return true;
 			break;
 	}
 
@@ -2974,7 +2768,7 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
  *			... do special transformations of other node types
  *		}
  *		// for any node type not specially processed, do:
- *		return expression_tree_mutator(node, my_mutator, context);
+ *		return expression_tree_mutator(node, my_mutator, (void *) context);
  * }
  *
  * The "context" argument points to a struct that holds whatever context
@@ -3025,7 +2819,7 @@ expression_tree_mutator_impl(Node *node,
 	 */
 
 #define FLATCOPY(newnode, node, nodetype)  \
-	( (newnode) = palloc_object(nodetype), \
+	( (newnode) = (nodetype *) palloc(sizeof(nodetype)), \
 	  memcpy((newnode), (node), sizeof(nodetype)) )
 
 #define MUTATE(newfield, oldfield, fieldtype)  \
@@ -3075,10 +2869,7 @@ expression_tree_mutator_impl(Node *node,
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 		case T_CTESearchClause:
-		case T_GraphLabelRef:
-		case T_GraphPropertyRef:
-		case T_MergeSupportFunc:
-			return copyObject(node);
+			return (Node *) copyObject(node);
 		case T_WithCheckOption:
 			{
 				WithCheckOption *wco = (WithCheckOption *) node;
@@ -3135,16 +2926,6 @@ expression_tree_mutator_impl(Node *node,
 				FLATCOPY(newnode, wfunc, WindowFunc);
 				MUTATE(newnode->args, wfunc->args, List *);
 				MUTATE(newnode->aggfilter, wfunc->aggfilter, Expr *);
-				return (Node *) newnode;
-			}
-			break;
-		case T_WindowFuncRunCondition:
-			{
-				WindowFuncRunCondition *wfuncrc = (WindowFuncRunCondition *) node;
-				WindowFuncRunCondition *newnode;
-
-				FLATCOPY(newnode, wfuncrc, WindowFuncRunCondition);
-				MUTATE(newnode->arg, wfuncrc->arg, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3482,31 +3263,6 @@ expression_tree_mutator_impl(Node *node,
 
 				return (Node *) newnode;
 			}
-		case T_JsonExpr:
-			{
-				JsonExpr   *jexpr = (JsonExpr *) node;
-				JsonExpr   *newnode;
-
-				FLATCOPY(newnode, jexpr, JsonExpr);
-				MUTATE(newnode->formatted_expr, jexpr->formatted_expr, Node *);
-				MUTATE(newnode->path_spec, jexpr->path_spec, Node *);
-				MUTATE(newnode->passing_values, jexpr->passing_values, List *);
-				/* assume mutator does not care about passing_names */
-				MUTATE(newnode->on_empty, jexpr->on_empty, JsonBehavior *);
-				MUTATE(newnode->on_error, jexpr->on_error, JsonBehavior *);
-				return (Node *) newnode;
-			}
-			break;
-		case T_JsonBehavior:
-			{
-				JsonBehavior *behavior = (JsonBehavior *) node;
-				JsonBehavior *newnode;
-
-				FLATCOPY(newnode, behavior, JsonBehavior);
-				MUTATE(newnode->expr, behavior->expr, Node *);
-				return (Node *) newnode;
-			}
-			break;
 		case T_NullTest:
 			{
 				NullTest   *ntest = (NullTest *) node;
@@ -3537,16 +3293,6 @@ expression_tree_mutator_impl(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_ReturningExpr:
-			{
-				ReturningExpr *rexpr = (ReturningExpr *) node;
-				ReturningExpr *newnode;
-
-				FLATCOPY(newnode, rexpr, ReturningExpr);
-				MUTATE(newnode->retexpr, rexpr->retexpr, Expr *);
-				return (Node *) newnode;
-			}
-			break;
 		case T_TargetEntry:
 			{
 				TargetEntry *targetentry = (TargetEntry *) node;
@@ -3570,6 +3316,7 @@ expression_tree_mutator_impl(Node *node,
 				MUTATE(newnode->orderClause, wc->orderClause, List *);
 				MUTATE(newnode->startOffset, wc->startOffset, Node *);
 				MUTATE(newnode->endOffset, wc->endOffset, Node *);
+				MUTATE(newnode->runCondition, wc->runCondition, List *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3683,22 +3430,6 @@ expression_tree_mutator_impl(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *fpo = (ForPortionOfExpr *) node;
-				ForPortionOfExpr *newnode;
-
-				FLATCOPY(newnode, fpo, ForPortionOfExpr);
-				MUTATE(newnode->rangeVar, fpo->rangeVar, Var *);
-				MUTATE(newnode->targetFrom, fpo->targetFrom, Node *);
-				MUTATE(newnode->targetTo, fpo->targetTo, Node *);
-				MUTATE(newnode->targetRange, fpo->targetRange, Node *);
-				MUTATE(newnode->overlapsExpr, fpo->overlapsExpr, Node *);
-				MUTATE(newnode->rangeTargetList, fpo->rangeTargetList, List *);
-
-				return (Node *) newnode;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -3712,7 +3443,7 @@ expression_tree_mutator_impl(Node *node,
 			break;
 		case T_PartitionPruneStepCombine:
 			/* no expression sub-nodes */
-			return copyObject(node);
+			return (Node *) copyObject(node);
 		case T_JoinExpr:
 			{
 				JoinExpr   *join = (JoinExpr *) node;
@@ -3825,32 +3556,6 @@ expression_tree_mutator_impl(Node *node,
 				MUTATE(newnode->rowexpr, tf->rowexpr, Node *);
 				MUTATE(newnode->colexprs, tf->colexprs, List *);
 				MUTATE(newnode->coldefexprs, tf->coldefexprs, List *);
-				MUTATE(newnode->colvalexprs, tf->colvalexprs, List *);
-				MUTATE(newnode->passingvalexprs, tf->passingvalexprs, List *);
-				return (Node *) newnode;
-			}
-			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-				GraphElementPattern *newnode;
-
-				FLATCOPY(newnode, gep, GraphElementPattern);
-				MUTATE(newnode->labelexpr, gep->labelexpr, Node *);
-				MUTATE(newnode->subexpr, gep->subexpr, List *);
-				MUTATE(newnode->whereClause, gep->whereClause, Node *);
-				newnode->quantifier = list_copy(gep->quantifier);
-				return (Node *) newnode;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-				GraphPattern *newnode;
-
-				FLATCOPY(newnode, gp, GraphPattern);
-				MUTATE(newnode->path_pattern_list, gp->path_pattern_list, List *);
-				MUTATE(newnode->whereClause, gp->whereClause, Node *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3903,8 +3608,6 @@ query_tree_mutator_impl(Query *query,
 	MUTATE(query->withCheckOptions, query->withCheckOptions, List *);
 	MUTATE(query->onConflict, query->onConflict, OnConflictExpr *);
 	MUTATE(query->mergeActionList, query->mergeActionList, List *);
-	MUTATE(query->mergeJoinCondition, query->mergeJoinCondition, Node *);
-	MUTATE(query->forPortionOf, query->forPortionOf, ForPortionOfExpr *);
 	MUTATE(query->returningList, query->returningList, List *);
 	MUTATE(query->jointree, query->jointree, FromExpr *);
 	MUTATE(query->setOperations, query->setOperations, Node *);
@@ -3943,6 +3646,7 @@ query_tree_mutator_impl(Query *query,
 			FLATCOPY(newnode, wc, WindowClause);
 			MUTATE(newnode->startOffset, wc->startOffset, Node *);
 			MUTATE(newnode->endOffset, wc->endOffset, Node *);
+			MUTATE(newnode->runCondition, wc->runCondition, List *);
 
 			resultlist = lappend(resultlist, (Node *) newnode);
 		}
@@ -4024,23 +3728,10 @@ range_table_mutator_impl(List *rtable,
 			case RTE_VALUES:
 				MUTATE(newrte->values_lists, rte->values_lists, List *);
 				break;
-			case RTE_GRAPH_TABLE:
-				MUTATE(newrte->graph_pattern, rte->graph_pattern, GraphPattern *);
-				MUTATE(newrte->graph_table_columns, rte->graph_table_columns, List *);
-				break;
 			case RTE_CTE:
 			case RTE_NAMEDTUPLESTORE:
 			case RTE_RESULT:
 				/* nothing to do */
-				break;
-			case RTE_GROUP:
-				if (!(flags & QTW_IGNORE_GROUPEXPRS))
-					MUTATE(newrte->groupexprs, rte->groupexprs, List *);
-				else
-				{
-					/* else, copy grouping exprs as-is */
-					newrte->groupexprs = copyObject(rte->groupexprs);
-				}
 				break;
 		}
 		MUTATE(newrte->securityQuals, rte->securityQuals, List *);
@@ -4142,8 +3833,6 @@ raw_expression_tree_walker_impl(Node *node,
 		case T_ParamRef:
 		case T_A_Const:
 		case T_A_Star:
-		case T_MergeSupportFunc:
-		case T_ReturningOption:
 			/* primitive node types with no subnodes */
 			break;
 		case T_Alias:
@@ -4216,36 +3905,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_JsonParseExpr:
-			{
-				JsonParseExpr *jpe = (JsonParseExpr *) node;
-
-				if (WALK(jpe->expr))
-					return true;
-				if (WALK(jpe->output))
-					return true;
-			}
-			break;
-		case T_JsonScalarExpr:
-			{
-				JsonScalarExpr *jse = (JsonScalarExpr *) node;
-
-				if (WALK(jse->expr))
-					return true;
-				if (WALK(jse->output))
-					return true;
-			}
-			break;
-		case T_JsonSerializeExpr:
-			{
-				JsonSerializeExpr *jse = (JsonSerializeExpr *) node;
-
-				if (WALK(jse->expr))
-					return true;
-				if (WALK(jse->output))
-					return true;
-			}
-			break;
 		case T_JsonConstructorExpr:
 			{
 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
@@ -4262,66 +3921,6 @@ raw_expression_tree_walker_impl(Node *node,
 			break;
 		case T_JsonIsPredicate:
 			return WALK(((JsonIsPredicate *) node)->expr);
-		case T_JsonArgument:
-			return WALK(((JsonArgument *) node)->val);
-		case T_JsonFuncExpr:
-			{
-				JsonFuncExpr *jfe = (JsonFuncExpr *) node;
-
-				if (WALK(jfe->context_item))
-					return true;
-				if (WALK(jfe->pathspec))
-					return true;
-				if (WALK(jfe->passing))
-					return true;
-				if (WALK(jfe->output))
-					return true;
-				if (WALK(jfe->on_empty))
-					return true;
-				if (WALK(jfe->on_error))
-					return true;
-			}
-			break;
-		case T_JsonBehavior:
-			{
-				JsonBehavior *jb = (JsonBehavior *) node;
-
-				if (WALK(jb->expr))
-					return true;
-			}
-			break;
-		case T_JsonTable:
-			{
-				JsonTable  *jt = (JsonTable *) node;
-
-				if (WALK(jt->context_item))
-					return true;
-				if (WALK(jt->pathspec))
-					return true;
-				if (WALK(jt->passing))
-					return true;
-				if (WALK(jt->columns))
-					return true;
-				if (WALK(jt->on_error))
-					return true;
-			}
-			break;
-		case T_JsonTableColumn:
-			{
-				JsonTableColumn *jtc = (JsonTableColumn *) node;
-
-				if (WALK(jtc->typeName))
-					return true;
-				if (WALK(jtc->on_empty))
-					return true;
-				if (WALK(jtc->on_error))
-					return true;
-				if (WALK(jtc->columns))
-					return true;
-			}
-			break;
-		case T_JsonTablePathSpec:
-			return WALK(((JsonTablePathSpec *) node)->string);
 		case T_NullTest:
 			return WALK(((NullTest *) node)->arg);
 		case T_BooleanTest:
@@ -4372,7 +3971,7 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(stmt->onConflictClause))
 					return true;
-				if (WALK(stmt->returningClause))
+				if (WALK(stmt->returningList))
 					return true;
 				if (WALK(stmt->withClause))
 					return true;
@@ -4388,7 +3987,7 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(stmt->whereClause))
 					return true;
-				if (WALK(stmt->returningClause))
+				if (WALK(stmt->returningList))
 					return true;
 				if (WALK(stmt->withClause))
 					return true;
@@ -4406,7 +4005,7 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(stmt->fromClause))
 					return true;
-				if (WALK(stmt->returningClause))
+				if (WALK(stmt->returningList))
 					return true;
 				if (WALK(stmt->withClause))
 					return true;
@@ -4424,8 +4023,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(stmt->mergeWhenClauses))
 					return true;
-				if (WALK(stmt->returningClause))
-					return true;
 				if (WALK(stmt->withClause))
 					return true;
 			}
@@ -4439,16 +4036,6 @@ raw_expression_tree_walker_impl(Node *node,
 				if (WALK(mergeWhenClause->targetList))
 					return true;
 				if (WALK(mergeWhenClause->values))
-					return true;
-			}
-			break;
-		case T_ReturningClause:
-			{
-				ReturningClause *returning = (ReturningClause *) node;
-
-				if (WALK(returning->options))
-					return true;
-				if (WALK(returning->exprs))
 					return true;
 			}
 			break;
@@ -4662,18 +4249,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_RangeGraphTable:
-			{
-				RangeGraphTable *rgt = (RangeGraphTable *) node;
-
-				if (WALK(rgt->graph_pattern))
-					return true;
-				if (WALK(rgt->columns))
-					return true;
-				if (WALK(rgt->alias))
-					return true;
-			}
-			break;
 		case T_TypeName:
 			{
 				TypeName   *tn = (TypeName *) node;
@@ -4832,28 +4407,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->labelexpr))
-					return true;
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
-					return true;
-			}
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -4979,7 +4532,9 @@ planstate_walk_members(PlanState **planstates, int nplans,
 					   planstate_tree_walker_callback walker,
 					   void *context)
 {
-	for (int j = 0; j < nplans; j++)
+	int			j;
+
+	for (j = 0; j < nplans; j++)
 	{
 		if (PSWALK(planstates[j]))
 			return true;

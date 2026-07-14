@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * src/bin/psql/large_obj.c
  */
@@ -13,10 +13,10 @@
 #include "large_obj.h"
 #include "settings.h"
 
-static void print_lo_result(const char *fmt, ...) pg_attribute_printf(1, 2);
+static void print_lo_result(const char *fmt,...) pg_attribute_printf(1, 2);
 
 static void
-print_lo_result(const char *fmt, ...)
+print_lo_result(const char *fmt,...)
 {
 	va_list		ap;
 
@@ -210,12 +210,12 @@ do_lo_import(const char *filename_arg, const char *comment_arg)
 
 		if (!(res = PSQLexec(cmdbuf)))
 		{
-			pg_free(cmdbuf);
+			free(cmdbuf);
 			return fail_lo_xact("\\lo_import", own_transaction);
 		}
 
 		PQclear(res);
-		pg_free(cmdbuf);
+		free(cmdbuf);
 	}
 
 	if (!finish_lo_xact("\\lo_import", own_transaction))

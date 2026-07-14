@@ -3,7 +3,7 @@
  * geqo_random.c
  *	   random number generator
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_random.c
@@ -15,10 +15,11 @@
 
 #include "optimizer/geqo_random.h"
 
+
 void
 geqo_set_seed(PlannerInfo *root, double seed)
 {
-	GeqoPrivateData *private = GetGeqoPrivateData(root);
+	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
 
 	pg_prng_fseed(&private->random_state, seed);
 }
@@ -26,7 +27,7 @@ geqo_set_seed(PlannerInfo *root, double seed)
 double
 geqo_rand(PlannerInfo *root)
 {
-	GeqoPrivateData *private = GetGeqoPrivateData(root);
+	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
 
 	return pg_prng_double(&private->random_state);
 }
@@ -34,7 +35,7 @@ geqo_rand(PlannerInfo *root)
 int
 geqo_randint(PlannerInfo *root, int upper, int lower)
 {
-	GeqoPrivateData *private = GetGeqoPrivateData(root);
+	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
 
 	/*
 	 * In current usage, "lower" is never negative so we can just use

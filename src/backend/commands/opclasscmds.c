@@ -4,7 +4,7 @@
  *
  *	  Routines for opclass (and opfamily) manipulation commands
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -35,13 +36,13 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "miscadmin.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -343,14 +344,13 @@ DefineOpClass(CreateOpClassStmt *stmt)
 				optsProcNumber, /* amoptsprocnum value */
 				maxProcNumber;	/* amsupport value */
 	bool		amstorage;		/* amstorage flag */
-	bool		isDefault = stmt->isDefault;
 	List	   *operators;		/* OpFamilyMember list for operators */
 	List	   *procedures;		/* OpFamilyMember list for support procs */
 	ListCell   *l;
 	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_am	amform;
-	const IndexAmRoutine *amroutine;
+	IndexAmRoutine *amroutine;
 	Datum		values[Natts_pg_opclass];
 	bool		nulls[Natts_pg_opclass];
 	AclResult	aclresult;
@@ -524,7 +524,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 #endif
 
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = false;
 				member->object = operOid;
 				member->number = item->number;
@@ -548,7 +548,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 								   get_func_name(funcOid));
 #endif
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = true;
 				member->object = funcOid;
 				member->number = item->number;
@@ -612,30 +612,11 @@ DefineOpClass(CreateOpClassStmt *stmt)
 						opcname, stmt->amname)));
 
 	/*
-	 * HACK: if we're trying to create btree_gist's gist_inet_ops or
-	 * gist_cidr_ops during a binary upgrade, avoid failure in the next stanza
-	 * by silently making the new opclass non-default.  Without this kluge, we
-	 * would fail to upgrade databases containing pre-1.9 versions of
-	 * contrib/btree_gist.  We can remove it sometime in the far future when
-	 * we don't expect any such databases to exist.  (The result of this hack
-	 * is that the installed version of btree_gist will approximate btree_gist
-	 * 1.9, how closely depending on whether it's 1.8 or something older.
-	 * ALTER EXTENSION UPDATE can be used to bring it up to real 1.9.)
-	 */
-	if (isDefault && IsBinaryUpgrade)
-	{
-		if (amoid == GIST_AM_OID &&
-			((typeoid == INETOID && strcmp(opcname, "gist_inet_ops") == 0) ||
-			 (typeoid == CIDROID && strcmp(opcname, "gist_cidr_ops") == 0)))
-			isDefault = false;
-	}
-
-	/*
 	 * If we are creating a default opclass, check there isn't one already.
 	 * (Note we do not restrict this test to visible opclasses; this ensures
 	 * that typcache.c can find unique solutions to its questions.)
 	 */
-	if (isDefault)
+	if (stmt->isDefault)
 	{
 		ScanKeyData skey[1];
 		SysScanDesc scan;
@@ -681,7 +662,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	values[Anum_pg_opclass_opcowner - 1] = ObjectIdGetDatum(GetUserId());
 	values[Anum_pg_opclass_opcfamily - 1] = ObjectIdGetDatum(opfamilyoid);
 	values[Anum_pg_opclass_opcintype - 1] = ObjectIdGetDatum(typeoid);
-	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(isDefault);
+	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(stmt->isDefault);
 	values[Anum_pg_opclass_opckeytype - 1] = ObjectIdGetDatum(storageoid);
 
 	tup = heap_form_tuple(rel->rd_att, values, nulls);
@@ -843,7 +824,7 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 				maxProcNumber;	/* amsupport value */
 	HeapTuple	tup;
 	Form_pg_am	amform;
-	const IndexAmRoutine *amroutine;
+	IndexAmRoutine *amroutine;
 
 	/* Get necessary info about access method */
 	tup = SearchSysCache1(AMNAME, CStringGetDatum(stmt->amname));
@@ -902,7 +883,7 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 				 int maxOpNumber, int maxProcNumber, int optsProcNumber,
 				 List *items)
 {
-	const IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(amoid, false);
+	IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(amoid, false);
 	List	   *operators;		/* OpFamilyMember list for operators */
 	List	   *procedures;		/* OpFamilyMember list for support procs */
 	ListCell   *l;
@@ -960,7 +941,7 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 #endif
 
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = false;
 				member->object = operOid;
 				member->number = item->number;
@@ -990,7 +971,7 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 #endif
 
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = true;
 				member->object = funcOid;
 				member->number = item->number;
@@ -1078,7 +1059,7 @@ AlterOpFamilyDrop(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 									item->number, maxOpNumber)));
 				processTypesSpec(item->class_args, &lefttype, &righttype);
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = false;
 				member->number = item->number;
 				member->lefttype = lefttype;
@@ -1094,7 +1075,7 @@ AlterOpFamilyDrop(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 									item->number, maxProcNumber)));
 				processTypesSpec(item->class_args, &lefttype, &righttype);
 				/* Save the info */
-				member = palloc0_object(OpFamilyMember);
+				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->is_func = true;
 				member->number = item->number;
 				member->lefttype = lefttype;
@@ -1185,7 +1166,9 @@ assignOperTypes(OpFamilyMember *member, Oid amoid, Oid typeoid)
 		 * the family has been created but not yet populated with the required
 		 * operators.)
 		 */
-		if (!GetIndexAmRoutineByAmId(amoid, false)->amcanorderbyop)
+		IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(amoid, false);
+
+		if (!amroutine->amcanorderbyop)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("access method \"%s\" does not support ordering operators",
@@ -1260,25 +1243,25 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid,
 	}
 
 	/*
-	 * Ordering comparison procs must be 2-arg procs returning int4.  Ordering
-	 * sortsupport procs must take internal and return void.  Ordering
-	 * in_range procs must be 5-arg procs returning bool.  Ordering equalimage
-	 * procs must take 1 arg and return bool.  Hashing support proc 1 must be
-	 * a 1-arg proc returning int4, while proc 2 must be a 2-arg proc
-	 * returning int8. Otherwise we don't know.
+	 * btree comparison procs must be 2-arg procs returning int4.  btree
+	 * sortsupport procs must take internal and return void.  btree in_range
+	 * procs must be 5-arg procs returning bool.  btree equalimage procs must
+	 * take 1 arg and return bool.  hash support proc 1 must be a 1-arg proc
+	 * returning int4, while proc 2 must be a 2-arg proc returning int8.
+	 * Otherwise we don't know.
 	 */
-	else if (GetIndexAmRoutineByAmId(amoid, false)->amcanorder)
+	else if (amoid == BTREE_AM_OID)
 	{
 		if (member->number == BTORDER_PROC)
 		{
 			if (procform->pronargs != 2)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering comparison functions must have two arguments")));
+						 errmsg("btree comparison functions must have two arguments")));
 			if (procform->prorettype != INT4OID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering comparison functions must return integer")));
+						 errmsg("btree comparison functions must return integer")));
 
 			/*
 			 * If lefttype/righttype isn't specified, use the proc's input
@@ -1295,11 +1278,11 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid,
 				procform->proargtypes.values[0] != INTERNALOID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering sort support functions must accept type \"internal\"")));
+						 errmsg("btree sort support functions must accept type \"internal\"")));
 			if (procform->prorettype != VOIDOID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering sort support functions must return void")));
+						 errmsg("btree sort support functions must return void")));
 
 			/*
 			 * Can't infer lefttype/righttype from proc, so use default rule
@@ -1310,11 +1293,11 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid,
 			if (procform->pronargs != 5)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering in_range functions must have five arguments")));
+						 errmsg("btree in_range functions must have five arguments")));
 			if (procform->prorettype != BOOLOID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering in_range functions must return boolean")));
+						 errmsg("btree in_range functions must return boolean")));
 
 			/*
 			 * If lefttype/righttype isn't specified, use the proc's input
@@ -1330,11 +1313,11 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid,
 			if (procform->pronargs != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering equal image functions must have one argument")));
+						 errmsg("btree equal image functions must have one argument")));
 			if (procform->prorettype != BOOLOID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering equal image functions must return boolean")));
+						 errmsg("btree equal image functions must return boolean")));
 
 			/*
 			 * pg_amproc functions are indexed by (lefttype, righttype), but
@@ -1347,35 +1330,10 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid,
 			if (member->lefttype != member->righttype)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("ordering equal image functions must not be cross-type")));
-		}
-		else if (member->number == BTSKIPSUPPORT_PROC)
-		{
-			if (procform->pronargs != 1 ||
-				procform->proargtypes.values[0] != INTERNALOID)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("btree skip support functions must accept type \"internal\"")));
-			if (procform->prorettype != VOIDOID)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("btree skip support functions must return void")));
-
-			/*
-			 * pg_amproc functions are indexed by (lefttype, righttype), but a
-			 * skip support function doesn't make sense in cross-type
-			 * scenarios.  The same opclass opcintype OID is always used for
-			 * lefttype and righttype.  Providing a cross-type routine isn't
-			 * sensible.  Reject cross-type ALTER OPERATOR FAMILY ...  ADD
-			 * FUNCTION 6 statements here.
-			 */
-			if (member->lefttype != member->righttype)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("btree skip support functions must not be cross-type")));
+						 errmsg("btree equal image functions must not be cross-type")));
 		}
 	}
-	else if (GetIndexAmRoutineByAmId(amoid, false)->amcanhash)
+	else if (amoid == HASH_AM_OID)
 	{
 		if (member->number == HASHSTANDARD_PROC)
 		{

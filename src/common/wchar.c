@@ -3,7 +3,7 @@
  * wchar.c
  *	  Functions for working with multibyte characters in various encodings.
  *
- * Portions Copyright (c) 1998-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1998-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/wchar.c
@@ -26,9 +26,9 @@
  * this pair specifically.  Byte pair range constraints, in encoding
  * originator documentation, always excluded this pair.  No core conversion
  * could translate it.  However, longstanding verifychar implementations
- * accepted any non-NUL byte.  big5_to_euc_tw even translates pairs not
- * valid per encoding originator documentation.  To avoid tightening core
- * or non-core conversions in a security patch, we sought this one pair.
+ * accepted any non-NUL byte.  big5_to_euc_tw and big5_to_mic even translate
+ * pairs not valid per encoding originator documentation.  To avoid tightening
+ * core or non-core conversions in a security patch, we sought this one pair.
  *
  * PQescapeString() historically used spaces for BYTE1; many other values
  * could suffice for BYTE1.
@@ -516,6 +516,39 @@ pg_utf2wchar_with_len(const unsigned char *from, pg_wchar *to, int len)
 
 
 /*
+ * Map a Unicode code point to UTF-8.  utf8string must have 4 bytes of
+ * space allocated.
+ */
+unsigned char *
+unicode_to_utf8(pg_wchar c, unsigned char *utf8string)
+{
+	if (c <= 0x7F)
+	{
+		utf8string[0] = c;
+	}
+	else if (c <= 0x7FF)
+	{
+		utf8string[0] = 0xC0 | ((c >> 6) & 0x1F);
+		utf8string[1] = 0x80 | (c & 0x3F);
+	}
+	else if (c <= 0xFFFF)
+	{
+		utf8string[0] = 0xE0 | ((c >> 12) & 0x0F);
+		utf8string[1] = 0x80 | ((c >> 6) & 0x3F);
+		utf8string[2] = 0x80 | (c & 0x3F);
+	}
+	else
+	{
+		utf8string[0] = 0xF0 | ((c >> 18) & 0x07);
+		utf8string[1] = 0x80 | ((c >> 12) & 0x3F);
+		utf8string[2] = 0x80 | ((c >> 6) & 0x3F);
+		utf8string[3] = 0x80 | (c & 0x3F);
+	}
+
+	return utf8string;
+}
+
+/*
  * Trivial conversion from pg_wchar to UTF-8.
  * caller should allocate enough space for "to"
  * len: length of from.
@@ -618,8 +651,7 @@ mbbisearch(pg_wchar ucs, const struct mbinterval *table, int max)
 }
 
 
-/*
- * The following functions define the column width of an ISO 10646
+/* The following functions define the column width of an ISO 10646
  * character as follows:
  *
  *	  - The null character (U+0000) has a column width of 0.
@@ -677,10 +709,210 @@ ucs_wcwidth(pg_wchar ucs)
 	return 1;
 }
 
+/*
+ * Convert a UTF-8 character to a Unicode code point.
+ * This is a one-character version of pg_utf2wchar_with_len.
+ *
+ * No error checks here, c must point to a long-enough string.
+ */
+pg_wchar
+utf8_to_unicode(const unsigned char *c)
+{
+	if ((*c & 0x80) == 0)
+		return (pg_wchar) c[0];
+	else if ((*c & 0xe0) == 0xc0)
+		return (pg_wchar) (((c[0] & 0x1f) << 6) |
+						   (c[1] & 0x3f));
+	else if ((*c & 0xf0) == 0xe0)
+		return (pg_wchar) (((c[0] & 0x0f) << 12) |
+						   ((c[1] & 0x3f) << 6) |
+						   (c[2] & 0x3f));
+	else if ((*c & 0xf8) == 0xf0)
+		return (pg_wchar) (((c[0] & 0x07) << 18) |
+						   ((c[1] & 0x3f) << 12) |
+						   ((c[2] & 0x3f) << 6) |
+						   (c[3] & 0x3f));
+	else
+		/* that is an invalid code on purpose */
+		return 0xffffffff;
+}
+
 static int
 pg_utf_dsplen(const unsigned char *s)
 {
 	return ucs_wcwidth(utf8_to_unicode(s));
+}
+
+/*
+ * convert mule internal code to pg_wchar
+ * caller should allocate enough space for "to"
+ * len: length of from.
+ * "from" not necessarily null terminated.
+ */
+static int
+pg_mule2wchar_with_len(const unsigned char *from, pg_wchar *to, int len)
+{
+	int			cnt = 0;
+
+	while (len > 0 && *from)
+	{
+		if (IS_LC1(*from))
+		{
+			MB2CHAR_NEED_AT_LEAST(len, 2);
+			*to = *from++ << 16;
+			*to |= *from++;
+			len -= 2;
+		}
+		else if (IS_LCPRV1(*from))
+		{
+			MB2CHAR_NEED_AT_LEAST(len, 3);
+			from++;
+			*to = *from++ << 16;
+			*to |= *from++;
+			len -= 3;
+		}
+		else if (IS_LC2(*from))
+		{
+			MB2CHAR_NEED_AT_LEAST(len, 3);
+			*to = *from++ << 16;
+			*to |= *from++ << 8;
+			*to |= *from++;
+			len -= 3;
+		}
+		else if (IS_LCPRV2(*from))
+		{
+			MB2CHAR_NEED_AT_LEAST(len, 4);
+			from++;
+			*to = *from++ << 16;
+			*to |= *from++ << 8;
+			*to |= *from++;
+			len -= 4;
+		}
+		else
+		{						/* assume ASCII */
+			*to = (unsigned char) *from++;
+			len--;
+		}
+		to++;
+		cnt++;
+	}
+	*to = 0;
+	return cnt;
+}
+
+/*
+ * convert pg_wchar to mule internal code
+ * caller should allocate enough space for "to"
+ * len: length of from.
+ * "from" not necessarily null terminated.
+ */
+static int
+pg_wchar2mule_with_len(const pg_wchar *from, unsigned char *to, int len)
+{
+	int			cnt = 0;
+
+	while (len > 0 && *from)
+	{
+		unsigned char lb;
+
+		lb = (*from >> 16) & 0xff;
+		if (IS_LC1(lb))
+		{
+			*to++ = lb;
+			*to++ = *from & 0xff;
+			cnt += 2;
+		}
+		else if (IS_LC2(lb))
+		{
+			*to++ = lb;
+			*to++ = (*from >> 8) & 0xff;
+			*to++ = *from & 0xff;
+			cnt += 3;
+		}
+		else if (IS_LCPRV1_A_RANGE(lb))
+		{
+			*to++ = LCPRV1_A;
+			*to++ = lb;
+			*to++ = *from & 0xff;
+			cnt += 3;
+		}
+		else if (IS_LCPRV1_B_RANGE(lb))
+		{
+			*to++ = LCPRV1_B;
+			*to++ = lb;
+			*to++ = *from & 0xff;
+			cnt += 3;
+		}
+		else if (IS_LCPRV2_A_RANGE(lb))
+		{
+			*to++ = LCPRV2_A;
+			*to++ = lb;
+			*to++ = (*from >> 8) & 0xff;
+			*to++ = *from & 0xff;
+			cnt += 4;
+		}
+		else if (IS_LCPRV2_B_RANGE(lb))
+		{
+			*to++ = LCPRV2_B;
+			*to++ = lb;
+			*to++ = (*from >> 8) & 0xff;
+			*to++ = *from & 0xff;
+			cnt += 4;
+		}
+		else
+		{
+			*to++ = *from & 0xff;
+			cnt += 1;
+		}
+		from++;
+		len--;
+	}
+	*to = 0;
+	return cnt;
+}
+
+/* exported for direct use by conv.c */
+int
+pg_mule_mblen(const unsigned char *s)
+{
+	int			len;
+
+	if (IS_LC1(*s))
+		len = 2;
+	else if (IS_LCPRV1(*s))
+		len = 3;
+	else if (IS_LC2(*s))
+		len = 3;
+	else if (IS_LCPRV2(*s))
+		len = 4;
+	else
+		len = 1;				/* assume ASCII */
+	return len;
+}
+
+static int
+pg_mule_dsplen(const unsigned char *s)
+{
+	int			len;
+
+	/*
+	 * Note: it's not really appropriate to assume that all multibyte charsets
+	 * are double-wide on screen.  But this seems an okay approximation for
+	 * the MULE charsets we currently support.
+	 */
+
+	if (IS_LC1(*s))
+		len = 1;
+	else if (IS_LCPRV1(*s))
+		len = 1;
+	else if (IS_LC2(*s))
+		len = 2;
+	else if (IS_LCPRV2(*s))
+		len = 2;
+	else
+		len = 1;				/* assume ASCII */
+
+	return len;
 }
 
 /*
@@ -1197,6 +1429,56 @@ pg_johab_verifystr(const unsigned char *s, int len)
 		else
 		{
 			l = pg_johab_verifychar(s, len);
+			if (l == -1)
+				break;
+		}
+		s += l;
+		len -= l;
+	}
+
+	return s - start;
+}
+
+static int
+pg_mule_verifychar(const unsigned char *s, int len)
+{
+	int			l,
+				mbl;
+	unsigned char c;
+
+	l = mbl = pg_mule_mblen(s);
+
+	if (len < l)
+		return -1;
+
+	while (--l > 0)
+	{
+		c = *++s;
+		if (!IS_HIGHBIT_SET(c))
+			return -1;
+	}
+	return mbl;
+}
+
+static int
+pg_mule_verifystr(const unsigned char *s, int len)
+{
+	const unsigned char *start = s;
+
+	while (len > 0)
+	{
+		int			l;
+
+		/* fast path for ASCII-subset characters */
+		if (!IS_HIGHBIT_SET(*s))
+		{
+			if (*s == '\0')
+				break;
+			l = 1;
+		}
+		else
+		{
+			l = pg_mule_verifychar(s, len);
 			if (l == -1)
 				break;
 		}
@@ -1800,12 +2082,12 @@ pg_utf8_islegal(const unsigned char *source, int length)
 			a = source[3];
 			if (a < 0x80 || a > 0xBF)
 				return false;
-			pg_fallthrough;
+			/* FALL THRU */
 		case 3:
 			a = source[2];
 			if (a < 0x80 || a > 0xBF)
 				return false;
-			pg_fallthrough;
+			/* FALL THRU */
 		case 2:
 			a = source[1];
 			switch (*source)
@@ -1831,7 +2113,7 @@ pg_utf8_islegal(const unsigned char *source, int length)
 						return false;
 					break;
 			}
-			pg_fallthrough;
+			/* FALL THRU */
 		case 1:
 			a = *source;
 			if (a >= 0x80 && a < 0xC2)
@@ -1860,50 +2142,52 @@ pg_encoding_set_invalid(int encoding, char *dst)
 /*
  *-------------------------------------------------------------------
  * encoding info table
+ * XXX must be sorted by the same order as enum pg_enc (in mb/pg_wchar.h)
  *-------------------------------------------------------------------
  */
 const pg_wchar_tbl pg_wchar_table[] = {
-	[PG_SQL_ASCII] = {pg_ascii2wchar_with_len, pg_wchar2single_with_len, pg_ascii_mblen, pg_ascii_dsplen, pg_ascii_verifychar, pg_ascii_verifystr, 1},
-	[PG_EUC_JP] = {pg_eucjp2wchar_with_len, pg_wchar2euc_with_len, pg_eucjp_mblen, pg_eucjp_dsplen, pg_eucjp_verifychar, pg_eucjp_verifystr, 3},
-	[PG_EUC_CN] = {pg_euccn2wchar_with_len, pg_wchar2euc_with_len, pg_euccn_mblen, pg_euccn_dsplen, pg_euccn_verifychar, pg_euccn_verifystr, 3},
-	[PG_EUC_KR] = {pg_euckr2wchar_with_len, pg_wchar2euc_with_len, pg_euckr_mblen, pg_euckr_dsplen, pg_euckr_verifychar, pg_euckr_verifystr, 3},
-	[PG_EUC_TW] = {pg_euctw2wchar_with_len, pg_wchar2euc_with_len, pg_euctw_mblen, pg_euctw_dsplen, pg_euctw_verifychar, pg_euctw_verifystr, 4},
-	[PG_EUC_JIS_2004] = {pg_eucjp2wchar_with_len, pg_wchar2euc_with_len, pg_eucjp_mblen, pg_eucjp_dsplen, pg_eucjp_verifychar, pg_eucjp_verifystr, 3},
-	[PG_UTF8] = {pg_utf2wchar_with_len, pg_wchar2utf_with_len, pg_utf_mblen, pg_utf_dsplen, pg_utf8_verifychar, pg_utf8_verifystr, 4},
-	[PG_LATIN1] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN2] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN3] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN4] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN5] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN6] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN7] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN8] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN9] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_LATIN10] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1256] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1258] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN866] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN874] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_KOI8R] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1251] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1252] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_ISO_8859_5] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_ISO_8859_6] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_ISO_8859_7] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_ISO_8859_8] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1250] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1253] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1254] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1255] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_WIN1257] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_KOI8U] = {pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},
-	[PG_SJIS] = {0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifychar, pg_sjis_verifystr, 2},
-	[PG_BIG5] = {0, 0, pg_big5_mblen, pg_big5_dsplen, pg_big5_verifychar, pg_big5_verifystr, 2},
-	[PG_GBK] = {0, 0, pg_gbk_mblen, pg_gbk_dsplen, pg_gbk_verifychar, pg_gbk_verifystr, 2},
-	[PG_UHC] = {0, 0, pg_uhc_mblen, pg_uhc_dsplen, pg_uhc_verifychar, pg_uhc_verifystr, 2},
-	[PG_GB18030] = {0, 0, pg_gb18030_mblen, pg_gb18030_dsplen, pg_gb18030_verifychar, pg_gb18030_verifystr, 4},
-	[PG_JOHAB] = {0, 0, pg_johab_mblen, pg_johab_dsplen, pg_johab_verifychar, pg_johab_verifystr, 3},
-	[PG_SHIFT_JIS_2004] = {0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifychar, pg_sjis_verifystr, 2},
+	{pg_ascii2wchar_with_len, pg_wchar2single_with_len, pg_ascii_mblen, pg_ascii_dsplen, pg_ascii_verifychar, pg_ascii_verifystr, 1},	/* PG_SQL_ASCII */
+	{pg_eucjp2wchar_with_len, pg_wchar2euc_with_len, pg_eucjp_mblen, pg_eucjp_dsplen, pg_eucjp_verifychar, pg_eucjp_verifystr, 3},	/* PG_EUC_JP */
+	{pg_euccn2wchar_with_len, pg_wchar2euc_with_len, pg_euccn_mblen, pg_euccn_dsplen, pg_euccn_verifychar, pg_euccn_verifystr, 3},	/* PG_EUC_CN */
+	{pg_euckr2wchar_with_len, pg_wchar2euc_with_len, pg_euckr_mblen, pg_euckr_dsplen, pg_euckr_verifychar, pg_euckr_verifystr, 3},	/* PG_EUC_KR */
+	{pg_euctw2wchar_with_len, pg_wchar2euc_with_len, pg_euctw_mblen, pg_euctw_dsplen, pg_euctw_verifychar, pg_euctw_verifystr, 4},	/* PG_EUC_TW */
+	{pg_eucjp2wchar_with_len, pg_wchar2euc_with_len, pg_eucjp_mblen, pg_eucjp_dsplen, pg_eucjp_verifychar, pg_eucjp_verifystr, 3},	/* PG_EUC_JIS_2004 */
+	{pg_utf2wchar_with_len, pg_wchar2utf_with_len, pg_utf_mblen, pg_utf_dsplen, pg_utf8_verifychar, pg_utf8_verifystr, 4},	/* PG_UTF8 */
+	{pg_mule2wchar_with_len, pg_wchar2mule_with_len, pg_mule_mblen, pg_mule_dsplen, pg_mule_verifychar, pg_mule_verifystr, 4},	/* PG_MULE_INTERNAL */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN1 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN2 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN3 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN4 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN5 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN6 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN7 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN8 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN9 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_LATIN10 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1256 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1258 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN866 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN874 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_KOI8R */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1251 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1252 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* ISO-8859-5 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* ISO-8859-6 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* ISO-8859-7 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* ISO-8859-8 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1250 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1253 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1254 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1255 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_WIN1257 */
+	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifychar, pg_latin1_verifystr, 1},	/* PG_KOI8U */
+	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifychar, pg_sjis_verifystr, 2},	/* PG_SJIS */
+	{0, 0, pg_big5_mblen, pg_big5_dsplen, pg_big5_verifychar, pg_big5_verifystr, 2},	/* PG_BIG5 */
+	{0, 0, pg_gbk_mblen, pg_gbk_dsplen, pg_gbk_verifychar, pg_gbk_verifystr, 2},	/* PG_GBK */
+	{0, 0, pg_uhc_mblen, pg_uhc_dsplen, pg_uhc_verifychar, pg_uhc_verifystr, 2},	/* PG_UHC */
+	{0, 0, pg_gb18030_mblen, pg_gb18030_dsplen, pg_gb18030_verifychar, pg_gb18030_verifystr, 4},	/* PG_GB18030 */
+	{0, 0, pg_johab_mblen, pg_johab_dsplen, pg_johab_verifychar, pg_johab_verifystr, 3},	/* PG_JOHAB */
+	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifychar, pg_sjis_verifystr, 2} /* PG_SHIFT_JIS_2004 */
 };
 
 /*

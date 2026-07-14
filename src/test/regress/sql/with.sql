@@ -33,11 +33,11 @@ SELECT * FROM t;
 
 -- UNION DISTINCT requires hashable type
 WITH RECURSIVE t(n) AS (
-    VALUES ('01'::varbit)
+    VALUES (1::money)
 UNION
-    SELECT n || '10'::varbit FROM t WHERE n < '100'::varbit
+    SELECT n+1::money FROM t WHERE n < 100::money
 )
-SELECT n FROM t;
+SELECT sum(n) FROM t;
 
 -- recursive view
 CREATE RECURSIVE VIEW nums (n) AS
@@ -216,20 +216,6 @@ WITH RECURSIVE subdepartment AS
 )
 SELECT * FROM subdepartment ORDER BY name;
 
--- exercise the deduplication code of a UNION with mixed input slot types
-WITH RECURSIVE subdepartment AS
-(
-	-- select all columns to prevent projection
-	SELECT id, parent_department, name FROM department WHERE name = 'A'
-
-	UNION
-
-	-- joins do projection
-	SELECT d.id, d.parent_department, d.name FROM department AS d
-	INNER JOIN subdepartment AS sd ON d.parent_department = sd.id
-)
-SELECT * FROM subdepartment ORDER BY name;
-
 -- inside subqueries
 SELECT count(*) FROM (
     WITH RECURSIVE t(n) AS (
@@ -372,25 +358,6 @@ WITH RECURSIVE cte (a) as (
 	SELECT a FROM cte
 )
 SELECT a FROM cte;
-
--- test that column statistics from a materialized CTE are available
--- to upper planner (otherwise, we'd get a stupider plan)
-explain (costs off)
-with x as materialized (select unique1 from tenk1 b)
-select count(*) from tenk1 a
-  where unique1 in (select * from x);
-
-explain (costs off)
-with x as materialized (insert into tenk1 default values returning unique1)
-select count(*) from tenk1 a
-  where unique1 in (select * from x);
-
--- test that pathkeys from a materialized CTE are propagated up to the
--- outer query
-explain (costs off)
-with x as materialized (select unique1 from tenk1 b order by unique1)
-select count(*) from tenk1 a
-  where unique1 in (select * from x);
 
 -- SEARCH clause
 
@@ -1707,14 +1674,6 @@ WITH t AS (
 )
 SELECT * FROM t;
 
--- RETURNING tries to return its own output
-WITH RECURSIVE t(action, a) AS (
-	MERGE INTO y USING (VALUES (11)) v(a) ON y.a = v.a
-		WHEN NOT MATCHED THEN INSERT VALUES (v.a)
-		RETURNING merge_action(), (SELECT a FROM t)
-)
-SELECT * FROM t;
-
 -- data-modifying WITH allowed only at the top level
 SELECT * FROM (
 	WITH t AS (UPDATE y SET a=a+1 RETURNING *)
@@ -1765,38 +1724,3 @@ create temp table with_test (i int);
 with with_test as (select 42) insert into with_test select * from with_test;
 select * from with_test;
 drop table with_test;
-
---
--- Test selectivity estimates for GROUP BY and DISTINCT subqueries/CTEs.
---
--- When a subquery or CTE has GROUP BY or DISTINCT, the planner should use
--- stadistinct from the base table for key columns, rather than falling back
--- to DEFAULT_NUM_DISTINCT.  With correct estimates, the planner picks Hash
--- Join; with the old default estimates it would pick Nested Loop.
---
-
--- Subquery with GROUP BY (OFFSET 0 prevents qual pushdown)
-EXPLAIN (COSTS OFF)
-SELECT * FROM
-  (SELECT two, thousand, avg(ten) AS avg FROM tenk1 GROUP BY two, thousand OFFSET 0) t1,
-  (SELECT two, thousand, avg(ten) AS avg FROM tenk1 GROUP BY two, thousand OFFSET 0) t2
-WHERE t1.two = 0 AND t2.two = 0 AND t1.avg = t2.avg;
-
--- Subquery with DISTINCT (OFFSET 0 prevents qual pushdown)
-EXPLAIN (COSTS OFF)
-SELECT * FROM
-  (SELECT DISTINCT two, thousand FROM tenk1 OFFSET 0) t1,
-  (SELECT DISTINCT two, thousand FROM tenk1 OFFSET 0) t2
-WHERE t1.two = 0 AND t2.two = 0 AND t1.thousand = t2.thousand;
-
--- CTE with GROUP BY
-EXPLAIN (COSTS OFF)
-WITH cte AS (SELECT two, thousand, avg(ten) AS avg FROM tenk1 GROUP BY two, thousand)
-SELECT * FROM cte t1, cte t2
-WHERE t1.two = 0 AND t2.two = 0 AND t1.avg = t2.avg;
-
--- CTE with DISTINCT
-EXPLAIN (COSTS OFF)
-WITH cte AS (SELECT DISTINCT two, thousand FROM tenk1)
-SELECT * FROM cte t1, cte t2
-WHERE t1.two = 0 AND t2.two = 0 AND t1.thousand = t2.thousand;

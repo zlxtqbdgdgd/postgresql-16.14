@@ -3,7 +3,7 @@
  * generic-gcc.h
  *	  Atomic operations, implemented using gcc (or compatible) intrinsics.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES:
@@ -30,14 +30,14 @@
 #define pg_compiler_barrier_impl()	__asm__ __volatile__("" ::: "memory")
 
 /*
- * If we're on GCC, we should be able to get a memory barrier
+ * If we're on GCC 4.1.0 or higher, we should be able to get a memory barrier
  * out of this compiler built-in.  But we prefer to rely on platform specific
  * definitions where possible, and use this only as a fallback.
  */
 #if !defined(pg_memory_barrier_impl)
 #	if defined(HAVE_GCC__ATOMIC_INT32_CAS)
 #		define pg_memory_barrier_impl()		__atomic_thread_fence(__ATOMIC_SEQ_CST)
-#	elif defined(__GNUC__)
+#	elif (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 1))
 #		define pg_memory_barrier_impl()		__sync_synchronize()
 #	endif
 #endif /* !defined(pg_memory_barrier_impl) */
@@ -60,6 +60,8 @@
 } while (0)
 #endif
 
+
+#ifdef HAVE_ATOMICS
 
 /* generic gcc based atomic flag implementation */
 #if !defined(PG_HAVE_ATOMIC_FLAG_SUPPORT) \
@@ -100,9 +102,10 @@ typedef struct pg_atomic_uint32
 	&& (defined(HAVE_GCC__ATOMIC_INT64_CAS) || defined(HAVE_GCC__SYNC_INT64_CAS))
 
 #define PG_HAVE_ATOMIC_U64_SUPPORT
+
 typedef struct pg_atomic_uint64
 {
-	alignas(8) volatile uint64 value;
+	volatile uint64 value pg_attribute_aligned(8);
 } pg_atomic_uint64;
 
 #endif /* defined(HAVE_GCC__ATOMIC_INT64_CAS) || defined(HAVE_GCC__SYNC_INT64_CAS) */
@@ -181,23 +184,6 @@ pg_atomic_compare_exchange_u32_impl(volatile pg_atomic_uint32 *ptr,
 }
 #endif
 
-/*
- * __sync_lock_test_and_set() only supports setting the value to 1 on some
- * platforms, so we only provide an __atomic implementation for
- * pg_atomic_exchange.
- *
- * We assume the availability of 32-bit __atomic_compare_exchange_n() implies
- * the availability of 32-bit __atomic_exchange_n().
- */
-#if !defined(PG_HAVE_ATOMIC_EXCHANGE_U32) && defined(HAVE_GCC__ATOMIC_INT32_CAS)
-#define PG_HAVE_ATOMIC_EXCHANGE_U32
-static inline uint32
-pg_atomic_exchange_u32_impl(volatile pg_atomic_uint32 *ptr, uint32 newval)
-{
-	return __atomic_exchange_n(&ptr->value, newval, __ATOMIC_SEQ_CST);
-}
-#endif
-
 /* if we have 32-bit __sync_val_compare_and_swap, assume we have these too: */
 
 #if !defined(PG_HAVE_ATOMIC_FETCH_ADD_U32) && defined(HAVE_GCC__SYNC_INT32_CAS)
@@ -245,7 +231,6 @@ static inline bool
 pg_atomic_compare_exchange_u64_impl(volatile pg_atomic_uint64 *ptr,
 									uint64 *expected, uint64 newval)
 {
-	AssertPointerAlignment(expected, 8);
 	return __atomic_compare_exchange_n(&ptr->value, expected, newval, false,
 									   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
@@ -259,29 +244,10 @@ pg_atomic_compare_exchange_u64_impl(volatile pg_atomic_uint64 *ptr,
 {
 	bool	ret;
 	uint64	current;
-
-	AssertPointerAlignment(expected, 8);
 	current = __sync_val_compare_and_swap(&ptr->value, *expected, newval);
 	ret = current == *expected;
 	*expected = current;
 	return ret;
-}
-#endif
-
-/*
- * __sync_lock_test_and_set() only supports setting the value to 1 on some
- * platforms, so we only provide an __atomic implementation for
- * pg_atomic_exchange.
- *
- * We assume the availability of 64-bit __atomic_compare_exchange_n() implies
- * the availability of 64-bit __atomic_exchange_n().
- */
-#if !defined(PG_HAVE_ATOMIC_EXCHANGE_U64) && defined(HAVE_GCC__ATOMIC_INT64_CAS)
-#define PG_HAVE_ATOMIC_EXCHANGE_U64
-static inline uint64
-pg_atomic_exchange_u64_impl(volatile pg_atomic_uint64 *ptr, uint64 newval)
-{
-	return __atomic_exchange_n(&ptr->value, newval, __ATOMIC_SEQ_CST);
 }
 #endif
 
@@ -324,3 +290,5 @@ pg_atomic_fetch_or_u64_impl(volatile pg_atomic_uint64 *ptr, uint64 or_)
 #endif
 
 #endif /* !defined(PG_DISABLE_64_BIT_ATOMICS) */
+
+#endif /* defined(HAVE_ATOMICS) */

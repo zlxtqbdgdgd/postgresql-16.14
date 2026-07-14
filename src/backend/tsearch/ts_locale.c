@@ -3,7 +3,7 @@
  * ts_locale.c
  *		locale compatibility layer for tsearch
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,27 +13,38 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_collation.h"
 #include "common/string.h"
 #include "storage/fd.h"
 #include "tsearch/ts_locale.h"
+#include "tsearch/ts_public.h"
 
 static void tsearch_readline_callback(void *arg);
 
 
-/* space for a single character plus a trailing NUL */
-#define WC_BUF_LEN  2
+/*
+ * The reason these functions use a 3-wchar_t output buffer, not 2 as you
+ * might expect, is that on Windows "wchar_t" is 16 bits and what we'll be
+ * getting from char2wchar() is UTF16 not UTF32.  A single input character
+ * may therefore produce a surrogate pair rather than just one wchar_t;
+ * we also need room for a trailing null.  When we do get a surrogate pair,
+ * we pass just the first code to iswdigit() etc, so that these functions will
+ * always return false for characters outside the Basic Multilingual Plane.
+ */
+#define WC_BUF_LEN  3
 
 #define GENERATE_T_ISCLASS_DEF(character_class) \
 /* mblen shall be that of the first character */ \
 int \
 t_is##character_class##_with_len(const char *ptr, int mblen) \
 { \
-	pg_wchar	wstr[WC_BUF_LEN]; \
-	int			wlen pg_attribute_unused(); \
-	wlen = pg_mb2wchar_with_len(ptr, wstr, mblen); \
-	Assert(wlen <= 1); \
-	/* pass single character, or NUL if empty */ \
-	return pg_isw##character_class(wstr[0], pg_database_locale()); \
+	int			clen = pg_mblen_with_len(ptr, mblen); \
+	wchar_t		character[WC_BUF_LEN]; \
+	pg_locale_t mylocale = 0;	/* TODO */ \
+	if (clen == 1 || database_ctype_is_c) \
+		return is##character_class(TOUCHAR(ptr)); \
+	char2wchar(character, WC_BUF_LEN, ptr, clen, mylocale); \
+	return isw##character_class((wint_t) character[0]); \
 } \
 \
 /* ptr shall point to a NUL-terminated string */ \
@@ -57,6 +68,9 @@ t_is##character_class(const char *ptr) \
 
 GENERATE_T_ISCLASS_DEF(alnum)
 GENERATE_T_ISCLASS_DEF(alpha)
+GENERATE_T_ISCLASS_DEF(digit)
+GENERATE_T_ISCLASS_DEF(print)
+GENERATE_T_ISCLASS_DEF(space)
 
 /*
  * Set up to read a file using tsearch_readline().  This facility is
@@ -93,7 +107,7 @@ tsearch_readline_begin(tsearch_readline_state *stp,
 	stp->curline = NULL;
 	/* Setup error traceback support for ereport() */
 	stp->cb.callback = tsearch_readline_callback;
-	stp->cb.arg = stp;
+	stp->cb.arg = (void *) stp;
 	stp->cb.previous = error_context_stack;
 	error_context_stack = &stp->cb;
 	return true;
@@ -192,4 +206,93 @@ tsearch_readline_callback(void *arg)
 		errcontext("line %d of configuration file \"%s\"",
 				   stp->lineno,
 				   stp->filename);
+}
+
+
+/*
+ * lowerstr --- fold null-terminated string to lower case
+ *
+ * Returned string is palloc'd
+ */
+char *
+lowerstr(const char *str)
+{
+	return lowerstr_with_len(str, strlen(str));
+}
+
+/*
+ * lowerstr_with_len --- fold string to lower case
+ *
+ * Input string need not be null-terminated.
+ *
+ * Returned string is palloc'd
+ */
+char *
+lowerstr_with_len(const char *str, int len)
+{
+	char	   *out;
+	pg_locale_t mylocale = 0;	/* TODO */
+
+	if (len == 0)
+		return pstrdup("");
+
+	/*
+	 * Use wide char code only when max encoding length > 1 and ctype != C.
+	 * Some operating systems fail with multi-byte encodings and a C locale.
+	 * Also, for a C locale there is no need to process as multibyte. From
+	 * backend/utils/adt/oracle_compat.c Teodor
+	 */
+	if (pg_database_encoding_max_length() > 1 && !database_ctype_is_c)
+	{
+		wchar_t    *wstr,
+				   *wptr;
+		int			wlen;
+
+		/*
+		 * alloc number of wchar_t for worst case, len contains number of
+		 * bytes >= number of characters and alloc 1 wchar_t for 0, because
+		 * wchar2char wants zero-terminated string
+		 */
+		wptr = wstr = (wchar_t *) palloc(sizeof(wchar_t) * (len + 1));
+
+		wlen = char2wchar(wstr, len + 1, str, len, mylocale);
+		Assert(wlen <= len);
+
+		while (*wptr)
+		{
+			*wptr = towlower((wint_t) *wptr);
+			wptr++;
+		}
+
+		/*
+		 * Alloc result string for worst case + '\0'
+		 */
+		len = pg_database_encoding_max_length() * wlen + 1;
+		out = (char *) palloc(len);
+
+		wlen = wchar2char(out, wstr, len, mylocale);
+
+		pfree(wstr);
+
+		if (wlen < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+					 errmsg("conversion from wchar_t to server encoding failed: %m")));
+		Assert(wlen < len);
+	}
+	else
+	{
+		const char *ptr = str;
+		char	   *outptr;
+
+		outptr = out = (char *) palloc(sizeof(char) * (len + 1));
+		while ((ptr - str) < len && *ptr)
+		{
+			*outptr++ = tolower(TOUCHAR(ptr));
+			ptr++;
+		}
+		*outptr = '\0';
+	}
+
+	return out;
 }

@@ -10,7 +10,7 @@
 #include "plpy_elog.h"
 #include "plpy_main.h"
 #include "plpy_procedure.h"
-#include "plpy_util.h"
+#include "plpython.h"
 
 PyObject   *PLy_exc_error = NULL;
 PyObject   *PLy_exc_fatal = NULL;
@@ -41,7 +41,7 @@ static bool set_string_attr(PyObject *obj, char *attrname, char *str);
  * in the context.
  */
 void
-PLy_elog_impl(int elevel, const char *fmt, ...)
+PLy_elog_impl(int elevel, const char *fmt,...)
 {
 	int			save_errno = errno;
 	char	   *volatile xmsg = NULL;
@@ -487,7 +487,7 @@ get_source_line(const char *src, int lineno)
 
 /* call PyErr_SetString with a vprint interface and translation support */
 void
-PLy_exception_set(PyObject *exc, const char *fmt, ...)
+PLy_exception_set(PyObject *exc, const char *fmt,...)
 {
 	char		buf[1024];
 	va_list		ap;
@@ -503,7 +503,7 @@ PLy_exception_set(PyObject *exc, const char *fmt, ...)
 void
 PLy_exception_set_plural(PyObject *exc,
 						 const char *fmt_singular, const char *fmt_plural,
-						 unsigned long n, ...)
+						 unsigned long n,...)
 {
 	char		buf[1024];
 	va_list		ap;
@@ -584,13 +584,12 @@ get_string_attr(PyObject *obj, char *attrname, char **str)
 	val = PyObject_GetAttrString(obj, attrname);
 	if (val != NULL && val != Py_None)
 	{
-		*str = PLyUnicode_AsString(val);
+		*str = pstrdup(PLyUnicode_AsString(val));
 	}
 	Py_XDECREF(val);
 }
 
-/*
- * set an object attribute to a string value, returns true when the set was
+/* set an object attribute to a string value, returns true when the set was
  * successful
  */
 static bool

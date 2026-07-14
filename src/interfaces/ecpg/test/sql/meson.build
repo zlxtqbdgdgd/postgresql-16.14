@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 pgc_files = [
   'array',
@@ -26,8 +26,6 @@ pgc_files = [
   'show',
   'sqlda',
   'sqljson',
-  'sqljson_jsontable',
-  'sqlpgq',
   'twophase',
 ]
 

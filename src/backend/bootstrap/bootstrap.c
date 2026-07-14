@@ -4,7 +4,7 @@
  *	  routines to support running postgres in 'bootstrap' mode
  *	bootstrap mode is used to create the initial template database
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,35 +23,34 @@
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/index.h"
-#include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/link-canary.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
-#include "port/pg_getopt_ctx.h"
-#include "postmaster/postmaster.h"
+#include "pg_getopt.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/checksum.h"
-#include "storage/fd.h"
+#include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
-#include "storage/shmem_internal.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relmapper.h"
+
+uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 
 static void CheckerModeMain(void);
 static void bootstrap_signals(void);
 static Form_pg_attribute AllocateAttribute(void);
-static void InsertOneProargdefaultsValue(char *value);
 static void populate_typ_list(void);
 static Oid	gettype(char *type);
 static void cleanup(void);
@@ -97,30 +96,34 @@ static const struct typinfo TypInfo[] = {
 	F_BYTEAIN, F_BYTEAOUT},
 	{"char", CHAROID, 0, 1, true, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, InvalidOid,
 	F_CHARIN, F_CHAROUT},
-	{"cstring", CSTRINGOID, 0, -2, false, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, InvalidOid,
-	F_CSTRING_IN, F_CSTRING_OUT},
 	{"int2", INT2OID, 0, 2, true, TYPALIGN_SHORT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_INT2IN, F_INT2OUT},
 	{"int4", INT4OID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_INT4IN, F_INT4OUT},
-	{"int8", INT8OID, 0, 8, true, TYPALIGN_DOUBLE, TYPSTORAGE_PLAIN, InvalidOid,
-	F_INT8IN, F_INT8OUT},
 	{"float4", FLOAT4OID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_FLOAT4IN, F_FLOAT4OUT},
-	{"float8", FLOAT8OID, 0, 8, true, TYPALIGN_DOUBLE, TYPSTORAGE_PLAIN, InvalidOid,
-	F_FLOAT8IN, F_FLOAT8OUT},
 	{"name", NAMEOID, CHAROID, NAMEDATALEN, false, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, C_COLLATION_OID,
 	F_NAMEIN, F_NAMEOUT},
+	{"regclass", REGCLASSOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_REGCLASSIN, F_REGCLASSOUT},
 	{"regproc", REGPROCOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGPROCIN, F_REGPROCOUT},
+	{"regtype", REGTYPEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_REGTYPEIN, F_REGTYPEOUT},
+	{"regrole", REGROLEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_REGROLEIN, F_REGROLEOUT},
+	{"regnamespace", REGNAMESPACEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_REGNAMESPACEIN, F_REGNAMESPACEOUT},
 	{"text", TEXTOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_TEXTIN, F_TEXTOUT},
-	{"jsonb", JSONBOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
-	F_JSONB_IN, F_JSONB_OUT},
 	{"oid", OIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_OIDIN, F_OIDOUT},
-	{"aclitem", ACLITEMOID, 0, 16, false, TYPALIGN_DOUBLE, TYPSTORAGE_PLAIN, InvalidOid,
-	F_ACLITEMIN, F_ACLITEMOUT},
+	{"tid", TIDOID, 0, 6, false, TYPALIGN_SHORT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_TIDIN, F_TIDOUT},
+	{"xid", XIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_XIDIN, F_XIDOUT},
+	{"cid", CIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_CIDIN, F_CIDOUT},
 	{"pg_node_tree", PG_NODE_TREEOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_PG_NODE_TREE_IN, F_PG_NODE_TREE_OUT},
 	{"int2vector", INT2VECTOROID, INT2OID, -1, false, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
@@ -129,13 +132,13 @@ static const struct typinfo TypInfo[] = {
 	F_OIDVECTORIN, F_OIDVECTOROUT},
 	{"_int4", INT4ARRAYOID, INT4OID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_text", TEXTARRAYOID, TEXTOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
+	{"_text", 1009, TEXTOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_oid", OIDARRAYOID, OIDOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
+	{"_oid", 1028, OIDOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_char", CHARARRAYOID, CHAROID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
+	{"_char", 1002, CHAROID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_aclitem", ACLITEMARRAYOID, ACLITEMOID, -1, false, TYPALIGN_DOUBLE, TYPSTORAGE_EXTENDED, InvalidOid,
+	{"_aclitem", 1034, ACLITEMOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT}
 };
 
@@ -149,43 +152,6 @@ struct typmap
 
 static List *Typ = NIL;			/* List of struct typmap* */
 static struct typmap *Ap = NULL;
-
-/*
- * Basic information about built-in roles.
- *
- * Presently, this need only list roles that are mentioned in aclitem arrays
- * in the catalog .dat files.  We might as well list everything that is in
- * pg_authid.dat, since there aren't that many.  Like pg_authid.dat, we
- * represent the bootstrap superuser's name as "POSTGRES", even though it
- * (probably) won't be that in the finished installation; this means aclitem
- * entries in .dat files must spell it like that.
- */
-struct rolinfo
-{
-	const char *rolname;
-	Oid			oid;
-};
-
-static const struct rolinfo RolInfo[] = {
-	{"POSTGRES", BOOTSTRAP_SUPERUSERID},
-	{"pg_database_owner", ROLE_PG_DATABASE_OWNER},
-	{"pg_read_all_data", ROLE_PG_READ_ALL_DATA},
-	{"pg_write_all_data", ROLE_PG_WRITE_ALL_DATA},
-	{"pg_monitor", ROLE_PG_MONITOR},
-	{"pg_read_all_settings", ROLE_PG_READ_ALL_SETTINGS},
-	{"pg_read_all_stats", ROLE_PG_READ_ALL_STATS},
-	{"pg_stat_scan_tables", ROLE_PG_STAT_SCAN_TABLES},
-	{"pg_read_server_files", ROLE_PG_READ_SERVER_FILES},
-	{"pg_write_server_files", ROLE_PG_WRITE_SERVER_FILES},
-	{"pg_execute_server_program", ROLE_PG_EXECUTE_SERVER_PROGRAM},
-	{"pg_signal_backend", ROLE_PG_SIGNAL_BACKEND},
-	{"pg_checkpoint", ROLE_PG_CHECKPOINT},
-	{"pg_maintain", ROLE_PG_MAINTAIN},
-	{"pg_use_reserved_connections", ROLE_PG_USE_RESERVED_CONNECTIONS},
-	{"pg_create_subscription", ROLE_PG_CREATE_SUBSCRIPTION},
-	{"pg_signal_autovacuum_worker", ROLE_PG_SIGNAL_AUTOVACUUM_WORKER}
-};
-
 
 static Datum values[MAXATTR];	/* current row's attribute values */
 static bool Nulls[MAXATTR];
@@ -238,11 +204,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 {
 	int			i;
 	char	   *progname = argv[0];
-	pg_getopt_ctx optctx;
 	int			flag;
 	char	   *userDoption = NULL;
-	uint32		bootstrap_data_checksum_version = PG_DATA_CHECKSUM_OFF;
-	yyscan_t	scanner;
 
 	Assert(!IsUnderPostmaster);
 
@@ -258,46 +221,32 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	argv++;
 	argc--;
 
-	pg_getopt_start(&optctx, argc, argv, "B:c:d:D:Fkr:X:-:");
-	while ((flag = pg_getopt_next(&optctx)) != -1)
+	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:X:-:")) != -1)
 	{
 		switch (flag)
 		{
 			case 'B':
-				SetConfigOption("shared_buffers", optctx.optarg, PGC_POSTMASTER, PGC_S_ARGV);
+				SetConfigOption("shared_buffers", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
-			case '-':
-
-				/*
-				 * Error if the user misplaced a special must-be-first option
-				 * for dispatching to a subprogram.  parse_dispatch_option()
-				 * returns DISPATCH_POSTMASTER if it doesn't find a match, so
-				 * error for anything else.
-				 */
-				if (parse_dispatch_option(optctx.optarg) != DISPATCH_POSTMASTER)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("--%s must be first argument", optctx.optarg)));
-
-				pg_fallthrough;
 			case 'c':
+			case '-':
 				{
 					char	   *name,
 							   *value;
 
-					ParseLongOption(optctx.optarg, &name, &value);
+					ParseLongOption(optarg, &name, &value);
 					if (!value)
 					{
 						if (flag == '-')
 							ereport(ERROR,
 									(errcode(ERRCODE_SYNTAX_ERROR),
 									 errmsg("--%s requires a value",
-											optctx.optarg)));
+											optarg)));
 						else
 							ereport(ERROR,
 									(errcode(ERRCODE_SYNTAX_ERROR),
 									 errmsg("-c %s requires a value",
-											optctx.optarg)));
+											optarg)));
 					}
 
 					SetConfigOption(name, value, PGC_POSTMASTER, PGC_S_ARGV);
@@ -306,14 +255,14 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 					break;
 				}
 			case 'D':
-				userDoption = pstrdup(optctx.optarg);
+				userDoption = pstrdup(optarg);
 				break;
 			case 'd':
 				{
 					/* Turn on debugging for the bootstrap process. */
 					char	   *debugstr;
 
-					debugstr = psprintf("debug%s", optctx.optarg);
+					debugstr = psprintf("debug%s", optarg);
 					SetConfigOption("log_min_messages", debugstr,
 									PGC_POSTMASTER, PGC_S_ARGV);
 					SetConfigOption("client_min_messages", debugstr,
@@ -328,10 +277,19 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 				bootstrap_data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 				break;
 			case 'r':
-				strlcpy(OutputFileName, optctx.optarg, MAXPGPATH);
+				strlcpy(OutputFileName, optarg, MAXPGPATH);
 				break;
 			case 'X':
-				SetConfigOption("wal_segment_size", optctx.optarg, PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+				{
+					int			WalSegSz = strtoul(optarg, NULL, 0);
+
+					if (!IsValidWalSegSize(WalSegSz))
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("-X requires a power of two value between 1 MB and 1 GB")));
+					SetConfigOption("wal_segment_size", optarg, PGC_INTERNAL,
+									PGC_S_DYNAMIC_DEFAULT);
+				}
 				break;
 			default:
 				write_stderr("Try \"%s --help\" for more information.\n",
@@ -341,7 +299,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 		}
 	}
 
-	if (argc != optctx.optind)
+	if (argc != optind)
 	{
 		write_stderr("%s: invalid command-line arguments\n", progname);
 		proc_exit(1);
@@ -363,27 +321,9 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	SetProcessingMode(BootstrapProcessing);
 	IgnoreSystemIndexes = true;
 
-	RegisterBuiltinShmemCallbacks();
-
 	InitializeMaxBackends();
 
-	/*
-	 * Even though bootstrapping runs in single-process mode, initialize
-	 * postmaster child slots array so that --check can detect running out of
-	 * shared memory or other resources if max_connections is set too high.
-	 */
-	InitPostmasterChildSlots();
-
-	InitializeFastPathLocks();
-
-	ShmemCallRequestCallbacks();
 	CreateSharedMemoryAndSemaphores();
-
-	/*
-	 * Estimate number of openable files.  This is essential too in --check
-	 * mode, because on some platforms semaphores count as open files.
-	 */
-	set_max_safe_fds();
 
 	/*
 	 * XXX: It might make sense to move this into its own function at some
@@ -405,7 +345,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	BaseInit();
 
 	bootstrap_signals();
-	BootStrapXLOG(bootstrap_data_checksum_version);
+	BootStrapXLOG();
 
 	/*
 	 * To ensure that src/common/link-canary.c is linked into the backend, we
@@ -414,7 +354,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	if (pg_link_canary_is_frontend())
 		elog(ERROR, "backend is incorrectly linked to frontend functions");
 
-	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, 0, NULL);
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, false, false, NULL);
 
 	/* Initialize stuff for bootstrap-file processing */
 	for (i = 0; i < MAXATTR; i++)
@@ -423,14 +363,11 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 		Nulls[i] = false;
 	}
 
-	if (boot_yylex_init(&scanner) != 0)
-		elog(ERROR, "yylex_init() failed: %m");
-
 	/*
 	 * Process bootstrap input.
 	 */
 	StartTransactionCommand();
-	boot_yyparse(scanner);
+	boot_yyparse();
 	CommitTransactionCommand();
 
 	/*
@@ -463,10 +400,10 @@ bootstrap_signals(void)
 	 * mode; "curl up and die" is a sufficient response for all these cases.
 	 * Let's set that handling explicitly, as documentation if nothing else.
 	 */
-	pqsignal(SIGHUP, PG_SIG_DFL);
-	pqsignal(SIGINT, PG_SIG_DFL);
-	pqsignal(SIGTERM, PG_SIG_DFL);
-	pqsignal(SIGQUIT, PG_SIG_DFL);
+	pqsignal(SIGHUP, SIG_DFL);
+	pqsignal(SIGINT, SIG_DFL);
+	pqsignal(SIGTERM, SIG_DFL);
+	pqsignal(SIGQUIT, SIG_DFL);
 }
 
 /* ----------------------------------------------------------------
@@ -507,8 +444,8 @@ boot_openrel(char *relname)
 	{
 		if (attrtypes[i] == NULL)
 			attrtypes[i] = AllocateAttribute();
-		memmove(attrtypes[i],
-				TupleDescAttr(boot_reldesc->rd_att, i),
+		memmove((char *) attrtypes[i],
+				(char *) TupleDescAttr(boot_reldesc->rd_att, i),
 				ATTRIBUTE_FIXED_PART_SIZE);
 
 		{
@@ -624,6 +561,8 @@ DefineAttr(char *name, char *type, int attnum, int nullness)
 	if (OidIsValid(attrtypes[attnum]->attcollation))
 		attrtypes[attnum]->attcollation = C_COLLATION_OID;
 
+	attrtypes[attnum]->attstattarget = -1;
+	attrtypes[attnum]->attcacheoff = -1;
 	attrtypes[attnum]->atttypmod = -1;
 	attrtypes[attnum]->attislocal = true;
 
@@ -700,7 +639,6 @@ InsertOneTuple(void)
 void
 InsertOneValue(char *value, int i)
 {
-	Form_pg_attribute attr;
 	Oid			typoid;
 	int16		typlen;
 	bool		typbyval;
@@ -709,42 +647,19 @@ InsertOneValue(char *value, int i)
 	Oid			typioparam;
 	Oid			typinput;
 	Oid			typoutput;
-	Oid			typcollation;
 
 	Assert(i >= 0 && i < MAXATTR);
 
 	elog(DEBUG4, "inserting column %d value \"%s\"", i, value);
 
-	attr = TupleDescAttr(RelationGetDescr(boot_reldesc), i);
-	typoid = attr->atttypid;
+	typoid = TupleDescAttr(boot_reldesc->rd_att, i)->atttypid;
 
 	boot_get_type_io_data(typoid,
 						  &typlen, &typbyval, &typalign,
 						  &typdelim, &typioparam,
-						  &typinput, &typoutput,
-						  &typcollation);
+						  &typinput, &typoutput);
 
-	/*
-	 * pg_node_tree values can't be inserted normally (pg_node_tree_in would
-	 * just error out), so provide special cases for such columns that we
-	 * would like to fill during bootstrap.
-	 */
-	if (typoid == PG_NODE_TREEOID)
-	{
-		/* pg_proc.proargdefaults */
-		if (RelationGetRelid(boot_reldesc) == ProcedureRelationId &&
-			i == Anum_pg_proc_proargdefaults - 1)
-			InsertOneProargdefaultsValue(value);
-		else					/* maybe other cases later */
-			elog(ERROR, "can't handle pg_node_tree input for %s.%s",
-				 RelationGetRelationName(boot_reldesc),
-				 NameStr(attr->attname));
-	}
-	else
-	{
-		/* Normal case */
-		values[i] = OidInputFunctionCall(typinput, value, typioparam, -1);
-	}
+	values[i] = OidInputFunctionCall(typinput, value, typioparam, -1);
 
 	/*
 	 * We use ereport not elog here so that parameters aren't evaluated unless
@@ -753,111 +668,6 @@ InsertOneValue(char *value, int i)
 	ereport(DEBUG4,
 			(errmsg_internal("inserted -> %s",
 							 OidOutputFunctionCall(typoutput, values[i]))));
-}
-
-/* ----------------
- *		InsertOneProargdefaultsValue
- *
- * In general, proargdefaults can be a list of any expressions, but
- * for bootstrap we only support a list of Const nodes.  The input
- * has the form of a text array, and we feed non-null elements to the
- * typinput functions for the appropriate parameters.
- * ----------------
- */
-static void
-InsertOneProargdefaultsValue(char *value)
-{
-	int			pronargs;
-	oidvector  *proargtypes;
-	Datum		arrayval;
-	Datum	   *array_datums;
-	bool	   *array_nulls;
-	int			array_count;
-	List	   *proargdefaults;
-	char	   *nodestring;
-
-	/* The pg_proc columns we need to use must have been filled already */
-	StaticAssertDecl(Anum_pg_proc_pronargs < Anum_pg_proc_proargdefaults,
-					 "pronargs must come before proargdefaults");
-	StaticAssertDecl(Anum_pg_proc_pronargdefaults < Anum_pg_proc_proargdefaults,
-					 "pronargdefaults must come before proargdefaults");
-	StaticAssertDecl(Anum_pg_proc_proargtypes < Anum_pg_proc_proargdefaults,
-					 "proargtypes must come before proargdefaults");
-	if (Nulls[Anum_pg_proc_pronargs - 1])
-		elog(ERROR, "pronargs must not be null");
-	if (Nulls[Anum_pg_proc_proargtypes - 1])
-		elog(ERROR, "proargtypes must not be null");
-	pronargs = DatumGetInt16(values[Anum_pg_proc_pronargs - 1]);
-	proargtypes = DatumGetPointer(values[Anum_pg_proc_proargtypes - 1]);
-	Assert(pronargs == proargtypes->dim1);
-
-	/* Parse the input string as an array value, then deconstruct to Datums */
-	arrayval = OidFunctionCall3(F_ARRAY_IN,
-								CStringGetDatum(value),
-								ObjectIdGetDatum(CSTRINGOID),
-								Int32GetDatum(-1));
-	deconstruct_array_builtin(DatumGetArrayTypeP(arrayval), CSTRINGOID,
-							  &array_datums, &array_nulls, &array_count);
-
-	/* The values should correspond to the last N argtypes */
-	if (array_count > pronargs)
-		elog(ERROR, "too many proargdefaults entries");
-
-	/* Build the List of Const nodes */
-	proargdefaults = NIL;
-	for (int i = 0; i < array_count; i++)
-	{
-		Oid			argtype = proargtypes->values[pronargs - array_count + i];
-		int16		typlen;
-		bool		typbyval;
-		char		typalign;
-		char		typdelim;
-		Oid			typioparam;
-		Oid			typinput;
-		Oid			typoutput;
-		Oid			typcollation;
-		Datum		defval;
-		bool		defnull;
-		Const	   *defConst;
-
-		boot_get_type_io_data(argtype,
-							  &typlen, &typbyval, &typalign,
-							  &typdelim, &typioparam,
-							  &typinput, &typoutput,
-							  &typcollation);
-
-		defnull = array_nulls[i];
-		if (defnull)
-			defval = (Datum) 0;
-		else
-			defval = OidInputFunctionCall(typinput,
-										  DatumGetCString(array_datums[i]),
-										  typioparam, -1);
-
-		defConst = makeConst(argtype,
-							 -1,	/* never any typmod */
-							 typcollation,
-							 typlen,
-							 defval,
-							 defnull,
-							 typbyval);
-		proargdefaults = lappend(proargdefaults, defConst);
-	}
-
-	/*
-	 * Flatten the List to a node-tree string, then convert to a text datum,
-	 * which is the storage representation of pg_node_tree.
-	 */
-	nodestring = nodeToString(proargdefaults);
-	values[Anum_pg_proc_proargdefaults - 1] = CStringGetTextDatum(nodestring);
-	Nulls[Anum_pg_proc_proargdefaults - 1] = false;
-
-	/*
-	 * Hack: fill in pronargdefaults with the right value.  This is surely
-	 * ugly, but it beats making the programmer do it.
-	 */
-	values[Anum_pg_proc_pronargdefaults - 1] = Int16GetDatum(array_count);
-	Nulls[Anum_pg_proc_pronargdefaults - 1] = false;
 }
 
 /* ----------------
@@ -913,7 +723,7 @@ populate_typ_list(void)
 		Form_pg_type typForm = (Form_pg_type) GETSTRUCT(tup);
 		struct typmap *newtyp;
 
-		newtyp = palloc_object(struct typmap);
+		newtyp = (struct typmap *) palloc(sizeof(struct typmap));
 		Typ = lappend(Typ, newtyp);
 
 		newtyp->am_oid = typForm->oid;
@@ -1000,11 +810,10 @@ gettype(char *type)
  *		boot_get_type_io_data
  *
  * Obtain type I/O information at bootstrap time.  This intentionally has
- * an API very close to that of lsyscache.c's get_type_io_data, except that
+ * almost the same API as lsyscache.c's get_type_io_data, except that
  * we only support obtaining the typinput and typoutput routines, not
- * the binary I/O routines, and we also return the type's collation.
- * This is exported so that array_in and array_out can be made to work
- * during early bootstrap.
+ * the binary I/O routines.  It is exported so that array_in and array_out
+ * can be made to work during early bootstrap.
  * ----------------
  */
 void
@@ -1015,8 +824,7 @@ boot_get_type_io_data(Oid typid,
 					  char *typdelim,
 					  Oid *typioparam,
 					  Oid *typinput,
-					  Oid *typoutput,
-					  Oid *typcollation)
+					  Oid *typoutput)
 {
 	if (Typ != NIL)
 	{
@@ -1047,8 +855,6 @@ boot_get_type_io_data(Oid typid,
 
 		*typinput = ap->am_typ.typinput;
 		*typoutput = ap->am_typ.typoutput;
-
-		*typcollation = ap->am_typ.typcollation;
 	}
 	else
 	{
@@ -1077,28 +883,7 @@ boot_get_type_io_data(Oid typid,
 
 		*typinput = TypInfo[typeindex].inproc;
 		*typoutput = TypInfo[typeindex].outproc;
-
-		*typcollation = TypInfo[typeindex].collation;
 	}
-}
-
-/* ----------------
- *		boot_get_role_oid
- *
- * Look up a role name at bootstrap time.  This is equivalent to
- * get_role_oid(rolname, true): return the role OID or InvalidOid if
- * not found.  We only need to cope with built-in role names.
- * ----------------
- */
-Oid
-boot_get_role_oid(const char *rolname)
-{
-	for (int i = 0; i < lengthof(RolInfo); i++)
-	{
-		if (strcmp(RolInfo[i].rolname, rolname) == 0)
-			return RolInfo[i].oid;
-	}
-	return InvalidOid;
 }
 
 /* ----------------
@@ -1129,7 +914,7 @@ AllocateAttribute(void)
 void
 index_register(Oid heap,
 			   Oid ind,
-			   const IndexInfo *indexInfo)
+			   IndexInfo *indexInfo)
 {
 	IndexList  *newind;
 	MemoryContext oldcxt;
@@ -1147,10 +932,10 @@ index_register(Oid heap,
 
 	oldcxt = MemoryContextSwitchTo(nogc);
 
-	newind = palloc_object(IndexList);
+	newind = (IndexList *) palloc(sizeof(IndexList));
 	newind->il_heap = heap;
 	newind->il_ind = ind;
-	newind->il_info = palloc_object(IndexInfo);
+	newind->il_info = (IndexInfo *) palloc(sizeof(IndexInfo));
 
 	memcpy(newind->il_info, indexInfo, sizeof(IndexInfo));
 	/* expressions will likely be null, but may as well copy it */
@@ -1188,7 +973,7 @@ build_indices(void)
 		heap = table_open(ILHead->il_heap, NoLock);
 		ind = index_open(ILHead->il_ind, NoLock);
 
-		index_build(heap, ind, ILHead->il_info, false, false, false);
+		index_build(heap, ind, ILHead->il_info, false, false);
 
 		index_close(ind, NoLock);
 		table_close(heap, NoLock);

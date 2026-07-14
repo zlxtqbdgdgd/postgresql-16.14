@@ -126,16 +126,16 @@ int SPI_connect_ext(int <parameter>options</parameter>)
      </para>
     </listitem>
    </varlistentry>
-  </variablelist>
 
-  <para>
-   The fact that these functions return <type>int</type>
-   not <type>void</type> is historical.  All failure cases are reported
-   via <function>ereport</function> or <function>elog</function>.
-   (In versions before <productname>PostgreSQL</productname> v10,
-   some but not all failures would be reported with a result value
-   of <symbol>SPI_ERROR_CONNECT</symbol>.)
-  </para>
+   <varlistentry>
+    <term><symbol>SPI_ERROR_CONNECT</symbol></term>
+    <listitem>
+     <para>
+      on error
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
  </refsect1>
 </refentry>
 
@@ -301,9 +301,8 @@ SPI_execute("INSERT INTO foo SELECT * FROM bar RETURNING *", false, 5);
    is returned in the global variable <varname>SPI_processed</varname>.
    If the return value of the function is <symbol>SPI_OK_SELECT</symbol>,
    <symbol>SPI_OK_INSERT_RETURNING</symbol>,
-   <symbol>SPI_OK_DELETE_RETURNING</symbol>,
-   <symbol>SPI_OK_UPDATE_RETURNING</symbol>, or
-   <symbol>SPI_OK_MERGE_RETURNING</symbol>,
+   <symbol>SPI_OK_DELETE_RETURNING</symbol>, or
+   <symbol>SPI_OK_UPDATE_RETURNING</symbol>,
    then you can use the
    global pointer <literal>SPITupleTable *SPI_tuptable</literal> to
    access the result rows.  Some utility commands (such as
@@ -470,15 +469,6 @@ typedef struct SPITupleTable
      <listitem>
       <para>
        if an <command>UPDATE RETURNING</command> was executed
-      </para>
-     </listitem>
-    </varlistentry>
-
-    <varlistentry>
-     <term><symbol>SPI_OK_MERGE_RETURNING</symbol></term>
-     <listitem>
-      <para>
-       if a <command>MERGE RETURNING</command> was executed
       </para>
      </listitem>
     </varlistentry>
@@ -845,8 +835,8 @@ int SPI_execute_extended(const char *<parameter>command</parameter>,
  <refsynopsisdiv>
 <synopsis>
 int SPI_execute_with_args(const char *<parameter>command</parameter>,
-                          int <parameter>nargs</parameter>, const Oid *<parameter>argtypes</parameter>,
-                          const Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
+                          int <parameter>nargs</parameter>, Oid *<parameter>argtypes</parameter>,
+                          Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
                           bool <parameter>read_only</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -997,7 +987,7 @@ int SPI_execute_with_args(const char *<parameter>command</parameter>,
 
  <refsynopsisdiv>
 <synopsis>
-SPIPlanPtr SPI_prepare(const char * <parameter>command</parameter>, int <parameter>nargs</parameter>, const Oid * <parameter>argtypes</parameter>)
+SPIPlanPtr SPI_prepare(const char * <parameter>command</parameter>, int <parameter>nargs</parameter>, Oid * <parameter>argtypes</parameter>)
 </synopsis>
  </refsynopsisdiv>
 
@@ -1160,7 +1150,7 @@ SPIPlanPtr SPI_prepare(const char * <parameter>command</parameter>, int <paramet
  <refsynopsisdiv>
 <synopsis>
 SPIPlanPtr SPI_prepare_cursor(const char * <parameter>command</parameter>, int <parameter>nargs</parameter>,
-                              const Oid * <parameter>argtypes</parameter>, int <parameter>cursorOptions</parameter>)
+                              Oid * <parameter>argtypes</parameter>, int <parameter>cursorOptions</parameter>)
 </synopsis>
  </refsynopsisdiv>
 
@@ -1671,7 +1661,7 @@ bool SPI_is_cursor_plan(SPIPlanPtr <parameter>plan</parameter>)
 
  <refsynopsisdiv>
 <synopsis>
-int SPI_execute_plan(SPIPlanPtr <parameter>plan</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
+int SPI_execute_plan(SPIPlanPtr <parameter>plan</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
                      bool <parameter>read_only</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -2086,7 +2076,7 @@ int SPI_execute_plan_with_paramlist(SPIPlanPtr <parameter>plan</parameter>,
 
  <refsynopsisdiv>
 <synopsis>
-int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>, long <parameter>count</parameter>)
+int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
 
@@ -2191,7 +2181,7 @@ int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, const Datum * <parameter>v
  <refsynopsisdiv>
 <synopsis>
 Portal SPI_cursor_open(const char * <parameter>name</parameter>, SPIPlanPtr <parameter>plan</parameter>,
-                       const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
+                       Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
                        bool <parameter>read_only</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -2316,8 +2306,8 @@ Portal SPI_cursor_open(const char * <parameter>name</parameter>, SPIPlanPtr <par
 <synopsis>
 Portal SPI_cursor_open_with_args(const char *<parameter>name</parameter>,
                                  const char *<parameter>command</parameter>,
-                                 int <parameter>nargs</parameter>, const Oid *<parameter>argtypes</parameter>,
-                                 const Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
+                                 int <parameter>nargs</parameter>, Oid *<parameter>argtypes</parameter>,
+                                 Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
                                  bool <parameter>read_only</parameter>, int <parameter>cursorOptions</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -4694,7 +4684,7 @@ HeapTupleHeader SPI_returntuple(HeapTuple <parameter>row</parameter>, TupleDesc 
  <refsynopsisdiv>
 <synopsis>
 HeapTuple SPI_modifytuple(Relation <parameter>rel</parameter>, HeapTuple <parameter>row</parameter>, int <parameter>ncols</parameter>,
-                          const int * <parameter>colnum</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>)
+                          int * <parameter>colnum</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>)
 </synopsis>
  </refsynopsisdiv>
 

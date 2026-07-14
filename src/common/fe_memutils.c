@@ -3,7 +3,7 @@
  * fe_memutils.c
  *	  memory management support for frontend code
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,8 +21,8 @@
 
 #include "common/int.h"
 
-pg_noreturn static pg_noinline void add_size_error(Size s1, Size s2);
-pg_noreturn static pg_noinline void mul_size_error(Size s1, Size s2);
+static pg_noinline void add_size_error(Size s1, Size s2) pg_attribute_noreturn();
+static pg_noinline void mul_size_error(Size s1, Size s2) pg_attribute_noreturn();
 
 
 static inline void *
@@ -203,7 +203,7 @@ add_size(Size s1, Size s2)
 	return result;
 }
 
-pg_noreturn static pg_noinline void
+static pg_noinline void
 add_size_error(Size s1, Size s2)
 {
 	fprintf(stderr, _("invalid memory allocation request size %zu + %zu\n"),
@@ -222,7 +222,7 @@ mul_size(Size s1, Size s2)
 	return result;
 }
 
-pg_noreturn static pg_noinline void
+static pg_noinline void
 mul_size_error(Size s1, Size s2)
 {
 	fprintf(stderr, _("invalid memory allocation request size %zu * %zu\n"),

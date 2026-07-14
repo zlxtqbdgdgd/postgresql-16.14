@@ -7,7 +7,7 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/prepare.c
@@ -21,23 +21,21 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
-#include "commands/explain.h"
-#include "commands/explain_format.h"
-#include "commands/explain_state.h"
 #include "commands/prepare.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/analyze.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_type.h"
+#include "rewrite/rewriteHandler.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
-#include "utils/hsearch.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
-#include "utils/tuplestore.h"
 
 
 /*
@@ -257,7 +255,7 @@ ExecuteQuery(ParseState *pstate,
 	 */
 	PortalStart(portal, paramLI, eflags, GetActiveSnapshot());
 
-	(void) PortalRun(portal, count, false, dest, dest, qc);
+	(void) PortalRun(portal, count, false, true, dest, dest, qc);
 
 	PortalDrop(portal, false);
 
@@ -566,12 +564,13 @@ DropAllPreparedStatements(void)
  * "into" is NULL unless we are doing EXPLAIN CREATE TABLE AS EXECUTE,
  * in which case executing the query should result in creating that table.
  *
- * Note: the passed-in pstate's queryString is that of the EXPLAIN EXECUTE,
+ * Note: the passed-in queryString is that of the EXPLAIN EXECUTE,
  * not the original PREPARE; we get the latter string from the plancache.
  */
 void
 ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
-					ParseState *pstate, ParamListInfo params)
+					const char *queryString, ParamListInfo params,
+					QueryEnvironment *queryEnv)
 {
 	PreparedStatement *entry;
 	const char *query_string;
@@ -584,19 +583,6 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	instr_time	planduration;
 	BufferUsage bufusage_start,
 				bufusage;
-	MemoryContextCounters mem_counters;
-	MemoryContext planner_ctx = NULL;
-	MemoryContext saved_ctx = NULL;
-
-	if (es->memory)
-	{
-		/* See ExplainOneQuery about this */
-		Assert(IsA(CurrentMemoryContext, AllocSetContext));
-		planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
-											"explain analyze planner context",
-											ALLOCSET_DEFAULT_SIZES);
-		saved_ctx = MemoryContextSwitchTo(planner_ctx);
-	}
 
 	if (es->buffers)
 		bufusage_start = pgBufferUsage;
@@ -614,10 +600,10 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	/* Evaluate parameters, if any */
 	if (entry->plansource->num_params)
 	{
-		ParseState *pstate_params;
+		ParseState *pstate;
 
-		pstate_params = make_parsestate(NULL);
-		pstate_params->p_sourcetext = pstate->p_sourcetext;
+		pstate = make_parsestate(NULL);
+		pstate->p_sourcetext = queryString;
 
 		/*
 		 * Need an EState to evaluate parameters; must not delete it till end
@@ -628,21 +614,15 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 		estate = CreateExecutorState();
 		estate->es_param_list_info = params;
 
-		paramLI = EvaluateParams(pstate_params, entry, execstmt->params, estate);
+		paramLI = EvaluateParams(pstate, entry, execstmt->params, estate);
 	}
 
 	/* Replan if needed, and acquire a transient refcount */
 	cplan = GetCachedPlan(entry->plansource, paramLI,
-						  CurrentResourceOwner, pstate->p_queryEnv);
+						  CurrentResourceOwner, queryEnv);
 
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
-
-	if (es->memory)
-	{
-		MemoryContextSwitchTo(saved_ctx);
-		MemoryContextMemConsumed(planner_ctx, &mem_counters);
-	}
 
 	/* calc differences of buffer counters. */
 	if (es->buffers)
@@ -659,11 +639,11 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 		PlannedStmt *pstmt = lfirst_node(PlannedStmt, p);
 
 		if (pstmt->commandType != CMD_UTILITY)
-			ExplainOnePlan(pstmt, into, es, query_string, paramLI, pstate->p_queryEnv,
-						   &planduration, (es->buffers ? &bufusage : NULL),
-						   es->memory ? &mem_counters : NULL);
+			ExplainOnePlan(pstmt, into, es, query_string, paramLI, queryEnv,
+						   &planduration, (es->buffers ? &bufusage : NULL));
 		else
-			ExplainOneUtility(pstmt->utilityStmt, into, es, pstate, paramLI);
+			ExplainOneUtility(pstmt->utilityStmt, into, es, query_string,
+							  paramLI, queryEnv);
 
 		/* No need for CommandCounterIncrement, as ExplainOnePlan did it */
 
@@ -720,7 +700,7 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 
 				result_types = palloc_array(Oid, result_desc->natts);
 				for (int i = 0; i < result_desc->natts; i++)
-					result_types[i] = TupleDescAttr(result_desc, i)->atttypid;
+					result_types[i] = result_desc->attrs[i].atttypid;
 				values[4] = build_regtype_array(result_types, result_desc->natts);
 			}
 			else

@@ -3,7 +3,7 @@
  * pqmq.c
  *	  Use the frontend/backend protocol for communication over a shm_mq
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/libpq/pqmq.c
@@ -14,22 +14,19 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
-#include "commands/repack.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqmq.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/logicalworker.h"
-#include "storage/latch.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
-#include "utils/wait_event.h"
 
-static shm_mq_handle *pq_mq_handle = NULL;
+static shm_mq_handle *pq_mq_handle;
 static bool pq_mq_busy = false;
 static pid_t pq_mq_parallel_leader_pid = 0;
-static ProcNumber pq_mq_parallel_leader_proc_number = INVALID_PROC_NUMBER;
+static pid_t pq_mq_parallel_leader_backend_id = InvalidBackendId;
 
 static void pq_cleanup_redirect_to_shm_mq(dsm_segment *seg, Datum arg);
 static void mq_comm_reset(void);
@@ -40,12 +37,12 @@ static int	mq_putmessage(char msgtype, const char *s, size_t len);
 static void mq_putmessage_noblock(char msgtype, const char *s, size_t len);
 
 static const PQcommMethods PqCommMqMethods = {
-	.comm_reset = mq_comm_reset,
-	.flush = mq_flush,
-	.flush_if_writable = mq_flush_if_writable,
-	.is_send_pending = mq_is_send_pending,
-	.putmessage = mq_putmessage,
-	.putmessage_noblock = mq_putmessage_noblock
+	mq_comm_reset,
+	mq_flush,
+	mq_flush_if_writable,
+	mq_is_send_pending,
+	mq_putmessage,
+	mq_putmessage_noblock
 };
 
 /*
@@ -69,11 +66,7 @@ pq_redirect_to_shm_mq(dsm_segment *seg, shm_mq_handle *mqh)
 static void
 pq_cleanup_redirect_to_shm_mq(dsm_segment *seg, Datum arg)
 {
-	if (pq_mq_handle != NULL)
-	{
-		pfree(pq_mq_handle);
-		pq_mq_handle = NULL;
-	}
+	pq_mq_handle = NULL;
 	whereToSendOutput = DestNone;
 }
 
@@ -82,11 +75,11 @@ pq_cleanup_redirect_to_shm_mq(dsm_segment *seg, Datum arg)
  * message data via the shm_mq.
  */
 void
-pq_set_parallel_leader(pid_t pid, ProcNumber procNumber)
+pq_set_parallel_leader(pid_t pid, BackendId backend_id)
 {
 	Assert(PqCommMethods == &PqCommMqMethods);
 	pq_mq_parallel_leader_pid = pid;
-	pq_mq_parallel_leader_proc_number = procNumber;
+	pq_mq_parallel_leader_backend_id = backend_id;
 }
 
 static void
@@ -138,10 +131,8 @@ mq_putmessage(char msgtype, const char *s, size_t len)
 	if (pq_mq_busy)
 	{
 		if (pq_mq_handle != NULL)
-		{
 			shm_mq_detach(pq_mq_handle);
-			pq_mq_handle = NULL;
-		}
+		pq_mq_handle = NULL;
 		return EOF;
 	}
 
@@ -161,6 +152,8 @@ mq_putmessage(char msgtype, const char *s, size_t len)
 	iov[1].data = s;
 	iov[1].len = len;
 
+	Assert(pq_mq_handle != NULL);
+
 	for (;;)
 	{
 		/*
@@ -168,7 +161,6 @@ mq_putmessage(char msgtype, const char *s, size_t len)
 		 * that the shared memory value is updated before we send the parallel
 		 * message signal right after this.
 		 */
-		Assert(pq_mq_handle != NULL);
 		result = shm_mq_sendv(pq_mq_handle, iov, 2, true, true);
 
 		if (pq_mq_parallel_leader_pid != 0)
@@ -176,17 +168,13 @@ mq_putmessage(char msgtype, const char *s, size_t len)
 			if (IsLogicalParallelApplyWorker())
 				SendProcSignal(pq_mq_parallel_leader_pid,
 							   PROCSIG_PARALLEL_APPLY_MESSAGE,
-							   pq_mq_parallel_leader_proc_number);
-			else if (AmRepackWorker())
-				SendProcSignal(pq_mq_parallel_leader_pid,
-							   PROCSIG_REPACK_MESSAGE,
-							   pq_mq_parallel_leader_proc_number);
+							   pq_mq_parallel_leader_backend_id);
 			else
 			{
 				Assert(IsParallelWorker());
 				SendProcSignal(pq_mq_parallel_leader_pid,
 							   PROCSIG_PARALLEL_MESSAGE,
-							   pq_mq_parallel_leader_proc_number);
+							   pq_mq_parallel_leader_backend_id);
 			}
 		}
 
@@ -194,7 +182,7 @@ mq_putmessage(char msgtype, const char *s, size_t len)
 			break;
 
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, 0,
-						 WAIT_EVENT_MESSAGE_QUEUE_PUT_MESSAGE);
+						 WAIT_EVENT_MQ_PUT_MESSAGE);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -335,7 +323,7 @@ pq_parse_errornotice(StringInfo msg, ErrorData *edata)
 				edata->funcname = pstrdup(value);
 				break;
 			default:
-				elog(ERROR, "unrecognized error field code: %d", code);
+				elog(ERROR, "unrecognized error field code: %d", (int) code);
 				break;
 		}
 	}

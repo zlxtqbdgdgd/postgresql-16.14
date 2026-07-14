@@ -2,7 +2,7 @@
  *
  * walmethods.c - implementations of different ways to write received wal
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/walmethods.c
@@ -11,7 +11,6 @@
 
 #include "postgres_fe.h"
 
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,7 +26,8 @@
 #include "common/file_utils.h"
 #include "common/logging.h"
 #include "pgtar.h"
-#include "walmethods.h"
+#include "receivelog.h"
+#include "streamutil.h"
 
 /* Size of zlib buffer for .tar.gz */
 #define ZLIB_OUT_SIZE 4096
@@ -55,7 +55,7 @@ static int	dir_sync(Walfile *f);
 static bool dir_finish(WalWriteMethod *wwmethod);
 static void dir_free(WalWriteMethod *wwmethod);
 
-static const WalWriteMethodOps WalDirectoryMethodOps = {
+const WalWriteMethodOps WalDirectoryMethodOps = {
 	.open_for_write = dir_open_for_write,
 	.close = dir_close,
 	.existsfile = dir_existsfile,
@@ -102,7 +102,7 @@ static char *
 dir_get_file_name(WalWriteMethod *wwmethod,
 				  const char *pathname, const char *temp_suffix)
 {
-	char	   *filename = pg_malloc0_array(char, MAXPGPATH);
+	char	   *filename = pg_malloc0(MAXPGPATH * sizeof(char));
 
 	snprintf(filename, MAXPGPATH, "%s%s%s",
 			 pathname,
@@ -275,7 +275,7 @@ dir_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		}
 	}
 
-	f = pg_malloc0_object(DirectoryMethodFile);
+	f = pg_malloc0(sizeof(DirectoryMethodFile));
 #ifdef HAVE_LIBZ
 	if (wwmethod->compression_algorithm == PG_COMPRESSION_GZIP)
 		f->gzfp = gzfp;
@@ -359,7 +359,7 @@ dir_write(Walfile *f, const void *buf, size_t count)
 				return -1;
 			}
 
-			inbuf = ((const char *) inbuf) + chunk;
+			inbuf = ((char *) inbuf) + chunk;
 		}
 
 		/* Our caller keeps track of the uncompressed size. */
@@ -594,11 +594,6 @@ dir_existsfile(WalWriteMethod *wwmethod, const char *pathname)
 
 	fd = open(tmppath, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
-
-		/*
-		 * Skip setting dir_data->lasterrno here because we are only checking
-		 * for existence.
-		 */
 		return false;
 	close(fd);
 	return true;
@@ -643,7 +638,7 @@ CreateWalDirectoryMethod(const char *basedir,
 {
 	DirectoryMethodData *wwmethod;
 
-	wwmethod = pg_malloc0_object(DirectoryMethodData);
+	wwmethod = pg_malloc0(sizeof(DirectoryMethodData));
 	*((const WalWriteMethodOps **) &wwmethod->base.ops) =
 		&WalDirectoryMethodOps;
 	wwmethod->base.compression_algorithm = compression_algorithm;
@@ -676,7 +671,7 @@ static int	tar_sync(Walfile *f);
 static bool tar_finish(WalWriteMethod *wwmethod);
 static void tar_free(WalWriteMethod *wwmethod);
 
-static const WalWriteMethodOps WalTarMethodOps = {
+const WalWriteMethodOps WalTarMethodOps = {
 	.open_for_write = tar_open_for_write,
 	.close = tar_close,
 	.existsfile = tar_existsfile,
@@ -710,7 +705,7 @@ typedef struct TarMethodData
 
 #ifdef HAVE_LIBZ
 static bool
-tar_write_compressed_data(TarMethodData *tar_data, const void *buf, size_t count,
+tar_write_compressed_data(TarMethodData *tar_data, void *buf, size_t count,
 						  bool flush)
 {
 	tar_data->zp->next_in = buf;
@@ -787,7 +782,8 @@ tar_write(Walfile *f, const void *buf, size_t count)
 #ifdef HAVE_LIBZ
 	else if (f->wwmethod->compression_algorithm == PG_COMPRESSION_GZIP)
 	{
-		if (!tar_write_compressed_data(tar_data, buf, count, false))
+		if (!tar_write_compressed_data(tar_data, unconstify(void *, buf),
+									   count, false))
 			return -1;
 		f->currpos += count;
 		return count;
@@ -825,7 +821,7 @@ static char *
 tar_get_file_name(WalWriteMethod *wwmethod, const char *pathname,
 				  const char *temp_suffix)
 {
-	char	   *filename = pg_malloc0_array(char, MAXPGPATH);
+	char	   *filename = pg_malloc0(MAXPGPATH * sizeof(char));
 
 	snprintf(filename, MAXPGPATH, "%s%s",
 			 pathname, temp_suffix ? temp_suffix : "");
@@ -859,7 +855,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 #ifdef HAVE_LIBZ
 		if (wwmethod->compression_algorithm == PG_COMPRESSION_GZIP)
 		{
-			tar_data->zp = pg_malloc_object(z_stream);
+			tar_data->zp = (z_streamp) pg_malloc(sizeof(z_stream));
 			tar_data->zp->zalloc = Z_NULL;
 			tar_data->zp->zfree = Z_NULL;
 			tar_data->zp->opaque = Z_NULL;
@@ -893,7 +889,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		return NULL;
 	}
 
-	tar_data->currentfile = pg_malloc0_object(TarMethodFile);
+	tar_data->currentfile = pg_malloc0(sizeof(TarMethodFile));
 	tar_data->currentfile->base.wwmethod = wwmethod;
 
 	tmppath = tar_get_file_name(wwmethod, pathname, temp_suffix);
@@ -1135,7 +1131,7 @@ tar_close(Walfile *f, WalCloseMethod method)
 	 * possibly also renaming the file. We overwrite the entire current header
 	 * when done, including the checksum.
 	 */
-	print_tar_number(&(tf->header[TAR_OFFSET_SIZE]), 12, filesize);
+	print_tar_number(&(tf->header[124]), 12, filesize);
 
 	if (method == CLOSE_NORMAL)
 
@@ -1143,10 +1139,9 @@ tar_close(Walfile *f, WalCloseMethod method)
 		 * We overwrite it with what it was before if we have no tempname,
 		 * since we're going to write the buffer anyway.
 		 */
-		strlcpy(&(tf->header[TAR_OFFSET_NAME]), tf->base.pathname, 100);
+		strlcpy(&(tf->header[0]), tf->base.pathname, 100);
 
-	print_tar_number(&(tf->header[TAR_OFFSET_CHECKSUM]), 8,
-					 tarChecksum(((TarMethodFile *) f)->header));
+	print_tar_number(&(tf->header[148]), 8, tarChecksum(((TarMethodFile *) f)->header));
 	if (lseek(tar_data->fd, tf->ofs_start, SEEK_SET) != ((TarMethodFile *) f)->ofs_start)
 	{
 		f->wwmethod->lasterrno = errno;
@@ -1360,7 +1355,7 @@ CreateWalTarMethod(const char *tarbase,
 	const char *suffix = (compression_algorithm == PG_COMPRESSION_GZIP) ?
 		".tar.gz" : ".tar";
 
-	wwmethod = pg_malloc0_object(TarMethodData);
+	wwmethod = pg_malloc0(sizeof(TarMethodData));
 	*((const WalWriteMethodOps **) &wwmethod->base.ops) =
 		&WalTarMethodOps;
 	wwmethod->base.compression_algorithm = compression_algorithm;

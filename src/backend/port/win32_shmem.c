@@ -3,7 +3,7 @@
  * win32_shmem.c
  *	  Implement shared memory using win32 facilities
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32_shmem.c
@@ -389,7 +389,7 @@ retry:
 	 * Initialize space allocation status for segment.
 	 */
 	hdr->totalsize = size;
-	hdr->content_offset = MAXALIGN(sizeof(PGShmemHeader));
+	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
 	hdr->dsm_control = 0;
 
 	/* Save info for possible future use */
@@ -401,11 +401,6 @@ retry:
 	on_shmem_exit(pgwin32_SharedMemoryDelete, PointerGetDatum(hmap2));
 
 	*shim = hdr;
-
-	/* Report whether huge pages are in use */
-	SetConfigOption("huge_pages_status", (flProtect & SEC_LARGE_PAGES) ?
-					"on" : "off", PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
-
 	return hdr;
 }
 
@@ -643,7 +638,7 @@ check_huge_page_size(int *newval, void **extra, GucSource source)
 {
 	if (*newval != 0)
 	{
-		GUC_check_errdetail("\"huge_page_size\" must be 0 on this platform.");
+		GUC_check_errdetail("huge_page_size must be 0 on this platform.");
 		return false;
 	}
 	return true;

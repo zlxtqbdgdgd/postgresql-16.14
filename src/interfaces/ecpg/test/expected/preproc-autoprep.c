@@ -248,7 +248,7 @@ if (sqlca.sqlcode < 0) sqlprint();}
 
 }
 
-int main(void) {
+int main() {
   test();
   test();     /* retry */
 

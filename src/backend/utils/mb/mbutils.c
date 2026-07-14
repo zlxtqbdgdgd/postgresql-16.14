@@ -23,7 +23,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,10 +37,11 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "mb/pg_wchar.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
+#include "utils/syscache.h"
 #include "varatt.h"
 
 /*
@@ -98,11 +99,11 @@ static char *perform_default_encoding_conversion(const char *src,
 												 int len, bool is_client_to_server);
 static int	cliplen(const char *str, int len, int limit);
 
-pg_noreturn
+pg_attribute_noreturn()
 static void report_invalid_encoding_int(int encoding, const char *mbstr,
 										int mblen, int len);
 
-pg_noreturn
+pg_attribute_noreturn()
 static void report_invalid_encoding_db(const char *mbstr, int mblen, int len);
 
 
@@ -505,8 +506,7 @@ pg_do_encoding_conversion_buf(Oid proc,
  * Convert string to encoding encoding_name. The source
  * encoding is the DB encoding.
  *
- * BYTEA convert_to(TEXT string, NAME encoding_name)
- */
+ * BYTEA convert_to(TEXT string, NAME encoding_name) */
 Datum
 pg_convert_to(PG_FUNCTION_ARGS)
 {
@@ -531,8 +531,7 @@ pg_convert_to(PG_FUNCTION_ARGS)
  * Convert string from encoding encoding_name. The destination
  * encoding is the DB encoding.
  *
- * TEXT convert_from(BYTEA string, NAME encoding_name)
- */
+ * TEXT convert_from(BYTEA string, NAME encoding_name) */
 Datum
 pg_convert_from(PG_FUNCTION_ARGS)
 {
@@ -595,19 +594,19 @@ pg_convert(PG_FUNCTION_ARGS)
 												  src_encoding,
 												  dest_encoding);
 
-
-	/* return source string if no conversion happened */
-	if (dest_str == src_str)
-		PG_RETURN_BYTEA_P(string);
+	/* update len if conversion actually happened */
+	if (dest_str != src_str)
+		len = strlen(dest_str);
 
 	/*
 	 * build bytea data type structure.
 	 */
-	len = strlen(dest_str);
 	retval = (bytea *) palloc(len + VARHDRSZ);
 	SET_VARSIZE(retval, len + VARHDRSZ);
 	memcpy(VARDATA(retval), dest_str, len);
-	pfree(dest_str);
+
+	if (dest_str != src_str)
+		pfree(dest_str);
 
 	/* free memory if allocated by the toaster */
 	PG_FREE_IF_COPY(string, 0);
@@ -872,7 +871,7 @@ perform_default_encoding_conversion(const char *src, int len,
  * may call this outside any transaction, or in an aborted transaction.
  */
 void
-pg_unicode_to_server(char32_t c, unsigned char *s)
+pg_unicode_to_server(pg_wchar c, unsigned char *s)
 {
 	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
 	int			c_as_utf8_len;
@@ -934,7 +933,7 @@ pg_unicode_to_server(char32_t c, unsigned char *s)
  * but simply return false on conversion failure.
  */
 bool
-pg_unicode_to_server_noerror(char32_t c, unsigned char *s)
+pg_unicode_to_server_noerror(pg_wchar c, unsigned char *s)
 {
 	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
 	int			c_as_utf8_len;
@@ -1178,8 +1177,7 @@ pg_mbstrlen(const char *mbstr)
 	return len;
 }
 
-/*
- * returns the length (counted in wchars) of a multibyte string
+/* returns the length (counted in wchars) of a multibyte string
  * (stops at the first of "limit" or a NUL)
  */
 int
@@ -1309,24 +1307,31 @@ SetMessageEncoding(int encoding)
 #ifdef ENABLE_NLS
 /*
  * Make one bind_textdomain_codeset() call, translating a pg_enc to a gettext
- * codeset.  Can fail for gettext-internal causes like out-of-memory.
+ * codeset.  Fails for MULE_INTERNAL, an encoding unknown to gettext; can also
+ * fail for gettext-internal causes like out-of-memory.
  */
 static bool
 raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
 {
 	bool		elog_ok = (CurrentMemoryContext != NULL);
+	int			i;
 
-	if (!PG_VALID_ENCODING(encoding) || pg_enc2gettext_tbl[encoding] == NULL)
-		return false;
+	for (i = 0; pg_enc2gettext_tbl[i].name != NULL; i++)
+	{
+		if (pg_enc2gettext_tbl[i].encoding == encoding)
+		{
+			if (bind_textdomain_codeset(domainname,
+										pg_enc2gettext_tbl[i].name) != NULL)
+				return true;
 
-	if (bind_textdomain_codeset(domainname,
-								pg_enc2gettext_tbl[encoding]) != NULL)
-		return true;
+			if (elog_ok)
+				elog(LOG, "bind_textdomain_codeset failed");
+			else
+				write_stderr("bind_textdomain_codeset failed");
 
-	if (elog_ok)
-		elog(LOG, "bind_textdomain_codeset failed");
-	else
-		write_stderr("bind_textdomain_codeset failed");
+			break;
+		}
+	}
 
 	return false;
 }
@@ -1429,7 +1434,8 @@ PG_encoding_to_char(PG_FUNCTION_ARGS)
 /*
  * gettext() returns messages in this encoding.  This often matches the
  * database encoding, but it differs for SQL_ASCII databases, for processes
- * not attached to a database.
+ * not attached to a database, and under a database encoding lacking iconv
+ * support (MULE_INTERNAL).
  */
 int
 GetMessageEncoding(void)
@@ -1500,7 +1506,7 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[3]++;
 				break;
 			}
-			pg_fallthrough;
+			/* FALL THRU */
 		case 3:
 			a = charptr[2];
 			if (a < 0xBF)
@@ -1508,7 +1514,7 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[2]++;
 				break;
 			}
-			pg_fallthrough;
+			/* FALL THRU */
 		case 2:
 			a = charptr[1];
 			switch (*charptr)
@@ -1528,7 +1534,7 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[1]++;
 				break;
 			}
-			pg_fallthrough;
+			/* FALL THRU */
 		case 1:
 			a = *charptr;
 			if (a == 0x7F || a == 0xDF || a == 0xEF || a == 0xF4)
@@ -1931,7 +1937,7 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 	 */
 	if (codepage != 0)
 	{
-		utf16 = palloc_array(WCHAR, len + 1);
+		utf16 = (WCHAR *) palloc(sizeof(WCHAR) * (len + 1));
 		dstlen = MultiByteToWideChar(codepage, 0, str, len, utf16, len);
 		utf16[dstlen] = (WCHAR) 0;
 	}
@@ -1955,7 +1961,7 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 		else
 			utf8 = (char *) str;
 
-		utf16 = palloc_array(WCHAR, len + 1);
+		utf16 = (WCHAR *) palloc(sizeof(WCHAR) * (len + 1));
 		dstlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, utf16, len);
 		utf16[dstlen] = (WCHAR) 0;
 

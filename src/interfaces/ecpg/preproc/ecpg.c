@@ -1,7 +1,7 @@
 /* src/interfaces/ecpg/preproc/ecpg.c */
 
 /* Main for ecpg, the PostgreSQL embedded SQL precompiler. */
-/* Copyright (c) 1996-2026, PostgreSQL Global Development Group */
+/* Copyright (c) 1996-2023, PostgreSQL Global Development Group */
 
 #include "postgres_fe.h"
 
@@ -20,7 +20,6 @@ bool		autocommit = false,
 			regression_mode = false,
 			auto_prepare = false;
 
-static const char *progname;
 char	   *output_filename;
 
 enum COMPAT_MODE compat = ECPG_COMPAT_PGSQL;
@@ -140,6 +139,7 @@ main(int argc, char *const argv[])
 	bool		verbose = false,
 				header_mode = false;
 	struct _include_path *ip;
+	const char *progname;
 	char		my_exec_path[MAXPGPATH];
 	char		include_path[MAXPGPATH];
 
@@ -227,8 +227,8 @@ main(int argc, char *const argv[])
 
 				if (base_yyout == NULL)
 				{
-					fprintf(stderr, _("%s: could not open file \"%s\": %m\n"),
-							progname, output_filename);
+					fprintf(stderr, _("%s: could not open file \"%s\": %s\n"),
+							progname, output_filename, strerror(errno));
 					output_filename = NULL;
 				}
 				else
@@ -342,8 +342,8 @@ main(int argc, char *const argv[])
 					base_yyout = fopen(output_filename, PG_BINARY_W);
 					if (base_yyout == NULL)
 					{
-						fprintf(stderr, _("%s: could not open file \"%s\": %m\n"),
-								progname, output_filename);
+						fprintf(stderr, _("%s: could not open file \"%s\": %s\n"),
+								progname, output_filename, strerror(errno));
 						free(output_filename);
 						output_filename = NULL;
 						free(input_filename);
@@ -353,8 +353,8 @@ main(int argc, char *const argv[])
 			}
 
 			if (base_yyin == NULL)
-				fprintf(stderr, _("%s: could not open file \"%s\": %m\n"),
-						progname, argv[fnr]);
+				fprintf(stderr, _("%s: could not open file \"%s\": %s\n"),
+						progname, argv[fnr], strerror(errno));
 			else
 			{
 				struct cursor *ptr;

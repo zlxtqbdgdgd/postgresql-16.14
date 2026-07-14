@@ -1,5 +1,5 @@
 
-# Copyright (c) 2023-2026, PostgreSQL Global Development Group
+# Copyright (c) 2023, PostgreSQL Global Development Group
 
 =pod
 
@@ -30,7 +30,7 @@ compare the results of cross-version upgrade tests.
 package PostgreSQL::Test::AdjustUpgrade;
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use Exporter 'import';
 use PostgreSQL::Version;
@@ -86,19 +86,13 @@ sub adjust_database_contents
 
 	# remove dbs of modules known to cause pg_upgrade to fail
 	# anything not builtin and incompatible should clean up its own db
-	foreach my $bad_module ('adminpack', 'test_ddl_deparse', 'tsearch2')
+	foreach my $bad_module ('test_ddl_deparse', 'tsearch2')
 	{
 		if ($dbnames{"contrib_regression_$bad_module"})
 		{
 			_add_st($result, 'postgres',
 				"drop database contrib_regression_$bad_module");
 			delete($dbnames{"contrib_regression_$bad_module"});
-		}
-		if ($dbnames{"regression_$bad_module"})
-		{
-			_add_st($result, 'postgres',
-				"drop database regression_$bad_module");
-			delete($dbnames{"regression_$bad_module"});
 		}
 	}
 
@@ -110,67 +104,6 @@ sub adjust_database_contents
 			'contrib_regression_test_extensions',
 			'drop extension if exists test_ext_cine',
 			'drop extension if exists test_ext7');
-	}
-
-	# refint was removed in v20
-	if ($old_version < 20)
-	{
-		if ($dbnames{"contrib_regression_autoinc"})
-		{
-			_add_st($result, 'contrib_regression_autoinc',
-				'drop extension if exists refint cascade');
-		}
-		if ($dbnames{"regression_spi"})
-		{
-			_add_st($result, 'regression_spi',
-				'drop extension if exists refint cascade');
-		}
-	}
-
-	# btree_gist inet/cidr indexes cannot be upgraded to v19
-	if ($old_version < 19)
-	{
-		if ($dbnames{"contrib_regression_btree_gist"})
-		{
-			_add_st(
-				$result,
-				'contrib_regression_btree_gist',
-				"drop index if exists public.inettmp_a_a1_idx");
-			_add_st(
-				$result,
-				'contrib_regression_btree_gist',
-				"drop index if exists public.inetidx");
-			_add_st(
-				$result,
-				'contrib_regression_btree_gist',
-				"drop index public.cidridx");
-		}
-		if ($dbnames{"regression_btree_gist"})
-		{
-			_add_st($result, 'regression_btree_gist',
-				"drop index if exists public.inettmp_a_a1_idx");
-			_add_st($result, 'regression_btree_gist',
-				"drop index if exists public.inetidx");
-			_add_st($result, 'regression_btree_gist',
-				"drop index public.cidridx");
-		}
-	}
-
-	# we removed these test-support functions in v18
-	if ($old_version < 18)
-	{
-		_add_st($result, 'regression', 'drop function ttdummy()');
-		_add_st($result, 'regression', 'drop function set_ttdummy(integer)');
-		_add_st($result, 'regression', 'drop function autoinc()');
-		_add_st($result, 'regression', 'drop function check_foreign_key()');
-		_add_st($result, 'regression', 'drop function check_primary_key()');
-	}
-
-	# we removed this test-support function in v17
-	if ($old_version >= 15 && $old_version < 17)
-	{
-		_add_st($result, 'regression',
-			'drop function get_columns_length(oid[])');
 	}
 
 	# stuff not supported from release 16
@@ -210,14 +143,6 @@ sub adjust_database_contents
 				$result, $regrdb,
 				'drop function if exists public.putenv(text)',
 				'drop function if exists public.wait_pid(integer)');
-		}
-
-		# delete seg row that pre-14 was printed incorrectly but would now
-		# be printed correctly
-		if ($dbnames{contrib_regression_seg})
-		{
-			_add_st($result, 'contrib_regression_seg',
-				"delete from test_seg where s = '4.6 .. ~7.0'");
 		}
 	}
 
@@ -303,32 +228,6 @@ sub adjust_database_contents
 			'drop operator if exists public.=> (bigint, NONE)');
 	}
 
-	# Version 19 changed the output format of pg_lsn.  To avoid output
-	# differences, set all pg_lsn columns to NULL if the old version is
-	# older than 19.
-	if ($old_version < 19)
-	{
-		if ($old_version >= '9.5')
-		{
-			_add_st($result, 'regression',
-				"update brintest set lsncol = NULL");
-		}
-
-		if ($old_version >= 12)
-		{
-			_add_st($result, 'regression',
-				"update tab_core_types set pg_lsn = NULL");
-		}
-
-		if ($old_version >= 14)
-		{
-			_add_st($result, 'regression',
-				"update brintest_multi set lsncol = NULL");
-			_add_st($result, 'regression',
-				"update brintest_bloom set lsncol = NULL");
-		}
-	}
-
 	return $result;
 }
 
@@ -382,26 +281,10 @@ sub adjust_old_dumpfile
 	# Version comments will certainly not match.
 	$dump =~ s/^-- Dumped from database version.*\n//mg;
 
-	# Same with version argument to pg_restore_relation_stats(),
-	# pg_restore_attribute_stats() or pg_restore_extended_stats().
-	$dump =~ s {\n(\s+'version',) '\d+'::integer,$}
-		{$1 '000000'::integer,}mg;
-
 	if ($old_version < 16)
 	{
 		# Fix up some view queries that no longer require table-qualification.
 		$dump = _mash_view_qualifiers($dump);
-	}
-
-	if ($old_version >= 14 && $old_version < 17)
-	{
-		# Fix up some privilege-set discrepancies.
-		$dump =~
-		  s {^REVOKE SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE}
-			{REVOKE ALL ON TABLE}mg;
-		$dump =~
-		  s {^(GRANT SELECT,INSERT,REFERENCES,TRIGGER,TRUNCATE),UPDATE ON TABLE}
-			{$1,MAINTAIN,UPDATE ON TABLE}mg;
 	}
 
 	if ($old_version < 14)
@@ -424,18 +307,6 @@ sub adjust_old_dumpfile
 			(^CREATE\sTRIGGER\s.*?)
 			\sEXECUTE\sPROCEDURE
 			/$1 EXECUTE FUNCTION/mgx;
-	}
-
-	# During pg_upgrade, we reindex hash indexes if the source is pre-v10.
-	# This may change their tables' relallvisible values, so don't compare
-	# those.
-	if ($old_version < 10)
-	{
-		$dump =~ s/
-			(^SELECT\s\*\sFROM\spg_catalog\.pg_restore_relation_stats\(
-			[^;]*'relation',\s'public\.hash_[a-z0-9]*_heap'::regclass,
-			[^;]*'relallvisible',)\s'\d+'::integer
-			/$1 ''::integer/mgx;
 	}
 
 	if ($old_version lt '9.6')
@@ -640,6 +511,7 @@ sub _mash_view_qualifiers
 		{
 			my @thischunks = split /;/, $chunk, 2;
 			my $stmt = shift(@thischunks);
+			my $ostmt = $stmt;
 
 			# now $stmt is just the body of the CREATE [MATERIALIZED] VIEW
 			$stmt =~ s/$qualifier\.//g;
@@ -732,16 +604,6 @@ sub adjust_new_dumpfile
 	# Version comments will certainly not match.
 	$dump =~ s/^-- Dumped from database version.*\n//mg;
 
-	# Same with version argument to pg_restore_relation_stats(),
-	# pg_restore_attribute_stats() or pg_restore_extended_stats().
-	$dump =~ s {\n(\s+'version',) '\d+'::integer,$}
-		{$1 '000000'::integer,}mg;
-
-	if ($old_version < 18)
-	{
-		$dump =~ s {,\n(\s+'relallfrozen',) '-?\d+'::integer$}{}mg;
-	}
-
 	# pre-v16 dumps do not know about XMLSERIALIZE(NO INDENT).
 	if ($old_version < 16)
 	{
@@ -777,18 +639,6 @@ sub adjust_new_dumpfile
 	if ($old_version < 12)
 	{
 		$dump =~ s/^SET default_table_access_method = heap;\n//mg;
-	}
-
-	# During pg_upgrade, we reindex hash indexes if the source is pre-v10.
-	# This may change their tables' relallvisible values, so don't compare
-	# those.
-	if ($old_version < 10)
-	{
-		$dump =~ s/
-			(^SELECT\s\*\sFROM\spg_catalog\.pg_restore_relation_stats\(
-			[^;]*'relation',\s'public\.hash_[a-z0-9]*_heap'::regclass,
-			[^;]*'relallvisible',)\s'\d+'::integer
-			/$1 ''::integer/mgx;
 	}
 
 	# dumps from pre-9.6 dblink may include redundant ACL settings

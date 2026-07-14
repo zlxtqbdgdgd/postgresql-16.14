@@ -2,7 +2,7 @@
  *
  * Ryu floating-point output for double precision.
  *
- * Portions Copyright (c) 2018-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2018-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/d2s.c
@@ -53,7 +53,7 @@
  * alignment concerns that apply elsewhere.
  */
 #if !defined(HAVE_INT128) && defined(_MSC_VER) \
-	&& !defined(RYU_ONLY_64_BIT_OPS) && defined(__x86_64__)
+	&& !defined(RYU_ONLY_64_BIT_OPS) && defined(_M_X64)
 #define HAS_64_BIT_INTRINSICS
 #endif
 

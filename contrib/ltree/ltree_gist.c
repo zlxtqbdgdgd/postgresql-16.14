@@ -101,7 +101,7 @@ ltree_compress(PG_FUNCTION_ARGS)
 		ltree	   *val = DatumGetLtreeP(entry->key);
 		ltree_gist *key = ltree_gist_alloc(false, NULL, 0, val, 0);
 
-		retval = palloc_object(GISTENTRY);
+		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
 					  entry->offset, false);
@@ -117,7 +117,7 @@ ltree_decompress(PG_FUNCTION_ARGS)
 
 	if (PointerGetDatum(key) != entry->key)
 	{
-		GISTENTRY  *retval = palloc_object(GISTENTRY);
+		GISTENTRY  *retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
@@ -264,11 +264,11 @@ ltree_penalty(PG_FUNCTION_ARGS)
 	ltree_gist *newval = (ltree_gist *) DatumGetPointer(((GISTENTRY *) PG_GETARG_POINTER(1))->key);
 	float	   *penalty = (float *) PG_GETARG_POINTER(2);
 	int			siglen = LTREE_GET_SIGLEN();
-	float		cmpr,
+	int32		cmpr,
 				cmpl;
 
-	cmpl = ltree_compare_distance(LTG_GETLNODE(origval, siglen), LTG_GETLNODE(newval, siglen));
-	cmpr = ltree_compare_distance(LTG_GETRNODE(newval, siglen), LTG_GETRNODE(origval, siglen));
+	cmpl = ltree_compare(LTG_GETLNODE(origval, siglen), LTG_GETLNODE(newval, siglen));
+	cmpr = ltree_compare(LTG_GETRNODE(newval, siglen), LTG_GETRNODE(origval, siglen));
 
 	*penalty = Max(cmpl, 0) + Max(cmpr, 0);
 
@@ -318,7 +318,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 	v->spl_right = (OffsetNumber *) palloc(nbytes);
 	v->spl_nleft = 0;
 	v->spl_nright = 0;
-	array = palloc_array(RIX, maxoff + 1);
+	array = (RIX *) palloc(sizeof(RIX) * (maxoff + 1));
 
 	/* copy the data into RIXes, and sort the RIXes */
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
@@ -618,9 +618,8 @@ ltree_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-#ifdef NOT_USED
-	Oid			subtype = PG_GETARG_OID(3);
-#endif
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	int			siglen = LTREE_GET_SIGLEN();
 	ltree_gist *key = (ltree_gist *) DatumGetPointer(entry->key);

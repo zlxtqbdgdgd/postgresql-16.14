@@ -4,7 +4,7 @@
  *	  Functions for dealing with encrypted passwords stored in
  *	  pg_authid.rolpassword.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/libpq/crypt.c
@@ -22,15 +22,9 @@
 #include "libpq/scram.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
-#include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
-/* Threshold for password expiration warnings. */
-int			password_expiration_warning_threshold = 604800;
-
-/* Enables deprecation warnings for MD5 passwords. */
-bool		md5_password_warnings = true;
 
 /*
  * Fetch stored password for a user, for authentication.
@@ -76,71 +70,13 @@ get_role_password(const char *role, const char **logdetail)
 	ReleaseSysCache(roleTup);
 
 	/*
-	 * Password OK, but check to be sure we are not past rolvaliduntil or
-	 * password_expiration_warning_threshold.
+	 * Password OK, but check to be sure we are not past rolvaliduntil
 	 */
-	if (!isnull)
+	if (!isnull && vuntil < GetCurrentTimestamp())
 	{
-		TimestampTz now = GetCurrentTimestamp();
-		uint64		expire_time = TimestampDifferenceMicroseconds(now, vuntil);
-
-		/*
-		 * If we're past rolvaliduntil, the connection attempt should fail, so
-		 * update logdetail and return NULL.
-		 */
-		if (vuntil < now)
-		{
-			*logdetail = psprintf(_("User \"%s\" has an expired password."),
-								  role);
-			return NULL;
-		}
-
-		/*
-		 * If we're past the warning threshold, the connection attempt should
-		 * succeed, but we still want to emit a warning.  To do so, we queue
-		 * the warning message using StoreConnectionWarning() so that it will
-		 * be emitted at the end of InitPostgres(), and we return normally.
-		 */
-		if (expire_time / USECS_PER_SEC < password_expiration_warning_threshold)
-		{
-			MemoryContext oldcontext;
-			int			days;
-			int			hours;
-			int			minutes;
-			char	   *warning;
-			char	   *detail;
-
-			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
-			days = expire_time / USECS_PER_DAY;
-			hours = (expire_time % USECS_PER_DAY) / USECS_PER_HOUR;
-			minutes = (expire_time % USECS_PER_HOUR) / USECS_PER_MINUTE;
-
-			warning = pstrdup(_("role password will expire soon"));
-
-			if (days > 0)
-				detail = psprintf(ngettext("The password for role \"%s\" will expire in %d day.",
-										   "The password for role \"%s\" will expire in %d days.",
-										   days),
-								  role, days);
-			else if (hours > 0)
-				detail = psprintf(ngettext("The password for role \"%s\" will expire in %d hour.",
-										   "The password for role \"%s\" will expire in %d hours.",
-										   hours),
-								  role, hours);
-			else if (minutes > 0)
-				detail = psprintf(ngettext("The password for role \"%s\" will expire in %d minute.",
-										   "The password for role \"%s\" will expire in %d minutes.",
-										   minutes),
-								  role, minutes);
-			else
-				detail = psprintf(_("The password for role \"%s\" will expire in less than 1 minute."),
-								  role);
-
-			StoreConnectionWarning(warning, detail, NULL);
-
-			MemoryContextSwitchTo(oldcontext);
-		}
+		*logdetail = psprintf(_("User \"%s\" has an expired password."),
+							  role);
+		return NULL;
 	}
 
 	return shadow_pass;
@@ -181,7 +117,7 @@ encrypt_password(PasswordType target_type, const char *role,
 				 const char *password)
 {
 	PasswordType guessed_type = get_password_type(password);
-	char	   *encrypted_password = NULL;
+	char	   *encrypted_password;
 	const char *errstr = NULL;
 
 	if (guessed_type != PASSWORD_TYPE_PLAINTEXT)
@@ -190,64 +126,32 @@ encrypt_password(PasswordType target_type, const char *role,
 		 * Cannot convert an already-encrypted password from one format to
 		 * another, so return it as it is.
 		 */
-		encrypted_password = pstrdup(password);
+		return pstrdup(password);
 	}
-	else
+
+	switch (target_type)
 	{
-		switch (target_type)
-		{
-			case PASSWORD_TYPE_MD5:
-				encrypted_password = palloc(MD5_PASSWD_LEN + 1);
+		case PASSWORD_TYPE_MD5:
+			encrypted_password = palloc(MD5_PASSWD_LEN + 1);
 
-				if (!pg_md5_encrypt(password, (const uint8 *) role, strlen(role),
-									encrypted_password, &errstr))
-					elog(ERROR, "password encryption failed: %s", errstr);
-				break;
+			if (!pg_md5_encrypt(password, role, strlen(role),
+								encrypted_password, &errstr))
+				elog(ERROR, "password encryption failed: %s", errstr);
+			return encrypted_password;
 
-			case PASSWORD_TYPE_SCRAM_SHA_256:
-				encrypted_password = pg_be_scram_build_secret(password);
-				break;
+		case PASSWORD_TYPE_SCRAM_SHA_256:
+			return pg_be_scram_build_secret(password);
 
-			case PASSWORD_TYPE_PLAINTEXT:
-				elog(ERROR, "cannot encrypt password with 'plaintext'");
-				break;
-		}
+		case PASSWORD_TYPE_PLAINTEXT:
+			elog(ERROR, "cannot encrypt password with 'plaintext'");
 	}
-
-	Assert(encrypted_password);
 
 	/*
-	 * Valid password hashes may be very long, but we don't want to store
-	 * anything that might need out-of-line storage, since de-TOASTing won't
-	 * work during authentication because we haven't selected a database yet
-	 * and cannot read pg_class. 512 bytes should be more than enough for all
-	 * practical use, so fail for anything longer.
+	 * This shouldn't happen, because the above switch statements should
+	 * handle every combination of source and target password types.
 	 */
-	if (encrypted_password &&	/* keep compiler quiet */
-		strlen(encrypted_password) > MAX_ENCRYPTED_PASSWORD_LEN)
-	{
-		/*
-		 * We don't expect any of our own hashing routines to produce hashes
-		 * that are too long.
-		 */
-		Assert(guessed_type != PASSWORD_TYPE_PLAINTEXT);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("encrypted password is too long"),
-				 errdetail("Encrypted passwords must be no longer than %d bytes.",
-						   MAX_ENCRYPTED_PASSWORD_LEN)));
-	}
-
-	if (md5_password_warnings &&
-		get_password_type(encrypted_password) == PASSWORD_TYPE_MD5)
-		ereport(WARNING,
-				(errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
-				 errmsg("setting an MD5-encrypted password"),
-				 errdetail("MD5 password support is deprecated and will be removed in a future release of PostgreSQL."),
-				 errhint("Refer to the PostgreSQL documentation for details about migrating to another password type.")));
-
-	return encrypted_password;
+	elog(ERROR, "cannot encrypt password to requested type");
+	return NULL;				/* keep compiler quiet */
 }
 
 /*
@@ -264,7 +168,7 @@ encrypt_password(PasswordType target_type, const char *role,
 int
 md5_crypt_verify(const char *role, const char *shadow_pass,
 				 const char *client_pass,
-				 const uint8 *md5_salt, int md5_salt_len,
+				 const char *md5_salt, int md5_salt_len,
 				 const char **logdetail)
 {
 	int			retval;
@@ -348,7 +252,7 @@ plain_crypt_verify(const char *role, const char *shadow_pass,
 
 		case PASSWORD_TYPE_MD5:
 			if (!pg_md5_encrypt(client_pass,
-								(const uint8 *) role,
+								role,
 								strlen(role),
 								crypt_client_pass,
 								&errstr))

@@ -128,26 +128,6 @@ LOAD 'auto_explain';
     </listitem>
    </varlistentry>
 
-   <varlistentry id="auto-explain-configuration-parameters-log-io">
-    <term>
-     <varname>auto_explain.log_io</varname> (<type>boolean</type>)
-     <indexterm>
-      <primary><varname>auto_explain.log_io</varname> configuration parameter</primary>
-     </indexterm>
-    </term>
-    <listitem>
-     <para>
-      <varname>auto_explain.log_io</varname> controls whether I/O usage
-      statistics are printed when an execution plan is logged; it's
-      equivalent to the <literal>IO</literal> option of <command>EXPLAIN</command>.
-      This parameter has no effect
-      unless <varname>auto_explain.log_analyze</varname> is enabled.
-      This parameter is off by default.
-      Only superusers can change this setting.
-     </para>
-    </listitem>
-   </varlistentry>
-
    <varlistentry id="auto-explain-configuration-parameters-log-wal">
     <term>
      <varname>auto_explain.log_wal</varname> (<type>boolean</type>)
@@ -265,29 +245,6 @@ LOAD 'auto_explain';
     </listitem>
    </varlistentry>
 
-   <varlistentry id="auto-explain-configuration-parameters-log-extension-options">
-    <term>
-     <varname>auto_explain.log_extension_options</varname> (<type>string</type>)
-     <indexterm>
-      <primary><varname>auto_explain.log_extension_options</varname> configuration parameter</primary>
-     </indexterm>
-    </term>
-    <listitem>
-     <para>
-      Loadable modules can extend the <literal>EXPLAIN</literal> command with
-      additional options that affect the output format. Such options can also
-      be specified here. The value of this parameter is a comma-separated
-      list of options, each of which is an option name followed optionally by
-      an associated value. The module that provides the
-      <literal>EXPLAIN</literal> option, such as
-      <link linkend="pgplanadvice"><literal>pg_plan_advice</literal></link> or
-      <link linkend="pgoverexplain"><literal>pg_overexplain</literal></link>,
-      should be loaded before this parameter is set.
-      Only superusers can change this setting.
-     </para>
-    </listitem>
-   </varlistentry>
-
    <varlistentry id="auto-explain-configuration-parameters-log-level">
     <term>
      <varname>auto_explain.log_level</varname> (<type>enum</type>)
@@ -380,13 +337,13 @@ LOG:  duration: 3.651 ms  plan:
   Query Text: SELECT count(*)
               FROM pg_class, pg_index
               WHERE oid = indrelid AND indisunique;
-  Aggregate  (cost=16.79..16.80 rows=1 width=0) (actual time=3.626..3.627 rows=1.00 loops=1)
-    ->  Hash Join  (cost=4.17..16.55 rows=92 width=0) (actual time=3.349..3.594 rows=92.00 loops=1)
+  Aggregate  (cost=16.79..16.80 rows=1 width=0) (actual time=3.626..3.627 rows=1 loops=1)
+    ->  Hash Join  (cost=4.17..16.55 rows=92 width=0) (actual time=3.349..3.594 rows=92 loops=1)
           Hash Cond: (pg_class.oid = pg_index.indrelid)
-          ->  Seq Scan on pg_class  (cost=0.00..9.55 rows=255 width=4) (actual time=0.016..0.140 rows=255.00 loops=1)
-          ->  Hash  (cost=3.02..3.02 rows=92 width=4) (actual time=3.238..3.238 rows=92.00 loops=1)
+          ->  Seq Scan on pg_class  (cost=0.00..9.55 rows=255 width=4) (actual time=0.016..0.140 rows=255 loops=1)
+          ->  Hash  (cost=3.02..3.02 rows=92 width=4) (actual time=3.238..3.238 rows=92 loops=1)
                 Buckets: 1024  Batches: 1  Memory Usage: 4kB
-                ->  Seq Scan on pg_index  (cost=0.00..3.02 rows=92 width=4) (actual time=0.008..3.187 rows=92.00 loops=1)
+                ->  Seq Scan on pg_index  (cost=0.00..3.02 rows=92 width=4) (actual time=0.008..3.187 rows=92 loops=1)
                       Filter: indisunique
 ]]></screen>
  </sect2>

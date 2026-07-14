@@ -5,7 +5,7 @@
  *	  Routines for CREATE and DROP FUNCTION commands and CREATE and DROP
  *	  CAST commands.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,7 +15,7 @@
  * DESCRIPTION
  *	  These routines take the parse tree and pick out the
  *	  appropriate arguments/flags, and pass the results to the
- *	  corresponding "FooCreate" routines (in src/backend/catalog) that do
+ *	  corresponding "FooDefine" routines (in src/catalog) that do
  *	  the actual catalog-munging.  These routines also verify permission
  *	  of the user to execute the command.
  *
@@ -32,9 +32,10 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/table.h"
-#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -46,9 +47,11 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
+#include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "executor/execdesc.h"
 #include "executor/executor.h"
 #include "executor/functions.h"
 #include "funcapi.h"
@@ -66,8 +69,10 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -75,7 +80,7 @@
 
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
- *	 and return information about it as *prorettype_p and *returnsSet_p.
+ *	 and return information about it as *prorettype_p and *returnsSet.
  *
  * This is more complex than the average typename lookup because we want to
  * allow a shell type to be used, or even created if the specified return type
@@ -154,8 +159,6 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 		address = TypeShellMake(typname, namespaceId, GetUserId());
 		rettype = address.objectId;
 		Assert(OidIsValid(rettype));
-		/* Ensure the new shell type is visible to ProcedureCreate */
-		CommandCounterIncrement();
 	}
 
 	aclresult = object_aclcheck(TypeRelationId, rettype, GetUserId(), ACL_USAGE);
@@ -235,7 +238,7 @@ interpret_function_parameter_list(ParseState *pstate,
 		if (fpmode == FUNC_PARAM_DEFAULT)
 			fpmode = FUNC_PARAM_IN;
 
-		typtup = LookupTypeName(pstate, t, NULL, false);
+		typtup = LookupTypeName(NULL, t, NULL, false);
 		if (typtup)
 		{
 			if (!((Form_pg_type) GETSTRUCT(typtup))->typisdefined)
@@ -245,21 +248,18 @@ interpret_function_parameter_list(ParseState *pstate,
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 							 errmsg("SQL function cannot accept shell type %s",
-									TypeNameToString(t)),
-							 parser_errposition(pstate, t->location)));
+									TypeNameToString(t))));
 				/* We don't allow creating aggregates on shell types either */
 				else if (objtype == OBJECT_AGGREGATE)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 							 errmsg("aggregate cannot accept shell type %s",
-									TypeNameToString(t)),
-							 parser_errposition(pstate, t->location)));
+									TypeNameToString(t))));
 				else
 					ereport(NOTICE,
 							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							 errmsg("argument type %s is only a shell",
-									TypeNameToString(t)),
-							 parser_errposition(pstate, t->location)));
+									TypeNameToString(t))));
 			}
 			toid = typeTypeId(typtup);
 			ReleaseSysCache(typtup);
@@ -269,8 +269,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("type %s does not exist",
-							TypeNameToString(t)),
-					 parser_errposition(pstate, t->location)));
+							TypeNameToString(t))));
 			toid = InvalidOid;	/* keep compiler quiet */
 		}
 
@@ -283,18 +282,15 @@ interpret_function_parameter_list(ParseState *pstate,
 			if (objtype == OBJECT_AGGREGATE)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("aggregates cannot accept set arguments"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("aggregates cannot accept set arguments")));
 			else if (objtype == OBJECT_PROCEDURE)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("procedures cannot accept set arguments"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("procedures cannot accept set arguments")));
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("functions cannot accept set arguments"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("functions cannot accept set arguments")));
 		}
 
 		/* handle input parameters */
@@ -304,8 +300,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			if (varCount > 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("VARIADIC parameter must be the last input parameter"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("VARIADIC parameter must be the last input parameter")));
 			inTypes[inCount++] = toid;
 			isinput = true;
 			if (parameterTypes_list)
@@ -325,8 +320,7 @@ interpret_function_parameter_list(ParseState *pstate,
 				if (varCount > 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-							 errmsg("VARIADIC parameter must be the last parameter"),
-							 parser_errposition(pstate, fp->location)));
+							 errmsg("VARIADIC parameter must be the last parameter")));
 				/* Procedures with output parameters always return RECORD */
 				*requiredResultType = RECORDOID;
 			}
@@ -351,8 +345,7 @@ interpret_function_parameter_list(ParseState *pstate,
 					if (!OidIsValid(get_element_type(toid)))
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-								 errmsg("VARIADIC parameter must be an array"),
-								 parser_errposition(pstate, fp->location)));
+								 errmsg("VARIADIC parameter must be an array")));
 					break;
 			}
 		}
@@ -398,8 +391,7 @@ interpret_function_parameter_list(ParseState *pstate,
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 							 errmsg("parameter name \"%s\" used more than once",
-									fp->name),
-							 parser_errposition(pstate, fp->location)));
+									fp->name)));
 			}
 
 			paramNames[i] = CStringGetTextDatum(fp->name);
@@ -416,8 +408,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			if (!isinput)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("only input parameters can have default values"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("only input parameters can have default values")));
 
 			def = transformExpr(pstate, fp->defexpr,
 								EXPR_KIND_FUNCTION_DEFAULT);
@@ -432,8 +423,7 @@ interpret_function_parameter_list(ParseState *pstate,
 				contain_var_clause(def))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-						 errmsg("cannot use table references in parameter default value"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("cannot use table references in parameter default value")));
 
 			/*
 			 * transformExpr() should have already rejected subqueries,
@@ -457,8 +447,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			if (isinput && have_defaults)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("input parameters after one with a default value must also have defaults"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("input parameters after one with a default value must also have defaults")));
 
 			/*
 			 * For procedures, we also can't allow OUT parameters after one
@@ -468,8 +457,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			if (objtype == OBJECT_PROCEDURE && have_defaults)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("procedure OUT parameters cannot appear after one with a default value"),
-						 parser_errposition(pstate, fp->location)));
+						 errmsg("procedure OUT parameters cannot appear after one with a default value")));
 		}
 
 		i++;
@@ -914,7 +902,7 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 	{
 		SQLFunctionParseInfoPtr pinfo;
 
-		pinfo = palloc0_object(SQLFunctionParseInfo);
+		pinfo = (SQLFunctionParseInfoPtr) palloc0(sizeof(SQLFunctionParseInfo));
 
 		pinfo->fname = funcname;
 		pinfo->nargs = list_length(parameterTypes);
@@ -1049,7 +1037,6 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	List	   *parameterDefaults;
 	Oid			variadicArgType;
 	List	   *trftypes_list = NIL;
-	List	   *trfoids_list = NIL;
 	ArrayType  *trftypes;
 	Oid			requiredResultType;
 	bool		isWindowFunc,
@@ -1161,12 +1148,11 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 			Oid			typeid = typenameTypeId(NULL,
 												lfirst_node(TypeName, lc));
 			Oid			elt = get_base_element_type(typeid);
-			Oid			transformid;
 
 			typeid = elt ? elt : typeid;
-			transformid = get_transform_oid(typeid, languageOid, false);
+
+			get_transform_oid(typeid, languageOid, false);
 			trftypes_list = lappend_oid(trftypes_list, typeid);
-			trfoids_list = lappend_oid(trfoids_list, transformid);
 		}
 	}
 
@@ -1297,7 +1283,6 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 						   PointerGetDatum(parameterNames),
 						   parameterDefaults,
 						   PointerGetDatum(trftypes),
-						   trfoids_list,
 						   PointerGetDatum(proconfig),
 						   prosupport,
 						   procost,
@@ -1466,13 +1451,9 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 
 		/* Add or replace dependency on support function */
 		if (OidIsValid(procForm->prosupport))
-		{
-			if (changeDependencyFor(ProcedureRelationId, funcOid,
-									ProcedureRelationId, procForm->prosupport,
-									newsupport) != 1)
-				elog(ERROR, "could not change support dependency for function %s",
-					 get_func_name(funcOid));
-		}
+			changeDependencyFor(ProcedureRelationId, funcOid,
+								ProcedureRelationId, procForm->prosupport,
+								newsupport);
 		else
 		{
 			ObjectAddress referenced;
@@ -1710,18 +1691,13 @@ CreateCast(CreateCastStmt *stmt)
 					 errmsg("source and target data types are not physically compatible")));
 
 		/*
-		 * We know that composite, array, range and enum types are never
-		 * binary-compatible with each other.  They all have OIDs embedded in
-		 * them.
+		 * We know that composite, enum and array types are never binary-
+		 * compatible with each other.  They all have OIDs embedded in them.
 		 *
 		 * Theoretically you could build a user-defined base type that is
-		 * binary-compatible with such a type.  But we disallow it anyway, as
-		 * in practice such a cast is surely a mistake.  You can always work
-		 * around that by writing a cast function.
-		 *
-		 * NOTE: if we ever have a kind of container type that doesn't need to
-		 * be rejected for this reason, we'd likely need to recursively apply
-		 * all of these same checks to the contained type(s).
+		 * binary-compatible with a composite, enum, or array type.  But we
+		 * disallow that too, as in practice such a cast is surely a mistake.
+		 * You can always work around that by writing a cast function.
 		 */
 		if (sourcetyptype == TYPTYPE_COMPOSITE ||
 			targettyptype == TYPTYPE_COMPOSITE)
@@ -1729,25 +1705,17 @@ CreateCast(CreateCastStmt *stmt)
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("composite data types are not binary-compatible")));
 
-		if (OidIsValid(get_element_type(sourcetypeid)) ||
-			OidIsValid(get_element_type(targettypeid)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("array data types are not binary-compatible")));
-
-		if (sourcetyptype == TYPTYPE_RANGE ||
-			targettyptype == TYPTYPE_RANGE ||
-			sourcetyptype == TYPTYPE_MULTIRANGE ||
-			targettyptype == TYPTYPE_MULTIRANGE)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("range data types are not binary-compatible")));
-
 		if (sourcetyptype == TYPTYPE_ENUM ||
 			targettyptype == TYPTYPE_ENUM)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("enum data types are not binary-compatible")));
+
+		if (OidIsValid(get_element_type(sourcetypeid)) ||
+			OidIsValid(get_element_type(targettypeid)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("array data types are not binary-compatible")));
 
 		/*
 		 * We also disallow creating binary-compatibility casts involving
@@ -2424,7 +2392,6 @@ CallStmtResultDesc(CallStmt *stmt)
 							   -1,
 							   0);
 		}
-		TupleDescFinalize(tupdesc);
 	}
 
 	return tupdesc;

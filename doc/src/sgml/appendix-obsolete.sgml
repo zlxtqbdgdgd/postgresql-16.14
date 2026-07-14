@@ -38,7 +38,5 @@
  &obsolete-pgxlogdump;
  &obsolete-pgresetxlog;
  &obsolete-pgreceivexlog;
- &obsolete-auth-radius;
- &obsolete-refint;
 
 </appendix>

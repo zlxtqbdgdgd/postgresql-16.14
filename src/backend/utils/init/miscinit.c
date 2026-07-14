@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -39,8 +39,8 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
-#include "replication/slotsync.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -55,7 +55,6 @@
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
-#include "utils/wait_event.h"
 
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
@@ -107,6 +106,13 @@ InitPostmasterChild(void)
 	pgwin32_signal_initialize();
 #endif
 
+	/*
+	 * Set reference point for stack-depth checking.  This might seem
+	 * redundant in !EXEC_BACKEND builds, but it's better to keep the depth
+	 * logic the same with and without that build option.
+	 */
+	(void) set_stack_base();
+
 	InitProcessGlobals();
 
 	/*
@@ -128,7 +134,7 @@ InitPostmasterChild(void)
 #endif
 
 	/* Initialize process-local latch support */
-	InitializeWaitEventSupport();
+	InitializeLatchSupport();
 	InitProcessLocalLatch();
 	InitializeLatchWaitSet();
 
@@ -189,7 +195,7 @@ InitStandaloneProcess(const char *argv0)
 	InitProcessGlobals();
 
 	/* Initialize process-local latch support */
-	InitializeWaitEventSupport();
+	InitializeLatchSupport();
 	InitProcessLocalLatch();
 	InitializeLatchWaitSet();
 
@@ -254,24 +260,57 @@ SwitchBackToLocalLatch(void)
 	SetLatch(MyLatch);
 }
 
-/*
- * Return a human-readable string representation of a BackendType.
- *
- * The string is not localized here, but we mark the strings for translation
- * so that callers can invoke _() on the result.
- */
 const char *
 GetBackendTypeDesc(BackendType backendType)
 {
-	const char *backendDesc = gettext_noop("unknown process type");
+	const char *backendDesc = "unknown process type";
 
 	switch (backendType)
 	{
-#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach)	\
-		case bktype: backendDesc = description; break;
-#include "postmaster/proctypelist.h"
-#undef PG_PROCTYPE
+		case B_INVALID:
+			backendDesc = "not initialized";
+			break;
+		case B_ARCHIVER:
+			backendDesc = "archiver";
+			break;
+		case B_AUTOVAC_LAUNCHER:
+			backendDesc = "autovacuum launcher";
+			break;
+		case B_AUTOVAC_WORKER:
+			backendDesc = "autovacuum worker";
+			break;
+		case B_BACKEND:
+			backendDesc = "client backend";
+			break;
+		case B_BG_WORKER:
+			backendDesc = "background worker";
+			break;
+		case B_BG_WRITER:
+			backendDesc = "background writer";
+			break;
+		case B_CHECKPOINTER:
+			backendDesc = "checkpointer";
+			break;
+		case B_LOGGER:
+			backendDesc = "logger";
+			break;
+		case B_STANDALONE_BACKEND:
+			backendDesc = "standalone backend";
+			break;
+		case B_STARTUP:
+			backendDesc = "startup";
+			break;
+		case B_WAL_RECEIVER:
+			backendDesc = "walreceiver";
+			break;
+		case B_WAL_SENDER:
+			backendDesc = "walsender";
+			break;
+		case B_WAL_WRITER:
+			backendDesc = "walwriter";
+			break;
 	}
+
 	return backendDesc;
 }
 
@@ -428,8 +467,8 @@ ChangeToDataDir(void)
  * AuthenticatedUserId is determined at connection start and never changes.
  *
  * SessionUserId is initially the same as AuthenticatedUserId, but can be
- * changed by SET SESSION AUTHORIZATION (if AuthenticatedUserId is a
- * superuser).  This is the ID reported by the SESSION_USER SQL function.
+ * changed by SET SESSION AUTHORIZATION (if AuthenticatedUserIsSuperuser).
+ * This is the ID reported by the SESSION_USER SQL function.
  *
  * OuterUserId is the current user ID in effect at the "outer level" (outside
  * any transaction or function).  This is initially the same as SessionUserId,
@@ -453,7 +492,8 @@ static Oid	OuterUserId = InvalidOid;
 static Oid	CurrentUserId = InvalidOid;
 static const char *SystemUser = NULL;
 
-/* We also have to remember the superuser state of the session user */
+/* We also have to remember the superuser state of some of these levels */
+static bool AuthenticatedUserIsSuperuser = false;
 static bool SessionUserIsSuperuser = false;
 
 static int	SecurityRestrictionContext = 0;
@@ -549,8 +589,18 @@ GetAuthenticatedUserId(void)
 	return AuthenticatedUserId;
 }
 
+/*
+ * Return whether the authenticated user was superuser at connection start.
+ */
+bool
+GetAuthenticatedUserIsSuperuser(void)
+{
+	Assert(OidIsValid(AuthenticatedUserId));
+	return AuthenticatedUserIsSuperuser;
+}
+
 void
-SetAuthenticatedUserId(Oid userid)
+SetAuthenticatedUserId(Oid userid, bool is_superuser)
 {
 	Assert(OidIsValid(userid));
 
@@ -558,6 +608,7 @@ SetAuthenticatedUserId(Oid userid)
 	Assert(!OidIsValid(AuthenticatedUserId));
 
 	AuthenticatedUserId = userid;
+	AuthenticatedUserIsSuperuser = is_superuser;
 
 	/* Also mark our PGPROC entry with the authenticated user id */
 	/* (We assume this is an atomic store so no lock is needed) */
@@ -708,8 +759,7 @@ has_rolreplication(Oid roleid)
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename, Oid roleid,
-						bool bypass_login_check)
+InitializeSessionUserId(const char *rolename, Oid roleid)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
@@ -724,10 +774,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid,
 	 * want to fail if it's been dropped.
 	 */
 	if (InitializingParallelWorker)
-	{
-		Assert(bypass_login_check);
 		return;
-	}
 
 	/*
 	 * Don't do scans if we're bootstrapping, none of the system catalogs
@@ -767,7 +814,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid,
 	rname = NameStr(rform->rolname);
 	is_superuser = rform->rolsuper;
 
-	SetAuthenticatedUserId(roleid);
+	SetAuthenticatedUserId(roleid, is_superuser);
 
 	/*
 	 * Set SessionUserId and related variables, including "role", via the GUC
@@ -799,10 +846,9 @@ InitializeSessionUserId(const char *rolename, Oid roleid,
 	if (IsUnderPostmaster)
 	{
 		/*
-		 * Is role allowed to login at all?  (But background workers can
-		 * override this by setting bypass_login_check.)
+		 * Is role allowed to login at all?
 		 */
-		if (!bypass_login_check && !rform->rolcanlogin)
+		if (!rform->rolcanlogin)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" is not permitted to log in",
@@ -842,16 +888,15 @@ InitializeSessionUserIdStandalone(void)
 {
 	/*
 	 * This function should only be called in single-user mode, in autovacuum
-	 * workers, in slot sync worker and in background workers.
+	 * workers, and in background workers.
 	 */
-	Assert(!IsUnderPostmaster || AmAutoVacuumWorkerProcess() ||
-		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess() ||
-		   AmDataChecksumsWorkerProcess());
+	Assert(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsBackgroundWorker);
 
 	/* call only once */
 	Assert(!OidIsValid(AuthenticatedUserId));
 
 	AuthenticatedUserId = BOOTSTRAP_SUPERUSERID;
+	AuthenticatedUserIsSuperuser = true;
 
 	/*
 	 * XXX Ideally we'd do this via SetConfigOption("session_authorization"),
@@ -1135,6 +1180,7 @@ UnlinkLockFiles(int status, Datum arg)
 		/* Should we complain if the unlink fails? */
 	}
 	/* Since we're about to exit, no need to reclaim storage */
+	lock_files = NIL;
 
 	/*
 	 * Lock file removal should always be the last externally visible action

@@ -29,6 +29,6 @@
  */
 #undef gai_strerror
 
-extern const char *gai_strerror(int errcode);
+extern const char *gai_strerror(int ecode);
 
 #endif							/* WIN32_SYS_SOCKET_H */

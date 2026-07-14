@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -28,9 +28,7 @@ $node->issues_sql_like(
 	qr/statement: DROP DATABASE foobar2 WITH \(FORCE\);/,
 	'SQL DROP DATABASE (FORCE) run');
 
-$node->command_fails_like(
-	[ 'dropdb', 'nonexistent' ],
-	qr/database "nonexistent" does not exist/,
+$node->command_fails([ 'dropdb', 'nonexistent' ],
 	'fails with nonexistent database');
 
 # check that invalid database can be dropped with dropdb
@@ -40,6 +38,6 @@ $node->safe_psql(
 	UPDATE pg_database SET datconnlimit = -2 WHERE datname = 'regression_invalid';
 ));
 $node->command_ok([ 'dropdb', 'regression_invalid' ],
-	'invalid database can be dropped');
+  'invalid database can be dropped');
 
 done_testing();

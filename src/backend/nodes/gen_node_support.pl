@@ -8,7 +8,7 @@
 # - readfuncs
 # - outfuncs
 #
-# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/nodes/gen_node_support.pl
@@ -16,7 +16,7 @@
 #----------------------------------------------------------------------
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use File::Basename;
 use Getopt::Long;
@@ -58,7 +58,6 @@ my @all_input_files = qw(
   nodes/plannodes.h
   nodes/execnodes.h
   access/amapi.h
-  access/cmptype.h
   access/sdir.h
   access/tableam.h
   access/tsmapi.h
@@ -96,6 +95,20 @@ my @nodetag_only_files = qw(
   nodes/supportnodes.h
 );
 
+# ARM ABI STABILITY CHECK HERE:
+#
+# In stable branches, set $last_nodetag to the name of the last node type
+# that should receive an auto-generated nodetag number, and $last_nodetag_no
+# to its number.  (Find these values in the last line of the current
+# nodetags.h file.)  The script will then complain if those values don't
+# match reality, providing a cross-check that we haven't broken ABI by
+# adding or removing nodetags.
+# In HEAD, these variables should be left undef, since we don't promise
+# ABI stability during development.
+
+my $last_nodetag = 'WindowObjectData';
+my $last_nodetag_no = 454;
+
 # output file names
 my @output_files;
 
@@ -121,7 +134,7 @@ my @nodetag_only;
 
 # types that are copied by straight assignment
 my @scalar_types = qw(
-  bool char double int int8 int16 int32 int64 long uint8 uint16 uint32 uint64
+  bits32 bool char double int int8 int16 int32 int64 long uint8 uint16 uint32 uint64
   AclMode AttrNumber Cardinality Cost Index Oid RelFileNumber Selectivity Size StrategyNumber SubTransactionId TimeLineID XLogRecPtr
 );
 
@@ -136,7 +149,7 @@ my @abstract_types = qw(Node);
 # they otherwise don't participate in node support.
 my @extra_tags = qw(
   IntList OidList XidList
-  AllocSetContext GenerationContext SlabContext BumpContext
+  AllocSetContext GenerationContext SlabContext
   TIDBitmap
   WindowObjectData
 );
@@ -181,7 +194,6 @@ my $next_input_file = 0;
 foreach my $infile (@ARGV)
 {
 	my $in_struct;
-	my $in_struct_lineno;
 	my $subline;
 	my $is_node_struct;
 	my $supertype;
@@ -458,13 +470,11 @@ foreach my $infile (@ARGV)
 								&& $attr !~ /^read_as\(\w+\)$/
 								&& !elem $attr,
 								qw(copy_as_scalar
-								custom_query_jumble
 								equal_as_scalar
 								equal_ignore
 								equal_ignore_if_zero
 								query_jumble_ignore
 								query_jumble_location
-								query_jumble_squash
 								read_write_ignore
 								write_only_relids
 								write_only_nondefault_pathtarget
@@ -530,7 +540,6 @@ foreach my $infile (@ARGV)
 			if ($line =~ /^(?:typedef )?struct (\w+)$/ && $1 ne 'Node')
 			{
 				$in_struct = $1;
-				$in_struct_lineno = $lineno;
 				$subline = 0;
 			}
 			# one node type typedef'ed directly from another
@@ -558,8 +567,7 @@ foreach my $infile (@ARGV)
 
 	if ($in_struct)
 	{
-		die
-		  "$infile:$in_struct_lineno: could not find closing brace for struct \"$in_struct\"\n";
+		die "runaway \"$in_struct\" in file \"$infile\"\n";
 	}
 
 	close $ifh;
@@ -577,7 +585,7 @@ my $header_comment =
  * %s
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -601,20 +609,29 @@ open my $nt, '>', "$output_path/nodetags.h$tmpext"
 printf $nt $header_comment, 'nodetags.h';
 
 my $tagno = 0;
+my $last_tag = undef;
 foreach my $n (@node_types, @extra_tags)
 {
 	next if elem $n, @abstract_types;
 	if (defined $manual_nodetag_number{$n})
 	{
-		# do not change $tagno
+		# do not change $tagno or $last_tag
 		print $nt "\tT_${n} = $manual_nodetag_number{$n},\n";
 	}
 	else
 	{
 		$tagno++;
+		$last_tag = $n;
 		print $nt "\tT_${n} = $tagno,\n";
 	}
 }
+
+# verify that last auto-assigned nodetag stays stable
+die "ABI stability break: last nodetag is $last_tag not $last_nodetag\n"
+  if (defined $last_nodetag && $last_nodetag ne $last_tag);
+die
+  "ABI stability break: last nodetag number is $tagno not $last_nodetag_no\n"
+  if (defined $last_nodetag_no && $last_nodetag_no != $tagno);
 
 close $nt;
 
@@ -760,7 +777,7 @@ _equal${n}(const $n *a, const $n *b)
 			print $eff "\tCOMPARE_BITMAPSET_FIELD($f);\n"
 			  unless $equal_ignore;
 		}
-		elsif ($t eq 'ParseLoc')
+		elsif ($t eq 'int' && $f =~ 'location$')
 		{
 			print $cff "\tCOPY_LOCATION_FIELD($f);\n" unless $copy_ignore;
 			print $eff "\tCOMPARE_LOCATION_FIELD($f);\n" unless $equal_ignore;
@@ -993,7 +1010,7 @@ _read${n}(void)
 			print $off "\tWRITE_BOOL_FIELD($f);\n";
 			print $rff "\tREAD_BOOL_FIELD($f);\n" unless $no_read;
 		}
-		elsif ($t eq 'ParseLoc')
+		elsif ($t eq 'int' && $f =~ 'location$')
 		{
 			print $off "\tWRITE_LOCATION_FIELD($f);\n";
 			print $rff "\tREAD_LOCATION_FIELD($f);\n" unless $no_read;
@@ -1008,17 +1025,13 @@ _read${n}(void)
 			print $rff "\tREAD_INT_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'uint32'
+			|| $t eq 'bits32'
 			|| $t eq 'BlockNumber'
 			|| $t eq 'Index'
 			|| $t eq 'SubTransactionId')
 		{
 			print $off "\tWRITE_UINT_FIELD($f);\n";
 			print $rff "\tREAD_UINT_FIELD($f);\n" unless $no_read;
-		}
-		elsif ($t eq 'int64')
-		{
-			print $off "\tWRITE_INT64_FIELD($f);\n";
-			print $rff "\tREAD_INT64_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'uint64'
 			|| $t eq 'AclMode')
@@ -1268,17 +1281,11 @@ _jumble${n}(JumbleState *jstate, Node *node)
 		my $t = $node_type_info{$n}->{field_types}{$f};
 		my @a = @{ $node_type_info{$n}->{field_attrs}{$f} };
 		my $query_jumble_ignore = $struct_no_query_jumble;
-		my $query_jumble_custom = 0;
 		my $query_jumble_location = 0;
-		my $query_jumble_squash = 0;
 
 		# extract per-field attributes
 		foreach my $a (@a)
 		{
-			if ($a eq 'custom_query_jumble')
-			{
-				$query_jumble_custom = 1;
-			}
 			if ($a eq 'query_jumble_ignore')
 			{
 				$query_jumble_ignore = 1;
@@ -1287,34 +1294,16 @@ _jumble${n}(JumbleState *jstate, Node *node)
 			{
 				$query_jumble_location = 1;
 			}
-			elsif ($a eq 'query_jumble_squash')
-			{
-				$query_jumble_squash = 1;
-			}
 		}
 
-		if ($query_jumble_custom)
-		{
-			# Custom function that applies to one field of a node.
-			print $jff "\tJUMBLE_CUSTOM($n, $f);\n"
-			  unless $query_jumble_ignore;
-		}
-		elsif (($t =~ /^(\w+)\*$/ or $t =~ /^struct\s+(\w+)\*$/)
+		# node type
+		if (($t =~ /^(\w+)\*$/ or $t =~ /^struct\s+(\w+)\*$/)
 			and elem $1, @node_types)
 		{
-			# Node type.  Squash constants if requested.
-			if ($query_jumble_squash)
-			{
-				print $jff "\tJUMBLE_ELEMENTS($f, node);\n"
-				  unless $query_jumble_ignore;
-			}
-			else
-			{
-				print $jff "\tJUMBLE_NODE($f);\n"
-				  unless $query_jumble_ignore;
-			}
+			print $jff "\tJUMBLE_NODE($f);\n"
+			  unless $query_jumble_ignore;
 		}
-		elsif ($t eq 'ParseLoc')
+		elsif ($t eq 'int' && $f =~ 'location$')
 		{
 			# Track the node's location only if directly requested.
 			if ($query_jumble_location)

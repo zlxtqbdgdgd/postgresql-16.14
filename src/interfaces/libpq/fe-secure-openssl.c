@@ -4,7 +4,7 @@
  *	  OpenSSL support
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -44,10 +44,12 @@
 
 #include <sys/stat.h>
 
+#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
+#endif
 #endif
 
 /*
@@ -57,7 +59,6 @@
  * include <wincrypt.h>, but some other Windows headers do.)
  */
 #include "common/openssl.h"
-#include <openssl/ssl.h>
 #include <openssl/conf.h>
 #ifdef USE_SSL_ENGINE
 #include <openssl/engine.h>
@@ -67,23 +68,34 @@
 
 static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static int	openssl_verify_peer_name_matches_certificate_name(PGconn *conn,
-															  const ASN1_STRING *name_entry,
+															  ASN1_STRING *name_entry,
 															  char **store_name);
 static int	openssl_verify_peer_name_matches_certificate_ip(PGconn *conn,
 															ASN1_OCTET_STRING *addr_entry,
 															char **store_name);
+static void destroy_ssl_system(void);
 static int	initialize_SSL(PGconn *conn);
 static PostgresPollingStatusType open_client_SSL(PGconn *conn);
 static char *SSLerrmessage(unsigned long ecode);
 static void SSLerrfree(char *buf);
 static int	PQssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
 
-static int	pgconn_bio_read(BIO *h, char *buf, int size);
-static int	pgconn_bio_write(BIO *h, const char *buf, int size);
-static BIO_METHOD *pgconn_bio_method(void);
-static int	ssl_set_pgconn_bio(PGconn *conn);
+static int	my_sock_read(BIO *h, char *buf, int size);
+static int	my_sock_write(BIO *h, const char *buf, int size);
+static BIO_METHOD *my_BIO_s_socket(void);
+static int	my_SSL_set_fd(PGconn *conn, int fd);
+
+
+static bool pq_init_ssl_lib = true;
+static bool pq_init_crypto_lib = true;
+
+static bool ssl_lib_initialized = false;
+
+#ifdef ENABLE_THREAD_SAFETY
+static long crypto_open_connections = 0;
 
 static pthread_mutex_t ssl_config_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif							/* ENABLE_THREAD_SAFETY */
 
 static PQsslKeyPassHook_OpenSSL_type PQsslKeyPassHook = NULL;
 static int	ssl_protocol_version_to_openssl(const char *protocol);
@@ -91,6 +103,23 @@ static int	ssl_protocol_version_to_openssl(const char *protocol);
 /* ------------------------------------------------------------ */
 /*			 Procedures common to all secure sessions			*/
 /* ------------------------------------------------------------ */
+
+void
+pgtls_init_library(bool do_ssl, int do_crypto)
+{
+#ifdef ENABLE_THREAD_SAFETY
+
+	/*
+	 * Disallow changing the flags while we have open connections, else we'd
+	 * get completely confused.
+	 */
+	if (crypto_open_connections != 0)
+		return;
+#endif
+
+	pq_init_ssl_lib = do_ssl;
+	pq_init_crypto_lib = do_crypto;
+}
 
 PostgresPollingStatusType
 pgtls_open_client(PGconn *conn)
@@ -230,40 +259,10 @@ rloop:
 	return n;
 }
 
-ssize_t
-pgtls_bytes_pending(PGconn *conn)
+bool
+pgtls_read_pending(PGconn *conn)
 {
-	int			pending;
-
-	/*
-	 * OpenSSL readahead is documented to break SSL_pending().  Plus, we can't
-	 * afford to have OpenSSL take bytes off the socket without processing
-	 * them; that breaks the postconditions for pqsecure_drain_pending().
-	 */
-	Assert(!SSL_get_read_ahead(conn->ssl));
-
-	pending = SSL_pending(conn->ssl);
-	if (pending < 0)
-	{
-		/* shouldn't be possible */
-		Assert(false);
-		libpq_append_conn_error(conn, "OpenSSL reports negative bytes pending");
-		return -1;
-	}
-	else if (pending == INT_MAX)
-	{
-		/*
-		 * If we ever found a legitimate way to hit this, we'd need to loop
-		 * around in the caller to call pgtls_bytes_pending() again.  Throw an
-		 * error rather than complicate the code in that way, because
-		 * SSL_read() should be bounded to the size of a single TLS record,
-		 * and conn->inBuffer can't currently go past INT_MAX in size anyway.
-		 */
-		libpq_append_conn_error(conn, "OpenSSL reports INT_MAX bytes pending");
-		return -1;
-	}
-
-	return (ssize_t) pending;
+	return SSL_pending(conn->ssl) > 0;
 }
 
 ssize_t
@@ -366,6 +365,7 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 	return n;
 }
 
+#if defined(HAVE_X509_GET_SIGNATURE_NID) || defined(HAVE_X509_GET_SIGNATURE_INFO)
 char *
 pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 {
@@ -440,6 +440,7 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 
 	return cert_hash;
 }
+#endif							/* HAVE_X509_GET_SIGNATURE_NID */
 
 /* ------------------------------------------------------------ */
 /*						OpenSSL specific code					*/
@@ -497,8 +498,7 @@ cert_cb(SSL *ssl, void *arg)
  * into a plain C string.
  */
 static int
-openssl_verify_peer_name_matches_certificate_name(PGconn *conn,
-												  const ASN1_STRING *name_entry,
+openssl_verify_peer_name_matches_certificate_name(PGconn *conn, ASN1_STRING *name_entry,
 												  char **store_name)
 {
 	int			len;
@@ -514,7 +514,11 @@ openssl_verify_peer_name_matches_certificate_name(PGconn *conn,
 	/*
 	 * GEN_DNS can be only IA5String, equivalent to US ASCII.
 	 */
+#ifdef HAVE_ASN1_STRING_GET0_DATA
 	namedata = ASN1_STRING_get0_data(name_entry);
+#else
+	namedata = ASN1_STRING_data(name_entry);
+#endif
 	len = ASN1_STRING_length(name_entry);
 
 	/* OK to cast from unsigned to plain char, since it's all ASCII. */
@@ -545,7 +549,11 @@ openssl_verify_peer_name_matches_certificate_ip(PGconn *conn,
 	 * GEN_IPADD is an OCTET STRING containing an IP address in network byte
 	 * order.
 	 */
+#ifdef HAVE_ASN1_STRING_GET0_DATA
 	addrdata = ASN1_STRING_get0_data(addr_entry);
+#else
+	addrdata = ASN1_STRING_data(addr_entry);
+#endif
 	len = ASN1_STRING_length(addr_entry);
 
 	return pq_verify_peer_name_matches_certificate_ip(conn, addrdata, len, store_name);
@@ -681,14 +689,14 @@ pgtls_verify_peer_name_matches_certificate_guts(PGconn *conn,
 	 */
 	if (check_cn)
 	{
-		const X509_NAME *subject_name;
+		X509_NAME  *subject_name;
 
 		subject_name = X509_get_subject_name(conn->peer);
 		if (subject_name != NULL)
 		{
 			int			cn_index;
 
-			cn_index = X509_NAME_get_index_by_NID(unconstify(X509_NAME *, subject_name),
+			cn_index = X509_NAME_get_index_by_NID(subject_name,
 												  NID_commonName, -1);
 			if (cn_index >= 0)
 			{
@@ -713,52 +721,182 @@ pgtls_verify_peer_name_matches_certificate_guts(PGconn *conn,
 	return rc;
 }
 
-/* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
-static unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
-
-#ifdef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK
+#if defined(ENABLE_THREAD_SAFETY) && defined(HAVE_CRYPTO_LOCK)
 /*
- * SSL Key Logging callback
- *
- * This callback lets the user store all key material to a file for debugging
- * purposes.  The file will be written using the NSS keylog format.  LibreSSL
- * 3.5 introduced stub function to set the callback for OpenSSL compatibility
- * but the callback is never invoked.
- *
- * Error messages added to the connection object won't be printed anywhere if
- * the connection is successful.  Errors in processing keylogging are printed
- * to stderr to overcome this.
+ *	Callback functions for OpenSSL internal locking.  (OpenSSL 1.1.0
+ *	does its own locking, and doesn't need these anymore.  The
+ *	CRYPTO_lock() function was removed in 1.1.0, when the callbacks
+ *	were made obsolete, so we assume that if CRYPTO_lock() exists,
+ *	the callbacks are still required.)
  */
-static void
-SSL_CTX_keylog_cb(const SSL *ssl, const char *line)
+
+static unsigned long
+pq_threadidcallback(void)
 {
-	int			fd;
-	ssize_t		rc;
-	PGconn	   *conn = SSL_get_app_data(ssl);
+	/*
+	 * This is not standards-compliant.  pthread_self() returns pthread_t, and
+	 * shouldn't be cast to unsigned long, but CRYPTO_set_id_callback requires
+	 * it, so we have to do it.
+	 */
+	return (unsigned long) pthread_self();
+}
 
-	if (conn == NULL)
-		return;
+static pthread_mutex_t *pq_lockarray;
 
-	fd = open(conn->sslkeylogfile, O_WRONLY | O_APPEND | O_CREAT, 0600);
-
-	if (fd == -1)
+static void
+pq_lockingcallback(int mode, int n, const char *file, int line)
+{
+	/*
+	 * There's no way to report a mutex-primitive failure, so we just Assert
+	 * in development builds, and ignore any errors otherwise.  Fortunately
+	 * this is all obsolete in modern OpenSSL.
+	 */
+	if (mode & CRYPTO_LOCK)
 	{
-		fprintf(stderr, libpq_gettext("WARNING: could not open SSL key logging file \"%s\": %m\n"),
-				conn->sslkeylogfile);
-		return;
+		if (pthread_mutex_lock(&pq_lockarray[n]))
+			Assert(false);
+	}
+	else
+	{
+		if (pthread_mutex_unlock(&pq_lockarray[n]))
+			Assert(false);
+	}
+}
+#endif							/* ENABLE_THREAD_SAFETY && HAVE_CRYPTO_LOCK */
+
+/*
+ * Initialize SSL library.
+ *
+ * In threadsafe mode, this includes setting up libcrypto callback functions
+ * to do thread locking.
+ *
+ * If the caller has told us (through PQinitOpenSSL) that he's taking care
+ * of libcrypto, we expect that callbacks are already set, and won't try to
+ * override it.
+ */
+int
+pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
+{
+#ifdef ENABLE_THREAD_SAFETY
+	if (pthread_mutex_lock(&ssl_config_mutex))
+		return -1;
+
+#ifdef HAVE_CRYPTO_LOCK
+	if (pq_init_crypto_lib)
+	{
+		/*
+		 * If necessary, set up an array to hold locks for libcrypto.
+		 * libcrypto will tell us how big to make this array.
+		 */
+		if (pq_lockarray == NULL)
+		{
+			int			i;
+
+			pq_lockarray = malloc(sizeof(pthread_mutex_t) * CRYPTO_num_locks());
+			if (!pq_lockarray)
+			{
+				pthread_mutex_unlock(&ssl_config_mutex);
+				return -1;
+			}
+			for (i = 0; i < CRYPTO_num_locks(); i++)
+			{
+				if (pthread_mutex_init(&pq_lockarray[i], NULL))
+				{
+					free(pq_lockarray);
+					pq_lockarray = NULL;
+					pthread_mutex_unlock(&ssl_config_mutex);
+					return -1;
+				}
+			}
+		}
+
+		if (do_crypto && !conn->crypto_loaded)
+		{
+			if (crypto_open_connections++ == 0)
+			{
+				/*
+				 * These are only required for threaded libcrypto
+				 * applications, but make sure we don't stomp on them if
+				 * they're already set.
+				 */
+				if (CRYPTO_get_id_callback() == NULL)
+					CRYPTO_set_id_callback(pq_threadidcallback);
+				if (CRYPTO_get_locking_callback() == NULL)
+					CRYPTO_set_locking_callback(pq_lockingcallback);
+			}
+
+			conn->crypto_loaded = true;
+		}
+	}
+#endif							/* HAVE_CRYPTO_LOCK */
+#endif							/* ENABLE_THREAD_SAFETY */
+
+	if (!ssl_lib_initialized && do_ssl)
+	{
+		if (pq_init_ssl_lib)
+		{
+#ifdef HAVE_OPENSSL_INIT_SSL
+			OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
+#else
+			OPENSSL_config(NULL);
+			SSL_library_init();
+			SSL_load_error_strings();
+#endif
+		}
+		ssl_lib_initialized = true;
 	}
 
-	/* line is guaranteed by OpenSSL to be NUL terminated */
-	rc = write(fd, line, strlen(line));
-	if (rc < 0)
-		fprintf(stderr, libpq_gettext("WARNING: could not write to SSL key logging file \"%s\": %m\n"),
-				conn->sslkeylogfile);
-	else
-		rc = write(fd, "\n", 1);
-	(void) rc;					/* silence compiler warnings */
-	close(fd);
-}
+#ifdef ENABLE_THREAD_SAFETY
+	pthread_mutex_unlock(&ssl_config_mutex);
 #endif
+	return 0;
+}
+
+/*
+ *	This function is needed because if the libpq library is unloaded
+ *	from the application, the callback functions will no longer exist when
+ *	libcrypto is used by other parts of the system.  For this reason,
+ *	we unregister the callback functions when the last libpq
+ *	connection is closed.  (The same would apply for OpenSSL callbacks
+ *	if we had any.)
+ *
+ *	Callbacks are only set when we're compiled in threadsafe mode, so
+ *	we only need to remove them in this case. They are also not needed
+ *	with OpenSSL 1.1.0 anymore.
+ */
+static void
+destroy_ssl_system(void)
+{
+#if defined(ENABLE_THREAD_SAFETY) && defined(HAVE_CRYPTO_LOCK)
+	if (pthread_mutex_lock(&ssl_config_mutex))
+		return;
+
+	if (pq_init_crypto_lib && crypto_open_connections > 0)
+		--crypto_open_connections;
+
+	if (pq_init_crypto_lib && crypto_open_connections == 0)
+	{
+		/*
+		 * No connections left, unregister libcrypto callbacks, if no one
+		 * registered different ones in the meantime.
+		 */
+		if (CRYPTO_get_locking_callback() == pq_lockingcallback)
+			CRYPTO_set_locking_callback(NULL);
+		if (CRYPTO_get_id_callback() == pq_threadidcallback)
+			CRYPTO_set_id_callback(NULL);
+
+		/*
+		 * We don't free the lock array. If we get another connection in this
+		 * process, we will just re-use them with the existing mutexes.
+		 *
+		 * This means we leak a little memory on repeated load/unload of the
+		 * library.
+		 */
+	}
+
+	pthread_mutex_unlock(&ssl_config_mutex);
+#endif
+}
 
 /*
  *	Create per-connection SSL object, and load the client certificate,
@@ -1065,7 +1203,7 @@ initialize_SSL(PGconn *conn)
 	 */
 	if (!(conn->ssl = SSL_new(SSL_context)) ||
 		!SSL_set_app_data(conn->ssl, conn) ||
-		!ssl_set_pgconn_bio(conn))
+		!my_SSL_set_fd(conn, conn->sock))
 	{
 		char	   *err = SSLerrmessage(ERR_get_error());
 
@@ -1075,23 +1213,6 @@ initialize_SSL(PGconn *conn)
 		return -1;
 	}
 	conn->ssl_in_use = true;
-
-	/*
-	 * If SSL key logging is requested, set up the callback if a compatible
-	 * version of OpenSSL is used and libpq was compiled to support it.
-	 */
-	if (conn->sslkeylogfile && strlen(conn->sslkeylogfile) > 0)
-	{
-#ifdef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK
-		SSL_CTX_set_keylog_callback(SSL_context, SSL_CTX_keylog_cb);
-#else
-#ifdef LIBRESSL_VERSION_NUMBER
-		fprintf(stderr, libpq_gettext("WARNING: sslkeylogfile support requires OpenSSL\n"));
-#else
-		fprintf(stderr, libpq_gettext("WARNING: libpq was not built with sslkeylogfile support\n"));
-#endif
-#endif
-	}
 
 	/*
 	 * SSL contexts are reference counted by OpenSSL. We can free it as soon
@@ -1122,22 +1243,6 @@ initialize_SSL(PGconn *conn)
 				SSLerrfree(err);
 				return -1;
 			}
-		}
-	}
-
-	/* Set ALPN */
-	{
-		int			retval;
-
-		retval = SSL_set_alpn_protos(conn->ssl, alpn_protos, sizeof(alpn_protos));
-
-		if (retval != 0)
-		{
-			char	   *err = SSLerrmessage(ERR_get_error());
-
-			libpq_append_conn_error(conn, "could not set SSL ALPN extension: %s", err);
-			SSLerrfree(err);
-			return -1;
 		}
 	}
 
@@ -1474,34 +1579,6 @@ open_client_SSL(PGconn *conn)
 		}
 	}
 
-	/* ALPN is mandatory with direct SSL connections */
-	if (conn->current_enc_method == ENC_SSL && conn->sslnegotiation[0] == 'd')
-	{
-		const unsigned char *selected;
-		unsigned int len;
-
-		SSL_get0_alpn_selected(conn->ssl, &selected, &len);
-
-		if (selected == NULL)
-		{
-			libpq_append_conn_error(conn, "direct SSL connection was established without ALPN protocol negotiation extension");
-			pgtls_close(conn);
-			return PGRES_POLLING_FAILED;
-		}
-
-		/*
-		 * We only support one protocol so that's what the negotiation should
-		 * always choose, but doesn't hurt to check.
-		 */
-		if (len != strlen(PG_ALPN_PROTOCOL) ||
-			memcmp(selected, PG_ALPN_PROTOCOL, strlen(PG_ALPN_PROTOCOL)) != 0)
-		{
-			libpq_append_conn_error(conn, "SSL connection was established with unexpected ALPN protocol");
-			pgtls_close(conn);
-			return PGRES_POLLING_FAILED;
-		}
-	}
-
 	/*
 	 * We already checked the server certificate in initialize_SSL() using
 	 * SSL_CTX_set_verify(), if root.crt exists.
@@ -1532,6 +1609,8 @@ open_client_SSL(PGconn *conn)
 void
 pgtls_close(PGconn *conn)
 {
+	bool		destroy_needed = false;
+
 	if (conn->ssl_in_use)
 	{
 		if (conn->ssl)
@@ -1546,7 +1625,8 @@ pgtls_close(PGconn *conn)
 			SSL_free(conn->ssl);
 			conn->ssl = NULL;
 			conn->ssl_in_use = false;
-			conn->ssl_handshake_started = false;
+
+			destroy_needed = true;
 		}
 
 		if (conn->peer)
@@ -1563,6 +1643,30 @@ pgtls_close(PGconn *conn)
 			conn->engine = NULL;
 		}
 #endif
+	}
+	else
+	{
+		/*
+		 * In the non-SSL case, just remove the crypto callbacks if the
+		 * connection has then loaded.  This code path has no dependency on
+		 * any pending SSL calls.
+		 */
+		if (conn->crypto_loaded)
+			destroy_needed = true;
+	}
+
+	/*
+	 * This will remove our crypto locking hooks if this is the last
+	 * connection using libcrypto which means we must wait to call it until
+	 * after all the potential SSL calls have been made, otherwise we can end
+	 * up with a race condition and possible deadlocks.
+	 *
+	 * See comments above destroy_ssl_system().
+	 */
+	if (destroy_needed)
+	{
+		destroy_ssl_system();
+		conn->crypto_loaded = false;
 	}
 }
 
@@ -1601,23 +1705,6 @@ SSLerrmessage(unsigned long ecode)
 		strlcpy(errbuf, errreason, SSL_ERR_LEN);
 		return errbuf;
 	}
-
-	/*
-	 * Server aborted the connection with TLS "no_application_protocol" alert.
-	 * The ERR_reason_error_string() function doesn't give any error string
-	 * for that for some reason, so do it ourselves.  See
-	 * https://github.com/openssl/openssl/issues/24300.  This is available in
-	 * OpenSSL 1.1.0 and later, as well as in LibreSSL 3.4.3 (OpenBSD 7.0) and
-	 * later.
-	 */
-#ifdef SSL_AD_NO_APPLICATION_PROTOCOL
-	if (ERR_GET_LIB(ecode) == ERR_LIB_SSL &&
-		ERR_GET_REASON(ecode) == SSL_AD_REASON_OFFSET + SSL_AD_NO_APPLICATION_PROTOCOL)
-	{
-		snprintf(errbuf, SSL_ERR_LEN, "no application protocol");
-		return errbuf;
-	}
-#endif
 
 	/*
 	 * In OpenSSL 3.0.0 and later, ERR_reason_error_string does not map system
@@ -1680,7 +1767,6 @@ PQsslAttributeNames(PGconn *conn)
 		"cipher",
 		"compression",
 		"protocol",
-		"alpn",
 		NULL
 	};
 	static const char *const empty_attrs[] = {NULL};
@@ -1735,21 +1821,6 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
 	if (strcmp(attribute_name, "protocol") == 0)
 		return SSL_get_version(conn->ssl);
 
-	if (strcmp(attribute_name, "alpn") == 0)
-	{
-		const unsigned char *data;
-		unsigned int len;
-		static char alpn_str[256];	/* alpn doesn't support longer than 255
-									 * bytes */
-
-		SSL_get0_alpn_selected(conn->ssl, &data, &len);
-		if (data == NULL || len == 0 || len > sizeof(alpn_str) - 1)
-			return "";
-		memcpy(alpn_str, data, len);
-		alpn_str[len] = 0;
-		return alpn_str;
-	}
-
 	return NULL;				/* unknown attribute */
 }
 
@@ -1760,20 +1831,20 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
  *
  * These functions are closely modelled on the standard socket BIO in OpenSSL;
  * see sock_read() and sock_write() in OpenSSL's crypto/bio/bss_sock.c.
+ * XXX OpenSSL 1.0.1e considers many more errcodes than just EINTR as reasons
+ * to retry; do we need to adopt their logic for that?
  */
 
 /* protected by ssl_config_mutex */
-static BIO_METHOD *pgconn_bio_method_ptr;
+static BIO_METHOD *my_bio_methods;
 
 static int
-pgconn_bio_read(BIO *h, char *buf, int size)
+my_sock_read(BIO *h, char *buf, int size)
 {
-	PGconn	   *conn = (PGconn *) BIO_get_data(h);
 	int			res;
 
-	res = pqsecure_raw_read(conn, buf, size);
+	res = pqsecure_raw_read((PGconn *) BIO_get_app_data(h), buf, size);
 	BIO_clear_retry_flags(h);
-	conn->last_read_was_eof = res == 0;
 	if (res < 0)
 	{
 		/* If we were interrupted, tell caller to retry */
@@ -1794,18 +1865,15 @@ pgconn_bio_read(BIO *h, char *buf, int size)
 		}
 	}
 
-	if (res > 0)
-		conn->ssl_handshake_started = true;
-
 	return res;
 }
 
 static int
-pgconn_bio_write(BIO *h, const char *buf, int size)
+my_sock_write(BIO *h, const char *buf, int size)
 {
 	int			res;
 
-	res = pqsecure_raw_write((PGconn *) BIO_get_data(h), buf, size);
+	res = pqsecure_raw_write((PGconn *) BIO_get_app_data(h), buf, size);
 	BIO_clear_retry_flags(h);
 	if (res < 0)
 	{
@@ -1830,54 +1898,28 @@ pgconn_bio_write(BIO *h, const char *buf, int size)
 	return res;
 }
 
-static long
-pgconn_bio_ctrl(BIO *h, int cmd, long num, void *ptr)
-{
-	long		res;
-	PGconn	   *conn = (PGconn *) BIO_get_data(h);
-
-	switch (cmd)
-	{
-		case BIO_CTRL_EOF:
-
-			/*
-			 * This should not be needed. pgconn_bio_read already has a way to
-			 * signal EOF to OpenSSL. However, OpenSSL made an undocumented,
-			 * backwards-incompatible change and now expects EOF via BIO_ctrl.
-			 * See https://github.com/openssl/openssl/issues/8208
-			 */
-			res = conn->last_read_was_eof;
-			break;
-		case BIO_CTRL_FLUSH:
-			/* libssl expects all BIOs to support BIO_flush. */
-			res = 1;
-			break;
-		default:
-			res = 0;
-			break;
-	}
-
-	return res;
-}
-
 static BIO_METHOD *
-pgconn_bio_method(void)
+my_BIO_s_socket(void)
 {
 	BIO_METHOD *res;
 
+#ifdef ENABLE_THREAD_SAFETY
 	if (pthread_mutex_lock(&ssl_config_mutex))
 		return NULL;
+#endif
 
-	res = pgconn_bio_method_ptr;
+	res = my_bio_methods;
 
-	if (!pgconn_bio_method_ptr)
+	if (!my_bio_methods)
 	{
+		BIO_METHOD *biom = (BIO_METHOD *) BIO_s_socket();
+#ifdef HAVE_BIO_METH_NEW
 		int			my_bio_index;
 
 		my_bio_index = BIO_get_new_index();
 		if (my_bio_index == -1)
 			goto err;
-		my_bio_index |= BIO_TYPE_SOURCE_SINK;
+		my_bio_index |= (BIO_TYPE_DESCRIPTOR | BIO_TYPE_SOURCE_SINK);
 		res = BIO_meth_new(my_bio_index, "libpq socket");
 		if (!res)
 			goto err;
@@ -1886,44 +1928,77 @@ pgconn_bio_method(void)
 		 * As of this writing, these functions never fail. But check anyway,
 		 * like OpenSSL's own examples do.
 		 */
-		if (!BIO_meth_set_write(res, pgconn_bio_write) ||
-			!BIO_meth_set_read(res, pgconn_bio_read) ||
-			!BIO_meth_set_ctrl(res, pgconn_bio_ctrl))
+		if (!BIO_meth_set_write(res, my_sock_write) ||
+			!BIO_meth_set_read(res, my_sock_read) ||
+			!BIO_meth_set_gets(res, BIO_meth_get_gets(biom)) ||
+			!BIO_meth_set_puts(res, BIO_meth_get_puts(biom)) ||
+			!BIO_meth_set_ctrl(res, BIO_meth_get_ctrl(biom)) ||
+			!BIO_meth_set_create(res, BIO_meth_get_create(biom)) ||
+			!BIO_meth_set_destroy(res, BIO_meth_get_destroy(biom)) ||
+			!BIO_meth_set_callback_ctrl(res, BIO_meth_get_callback_ctrl(biom)))
 		{
 			goto err;
 		}
+#else
+		res = malloc(sizeof(BIO_METHOD));
+		if (!res)
+			goto err;
+		memcpy(res, biom, sizeof(BIO_METHOD));
+		res->bread = my_sock_read;
+		res->bwrite = my_sock_write;
+#endif
 	}
 
-	pgconn_bio_method_ptr = res;
+	my_bio_methods = res;
+
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&ssl_config_mutex);
+#endif
+
 	return res;
 
 err:
+#ifdef HAVE_BIO_METH_NEW
 	if (res)
 		BIO_meth_free(res);
+#else
+	if (res)
+		free(res);
+#endif
+
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&ssl_config_mutex);
+#endif
 	return NULL;
 }
 
+/* This should exactly match OpenSSL's SSL_set_fd except for using my BIO */
 static int
-ssl_set_pgconn_bio(PGconn *conn)
+my_SSL_set_fd(PGconn *conn, int fd)
 {
+	int			ret = 0;
 	BIO		   *bio;
 	BIO_METHOD *bio_method;
 
-	bio_method = pgconn_bio_method();
+	bio_method = my_BIO_s_socket();
 	if (bio_method == NULL)
-		return 0;
-
+	{
+		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+		goto err;
+	}
 	bio = BIO_new(bio_method);
 	if (bio == NULL)
-		return 0;
-
-	BIO_set_data(bio, conn);
-	BIO_set_init(bio, 1);
+	{
+		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+		goto err;
+	}
+	BIO_set_app_data(bio, conn);
 
 	SSL_set_bio(conn->ssl, bio, bio);
-	return 1;
+	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+	ret = 1;
+err:
+	return ret;
 }
 
 /*

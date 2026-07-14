@@ -5,7 +5,7 @@
  *	  infrastructure for selectivity and cost estimation.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/selfuncs.h
@@ -94,8 +94,7 @@ typedef struct VariableStatData
 	Oid			vartype;		/* exposed type of expression */
 	Oid			atttype;		/* actual type (after stripping relabel) */
 	int32		atttypmod;		/* actual typmod (after stripping relabel) */
-	bool		isunique;		/* matches unique index, DISTINCT or GROUP-BY
-								 * clause */
+	bool		isunique;		/* matches unique index or DISTINCT clause */
 	bool		acl_ok;			/* true if user has SELECT privilege on all
 								 * rows from the table or column */
 } VariableStatData;
@@ -119,15 +118,6 @@ typedef struct VariableStatData
  * Callers should initialize all fields of GenericCosts to zero.  In addition,
  * they can set numIndexTuples to some positive value if they have a better
  * than default way of estimating the number of leaf index tuples visited.
- * Similarly, they can set num_sa_scans to some value >= 1 for an index AM
- * that doesn't necessarily perform exactly one primitive index scan per
- * distinct combination of ScalarArrayOp array elements.
- * Similarly, they can set numNonLeafPages to some value >= 1 if they know
- * how many index pages are not leaf pages.  (It's always good to count
- * totally non-data-bearing pages such as metapages here, since accounting
- * for the metapage can move cost estimates for a small index significantly.
- * But upper pages in large indexes may be few enough relative to leaf pages
- * that it's not worth trying to count them.)
  */
 typedef struct
 {
@@ -142,7 +132,6 @@ typedef struct
 	double		numIndexTuples; /* number of leaf tuples visited */
 	double		spc_random_page_cost;	/* relevant random_page_cost value */
 	double		num_sa_scans;	/* # indexscans from ScalarArrayOpExprs */
-	BlockNumber numNonLeafPages;	/* # of index pages that are not leaves */
 } GenericCosts;
 
 /* Hooks for plugins to get control when we ask for stats */
@@ -213,13 +202,13 @@ extern Selectivity scalararraysel(PlannerInfo *root,
 								  ScalarArrayOpExpr *clause,
 								  bool is_join_clause,
 								  int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
-extern double estimate_array_length(PlannerInfo *root, Node *arrayexpr);
+extern int	estimate_array_length(Node *arrayexpr);
 extern Selectivity rowcomparesel(PlannerInfo *root,
 								 RowCompareExpr *clause,
 								 int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
 
 extern void mergejoinscansel(PlannerInfo *root, Node *clause,
-							 Oid opfamily, CompareType cmptype, bool nulls_first,
+							 Oid opfamily, int strategy, bool nulls_first,
 							 Selectivity *leftstart, Selectivity *leftend,
 							 Selectivity *rightstart, Selectivity *rightend);
 
@@ -227,10 +216,6 @@ extern double estimate_num_groups(PlannerInfo *root, List *groupExprs,
 								  double input_rows, List **pgset,
 								  EstimationInfo *estinfo);
 
-extern List *estimate_multivariate_bucketsize(PlannerInfo *root,
-											  RelOptInfo *inner,
-											  List *hashclauses,
-											  Selectivity *innerbucketsize);
 extern void estimate_hash_bucket_stats(PlannerInfo *root,
 									   Node *hashkey, double nbuckets,
 									   Selectivity *mcv_freq,

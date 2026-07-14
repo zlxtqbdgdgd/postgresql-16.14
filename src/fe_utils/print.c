@@ -8,7 +8,7 @@
  * pager open/close functions, all that stuff came with it.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/fe_utils/print.c
@@ -32,11 +32,6 @@
 #include "catalog/pg_type_d.h"
 #include "fe_utils/mbprint.h"
 #include "fe_utils/print.h"
-
-/* Presently, count_table_lines() is only used within #ifdef TIOCGWINSZ */
-#ifdef TIOCGWINSZ
-#define NEED_COUNT_TABLE_LINES
-#endif
 
 /*
  * If the calling program doesn't have any mechanism for setting
@@ -271,20 +266,9 @@ static const unicodeStyleFormat unicode_style = {
 
 /* Local functions */
 static int	strlen_max_width(unsigned char *str, int *target_width, int encoding);
-static FILE *PageOutputInternal(int lines, const printTableOpt *topt,
-								const printTableContent *cont,
-								const unsigned int *width_wrap,
-								bool vertical);
-static void IsPagerNeeded(const printTableContent *cont,
-						  const unsigned int *width_wrap,
-						  bool vertical,
+static void IsPagerNeeded(const printTableContent *cont, int extra_lines, bool expanded,
 						  FILE **fout, bool *is_pager);
-#ifdef NEED_COUNT_TABLE_LINES
-static int	count_table_lines(const printTableContent *cont,
-							  const unsigned int *width_wrap,
-							  bool vertical,
-							  int threshold);
-#endif
+
 static void print_aligned_vertical(const printTableContent *cont,
 								   FILE *fout, bool is_pager);
 
@@ -344,7 +328,7 @@ format_numeric_locale(const char *my_str)
 		return pg_strdup(my_str);
 
 	new_len = strlen(my_str) + additional_numeric_locale_len(my_str);
-	new_str = pg_malloc_array(char, (new_len + 1));
+	new_str = pg_malloc(new_len + 1);
 	new_str_pos = 0;
 	int_len = integer_digits(my_str);
 
@@ -672,6 +656,8 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 	unsigned char **format_buf;
 	unsigned int width_total;
 	unsigned int total_header_width;
+	unsigned int extra_row_output_lines = 0;
+	unsigned int extra_output_lines = 0;
 
 	const char *const *ptr;
 
@@ -692,18 +678,18 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 	if (cont->ncolumns > 0)
 	{
 		col_count = cont->ncolumns;
-		width_header = pg_malloc0_array(unsigned int, col_count);
-		width_average = pg_malloc0_array(unsigned int, col_count);
-		max_width = pg_malloc0_array(unsigned int, col_count);
-		width_wrap = pg_malloc0_array(unsigned int, col_count);
-		max_nl_lines = pg_malloc0_array(unsigned int, col_count);
-		curr_nl_line = pg_malloc0_array(unsigned int, col_count);
-		col_lineptrs = pg_malloc0_array(struct lineptr *, col_count);
-		max_bytes = pg_malloc0_array(unsigned int, col_count);
-		format_buf = pg_malloc0_array(unsigned char *, col_count);
-		header_done = pg_malloc0_array(bool, col_count);
-		bytes_output = pg_malloc0_array(int, col_count);
-		wrap = pg_malloc0_array(printTextLineWrap, col_count);
+		width_header = pg_malloc0(col_count * sizeof(*width_header));
+		width_average = pg_malloc0(col_count * sizeof(*width_average));
+		max_width = pg_malloc0(col_count * sizeof(*max_width));
+		width_wrap = pg_malloc0(col_count * sizeof(*width_wrap));
+		max_nl_lines = pg_malloc0(col_count * sizeof(*max_nl_lines));
+		curr_nl_line = pg_malloc0(col_count * sizeof(*curr_nl_line));
+		col_lineptrs = pg_malloc0(col_count * sizeof(*col_lineptrs));
+		max_bytes = pg_malloc0(col_count * sizeof(*max_bytes));
+		format_buf = pg_malloc0(col_count * sizeof(*format_buf));
+		header_done = pg_malloc0(col_count * sizeof(*header_done));
+		bytes_output = pg_malloc0(col_count * sizeof(*bytes_output));
+		wrap = pg_malloc0(col_count * sizeof(*wrap));
 	}
 	else
 	{
@@ -736,12 +722,17 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 			max_nl_lines[i] = nl_lines;
 		if (bytes_required > max_bytes[i])
 			max_bytes[i] = bytes_required;
+		if (nl_lines > extra_row_output_lines)
+			extra_row_output_lines = nl_lines;
 
 		width_header[i] = width;
 	}
+	/* Add height of tallest header column */
+	extra_output_lines += extra_row_output_lines;
+	extra_row_output_lines = 0;
 
 	/* scan all cells, find maximum width, compute cell_count */
-	for (i = 0, ptr = cont->cells; *ptr; ptr++, cell_count++)
+	for (i = 0, ptr = cont->cells; *ptr; ptr++, i++, cell_count++)
 	{
 		int			width,
 					nl_lines,
@@ -750,18 +741,14 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 		pg_wcssize((const unsigned char *) *ptr, strlen(*ptr), encoding,
 				   &width, &nl_lines, &bytes_required);
 
-		if (width > max_width[i])
-			max_width[i] = width;
-		if (nl_lines > max_nl_lines[i])
-			max_nl_lines[i] = nl_lines;
-		if (bytes_required > max_bytes[i])
-			max_bytes[i] = bytes_required;
+		if (width > max_width[i % col_count])
+			max_width[i % col_count] = width;
+		if (nl_lines > max_nl_lines[i % col_count])
+			max_nl_lines[i % col_count] = nl_lines;
+		if (bytes_required > max_bytes[i % col_count])
+			max_bytes[i % col_count] = bytes_required;
 
-		width_average[i] += width;
-
-		/* i is the current column number: increment with wrap */
-		if (++i >= col_count)
-			i = 0;
+		width_average[i % col_count] += width;
 	}
 
 	/* If we have rows, compute average */
@@ -798,10 +785,10 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 	for (i = 0; i < col_count; i++)
 	{
 		/* Add entry for ptr == NULL array termination */
-		col_lineptrs[i] = pg_malloc0_array(struct lineptr,
-										   (max_nl_lines[i] + 1));
+		col_lineptrs[i] = pg_malloc0((max_nl_lines[i] + 1) *
+									 sizeof(**col_lineptrs));
 
-		format_buf[i] = pg_malloc_array(unsigned char, (max_bytes[i] + 1));
+		format_buf[i] = pg_malloc(max_bytes[i] + 1);
 
 		col_lineptrs[i]->ptr = format_buf[i];
 	}
@@ -902,10 +889,43 @@ print_aligned_text(const printTableContent *cont, FILE *fout, bool is_pager)
 		is_pager = is_local_pager = true;
 	}
 
-	/* Check if there are enough lines to require the pager */
-	if (!is_pager)
+	/* Check if newlines or our wrapping now need the pager */
+	if (!is_pager && fout == stdout)
 	{
-		IsPagerNeeded(cont, width_wrap, false, &fout, &is_pager);
+		/* scan all cells, find maximum width, compute cell_count */
+		for (i = 0, ptr = cont->cells; *ptr; ptr++, cell_count++)
+		{
+			int			width,
+						nl_lines,
+						bytes_required;
+
+			pg_wcssize((const unsigned char *) *ptr, strlen(*ptr), encoding,
+					   &width, &nl_lines, &bytes_required);
+
+			/*
+			 * A row can have both wrapping and newlines that cause it to
+			 * display across multiple lines.  We check for both cases below.
+			 */
+			if (width > 0 && width_wrap[i])
+			{
+				unsigned int extra_lines;
+
+				/* don't count the first line of nl_lines - it's not "extra" */
+				extra_lines = ((width - 1) / width_wrap[i]) + nl_lines - 1;
+				if (extra_lines > extra_row_output_lines)
+					extra_row_output_lines = extra_lines;
+			}
+
+			/* i is the current column number: increment with wrap */
+			if (++i >= col_count)
+			{
+				i = 0;
+				/* At last column of each row, add tallest column height */
+				extra_output_lines += extra_row_output_lines;
+				extra_row_output_lines = 0;
+			}
+		}
+		IsPagerNeeded(cont, extra_output_lines, false, &fout, &is_pager);
 		is_local_pager = is_pager;
 	}
 
@@ -1180,21 +1200,21 @@ cleanup:
 	/* clean up */
 	for (i = 0; i < col_count; i++)
 	{
-		pg_free(col_lineptrs[i]);
-		pg_free(format_buf[i]);
+		free(col_lineptrs[i]);
+		free(format_buf[i]);
 	}
-	pg_free(width_header);
-	pg_free(width_average);
-	pg_free(max_width);
-	pg_free(width_wrap);
-	pg_free(max_nl_lines);
-	pg_free(curr_nl_line);
-	pg_free(col_lineptrs);
-	pg_free(max_bytes);
-	pg_free(format_buf);
-	pg_free(header_done);
-	pg_free(bytes_output);
-	pg_free(wrap);
+	free(width_header);
+	free(width_average);
+	free(max_width);
+	free(width_wrap);
+	free(max_nl_lines);
+	free(curr_nl_line);
+	free(col_lineptrs);
+	free(max_bytes);
+	free(format_buf);
+	free(header_done);
+	free(bytes_output);
+	free(wrap);
 
 	if (is_local_pager)
 		ClosePager(fout);
@@ -1331,11 +1351,6 @@ print_aligned_vertical(const printTableContent *cont,
 	if (opt_border > 2)
 		opt_border = 2;
 
-	/*
-	 * Kluge for totally empty table: use the default footer even though
-	 * vertical modes normally don't.  Otherwise we'd print nothing at all,
-	 * which isn't terribly friendly.  Assume pager will not be needed.
-	 */
 	if (cont->cells[0] == NULL && cont->opt->start_table &&
 		cont->opt->stop_table)
 	{
@@ -1352,6 +1367,17 @@ print_aligned_vertical(const printTableContent *cont,
 		fputc('\n', fout);
 
 		return;
+	}
+
+	/*
+	 * Deal with the pager here instead of in printTable(), because we could
+	 * get here via print_aligned_text() in expanded auto mode, and so we have
+	 * to recalculate the pager requirement based on vertical output.
+	 */
+	if (!is_pager)
+	{
+		IsPagerNeeded(cont, 0, true, &fout, &is_pager);
+		is_local_pager = is_pager;
 	}
 
 	/* Find the maximum dimensions for the headers */
@@ -1375,7 +1401,7 @@ print_aligned_vertical(const printTableContent *cont,
 	}
 
 	/* find longest data cell */
-	for (ptr = cont->cells; *ptr; ptr++)
+	for (i = 0, ptr = cont->cells; *ptr; ptr++, i++)
 	{
 		int			width,
 					height,
@@ -1398,11 +1424,18 @@ print_aligned_vertical(const printTableContent *cont,
 	 * We now have all the information we need to setup the formatting
 	 * structures
 	 */
-	dlineptr = pg_malloc_array(struct lineptr, (dheight + 1));
-	hlineptr = pg_malloc_array(struct lineptr, (hheight + 1));
+	dlineptr = pg_malloc((sizeof(*dlineptr)) * (dheight + 1));
+	hlineptr = pg_malloc((sizeof(*hlineptr)) * (hheight + 1));
 
 	dlineptr->ptr = pg_malloc(dformatsize);
 	hlineptr->ptr = pg_malloc(hformatsize);
+
+	if (cont->opt->start_table)
+	{
+		/* print title */
+		if (!opt_tuples_only && cont->title)
+			fprintf(fout, "%s\n", cont->title);
+	}
 
 	/*
 	 * Choose target output width: \pset columns, or $COLUMNS, or ioctl
@@ -1425,10 +1458,9 @@ print_aligned_vertical(const printTableContent *cont,
 	}
 
 	/*
-	 * Determine data column width: fit output width in wrapped mode, or
-	 * ensure alignment with the record header line in aligned mode.
+	 * Calculate available width for data in wrapped mode
 	 */
-	if (cont->opt->format == PRINT_WRAPPED || cont->opt->format == PRINT_ALIGNED)
+	if (cont->opt->format == PRINT_WRAPPED)
 	{
 		unsigned int swidth,
 					rwidth = 0,
@@ -1500,7 +1532,7 @@ print_aligned_vertical(const printTableContent *cont,
 			if (width < rwidth)
 				width = rwidth;
 
-			if (cont->opt->format == PRINT_WRAPPED && output_columns > 0)
+			if (output_columns > 0)
 			{
 				unsigned int min_width;
 
@@ -1549,41 +1581,6 @@ print_aligned_vertical(const printTableContent *cont,
 		}
 
 		dwidth = newdwidth;
-	}
-
-	/*
-	 * Deal with the pager here instead of in printTable(), because we could
-	 * get here via print_aligned_text() in expanded auto mode, and so we have
-	 * to recalculate the pager requirement based on vertical output.
-	 */
-	if (!is_pager)
-	{
-		unsigned int *width_wrap = NULL;
-
-		/*
-		 * Wrapping can add extra output lines, which count_table_lines() can
-		 * only account for if it has wrap widths.  But vertical output uses
-		 * the same data width for every field, so that's easy: use dwidth for
-		 * every column.
-		 */
-		if (cont->opt->format == PRINT_WRAPPED && cont->ncolumns > 0)
-		{
-			width_wrap = pg_malloc_array(unsigned int, cont->ncolumns);
-			for (i = 0; i < cont->ncolumns; i++)
-				width_wrap[i] = dwidth;
-		}
-
-		IsPagerNeeded(cont, width_wrap, true, &fout, &is_pager);
-		is_local_pager = is_pager;
-
-		free(width_wrap);
-	}
-
-	if (cont->opt->start_table)
-	{
-		/* print title */
-		if (!opt_tuples_only && cont->title)
-			fprintf(fout, "%s\n", cont->title);
 	}
 
 	/* print records */
@@ -1824,10 +1821,10 @@ print_aligned_vertical(const printTableContent *cont,
 		fputc('\n', fout);
 	}
 
-	pg_free(hlineptr->ptr);
-	pg_free(dlineptr->ptr);
-	pg_free(hlineptr);
-	pg_free(dlineptr);
+	free(hlineptr->ptr);
+	free(dlineptr->ptr);
+	free(hlineptr);
+	free(dlineptr);
 
 	if (is_local_pager)
 		ClosePager(fout);
@@ -3042,7 +3039,7 @@ void
 disable_sigpipe_trap(void)
 {
 #ifndef WIN32
-	pqsignal(SIGPIPE, PG_SIG_IGN);
+	pqsignal(SIGPIPE, SIG_IGN);
 #endif
 }
 
@@ -3065,7 +3062,7 @@ void
 restore_sigpipe_trap(void)
 {
 #ifndef WIN32
-	pqsignal(SIGPIPE, always_ignore_sigpipe ? PG_SIG_IGN : PG_SIG_DFL);
+	pqsignal(SIGPIPE, always_ignore_sigpipe ? SIG_IGN : SIG_DFL);
 #endif
 }
 
@@ -3084,62 +3081,28 @@ set_sigpipe_trap_state(bool ignore)
 /*
  * PageOutput
  *
- * Tests if pager is needed and returns appropriate FILE pointer
- * (either a pipe, or stdout if we don't need the pager).
- *
- * lines: number of lines that will be printed
- * topt: print formatting options
+ * Tests if pager is needed and returns appropriate FILE pointer.
  *
  * If the topt argument is NULL no pager is used.
  */
 FILE *
 PageOutput(int lines, const printTableOpt *topt)
 {
-	return PageOutputInternal(lines, topt, NULL, NULL, false);
-}
-
-/*
- * Private version that allows for line-counting to be avoided when
- * not needed.  If "cont" is not null then the input value of "lines"
- * is ignored and we count lines based on cont + width_wrap + vertical
- * (see count_table_lines).
- */
-static FILE *
-PageOutputInternal(int lines, const printTableOpt *topt,
-				   const printTableContent *cont,
-				   const unsigned int *width_wrap,
-				   bool vertical)
-{
 	/* check whether we need / can / are supposed to use pager */
 	if (topt && topt->pager && isatty(fileno(stdin)) && isatty(fileno(stdout)))
 	{
-		/* without TIOCGWINSZ, pager == 1 acts the same as pager > 1 */
 #ifdef TIOCGWINSZ
 		unsigned short int pager = topt->pager;
 		int			min_lines = topt->pager_min_lines;
+		int			result;
+		struct winsize screen_size;
 
-		if (pager == 1)
-		{
-			int			result;
-			struct winsize screen_size;
+		result = ioctl(fileno(stdout), TIOCGWINSZ, &screen_size);
 
-			result = ioctl(fileno(stdout), TIOCGWINSZ, &screen_size);
-			if (result < 0)
-				pager = 2;		/* force use of pager */
-			else
-			{
-				int			threshold = Max(screen_size.ws_row, min_lines);
-
-				if (cont)		/* caller wants us to calculate lines */
-					lines = count_table_lines(cont, width_wrap, vertical,
-											  threshold);
-				/* >= accounts for a one-line prompt */
-				if (lines >= threshold)
-					pager = 2;
-			}
-		}
-
-		if (pager > 1)
+		/* >= accounts for a one-line prompt */
+		if (result == -1
+			|| (lines >= screen_size.ws_row && lines >= min_lines)
+			|| pager > 1)
 #endif
 		{
 			const char *pagerprog;
@@ -3209,30 +3172,19 @@ void
 printTableInit(printTableContent *const content, const printTableOpt *opt,
 			   const char *title, const int ncolumns, const int nrows)
 {
-	uint64		total_cells;
-
 	content->opt = opt;
 	content->title = title;
 	content->ncolumns = ncolumns;
 	content->nrows = nrows;
 
-	content->headers = pg_malloc0_array(const char *, (ncolumns + 1));
+	content->headers = pg_malloc0((ncolumns + 1) * sizeof(*content->headers));
 
-	total_cells = (uint64) ncolumns * nrows;
-	/* Catch possible overflow.  Using >= here allows adding 1 below */
-	if (total_cells >= SIZE_MAX / sizeof(*content->cells))
-	{
-		fprintf(stderr, _("Cannot print table contents: number of cells %" PRIu64 " is equal to or exceeds maximum %zu.\n"),
-				total_cells,
-				SIZE_MAX / sizeof(*content->cells));
-		exit(EXIT_FAILURE);
-	}
-	content->cells = pg_malloc0_array(const char *, (total_cells + 1));
+	content->cells = pg_malloc0((ncolumns * nrows + 1) * sizeof(*content->cells));
 
 	content->cellmustfree = NULL;
 	content->footers = NULL;
 
-	content->aligns = pg_malloc0_array(char, (ncolumns + 1));
+	content->aligns = pg_malloc0((ncolumns + 1) * sizeof(*content->align));
 
 	content->header = content->headers;
 	content->cell = content->cells;
@@ -3297,17 +3249,15 @@ void
 printTableAddCell(printTableContent *const content, char *cell,
 				  const bool translate, const bool mustfree)
 {
-	uint64		total_cells;
-
 #ifndef ENABLE_NLS
 	(void) translate;			/* unused parameter */
 #endif
 
-	total_cells = (uint64) content->ncolumns * content->nrows;
-	if (content->cellsadded >= total_cells)
+	if (content->cellsadded >= content->ncolumns * content->nrows)
 	{
-		fprintf(stderr, _("Cannot add cell to table content: total cell count of %" PRIu64 " exceeded.\n"),
-				total_cells);
+		fprintf(stderr, _("Cannot add cell to table content: "
+						  "total cell count of %d exceeded.\n"),
+				content->ncolumns * content->nrows);
 		exit(EXIT_FAILURE);
 	}
 
@@ -3323,7 +3273,7 @@ printTableAddCell(printTableContent *const content, char *cell,
 	{
 		if (content->cellmustfree == NULL)
 			content->cellmustfree =
-				pg_malloc0_array(bool, (total_cells + 1));
+				pg_malloc0((content->ncolumns * content->nrows + 1) * sizeof(bool));
 
 		content->cellmustfree[content->cellsadded] = true;
 	}
@@ -3348,7 +3298,7 @@ printTableAddFooter(printTableContent *const content, const char *footer)
 {
 	printTableFooter *f;
 
-	f = pg_malloc0_object(printTableFooter);
+	f = pg_malloc0(sizeof(*f));
 	f->data = pg_strdup(footer);
 
 	if (content->footers == NULL)
@@ -3391,10 +3341,9 @@ printTableCleanup(printTableContent *const content)
 {
 	if (content->cellmustfree)
 	{
-		uint64		total_cells;
+		int			i;
 
-		total_cells = (uint64) content->ncolumns * content->nrows;
-		for (uint64 i = 0; i < total_cells; i++)
+		for (i = 0; i < content->nrows * content->ncolumns; i++)
 		{
 			if (content->cellmustfree[i])
 				free(unconstify(char *, content->cells[i]));
@@ -3435,212 +3384,38 @@ printTableCleanup(printTableContent *const content)
  * IsPagerNeeded
  *
  * Setup pager if required
- *
- * cont: table data to be printed
- * width_wrap[]: per-column maximum width, or NULL if caller will not wrap
- * vertical: vertical mode?
- * fout: where to print to (in/out argument)
- * is_pager: output argument
- *
- * If we decide pager is needed, *fout is modified and *is_pager is set true
  */
 static void
-IsPagerNeeded(const printTableContent *cont, const unsigned int *width_wrap,
-			  bool vertical,
+IsPagerNeeded(const printTableContent *cont, int extra_lines, bool expanded,
 			  FILE **fout, bool *is_pager)
 {
 	if (*fout == stdout)
 	{
-		*fout = PageOutputInternal(0, cont->opt, cont, width_wrap, vertical);
+		int			lines;
+
+		if (expanded)
+			lines = (cont->ncolumns + 1) * cont->nrows;
+		else
+			lines = cont->nrows + 1;
+
+		if (!cont->opt->tuples_only)
+		{
+			printTableFooter *f;
+
+			/*
+			 * FIXME -- this is slightly bogus: it counts the number of
+			 * footers, not the number of lines in them.
+			 */
+			for (f = cont->footers; f; f = f->next)
+				lines++;
+		}
+
+		*fout = PageOutput(lines + extra_lines, cont->opt);
 		*is_pager = (*fout != stdout);
 	}
 	else
 		*is_pager = false;
 }
-
-/*
- * Count the number of lines needed to print the given table.
- *
- * cont: table data to be printed
- * width_wrap[]: per-column maximum width, or NULL if caller will not wrap
- * vertical: vertical mode?
- * threshold: we can stop counting once we pass this many lines
- *
- * The result is currently only fully accurate for ALIGNED/WRAPPED and
- * UNALIGNED formats; otherwise it's an approximation.
- *
- * Note: while cont->opt will tell us most formatting details, we need the
- * separate "vertical" flag because of the possibility of a dynamic switch
- * from aligned_text to aligned_vertical format.
- *
- * The point of the threshold parameter is that when the table is very long,
- * we'll typically be able to stop scanning after not many rows.
- */
-#ifdef NEED_COUNT_TABLE_LINES
-static int
-count_table_lines(const printTableContent *cont,
-				  const unsigned int *width_wrap,
-				  bool vertical,
-				  int threshold)
-{
-	int		   *header_height;
-	int			lines = 0,
-				max_lines = 0,
-				nl_lines,
-				i;
-	int			encoding = cont->opt->encoding;
-	const char *const *cell;
-
-	/*
-	 * Scan all column headers and determine their heights.  Cache the values
-	 * since vertical mode repeats the headers for every record.
-	 */
-	header_height = pg_malloc_array(int, cont->ncolumns);
-	for (i = 0; i < cont->ncolumns; i++)
-	{
-		pg_wcssize((const unsigned char *) cont->headers[i],
-				   strlen(cont->headers[i]), encoding,
-				   NULL, &header_height[i], NULL);
-	}
-
-	/*
-	 * Account for separator lines (if used), as well as the trailing blank
-	 * line that most formats emit.
-	 */
-	switch (cont->opt->format)
-	{
-		case PRINT_ALIGNED:
-		case PRINT_WRAPPED:
-
-			/*
-			 * Vertical mode writes one separator line per record.  Normal
-			 * mode writes a single separator line between header and rows.
-			 */
-			lines = vertical ? cont->nrows : 1;
-			/* Both modes add a blank line at the end */
-			lines++;
-			break;
-		case PRINT_UNALIGNED:
-
-			/*
-			 * Vertical mode writes a separator (here assumed to be a newline)
-			 * between records.  Normal mode writes nothing extra.
-			 */
-			if (vertical)
-				lines = Max(cont->nrows - 1, 0);
-			break;
-		case PRINT_CSV:
-			/* Nothing extra is added */
-			break;
-		case PRINT_HTML:
-		case PRINT_ASCIIDOC:
-		case PRINT_LATEX:
-		case PRINT_LATEX_LONGTABLE:
-		case PRINT_TROFF_MS:
-
-			/*
-			 * These formats aren't really meant for interactive consumption,
-			 * so for now we won't work hard on them.  Treat them like aligned
-			 * mode.
-			 */
-			lines = vertical ? cont->nrows : 1;
-			lines++;
-			break;
-		case PRINT_NOTHING:
-			/* Shouldn't get here... */
-			break;
-	}
-
-	/* Scan all cells to count their lines */
-	for (i = 0, cell = cont->cells; *cell; cell++)
-	{
-		int			width;
-
-		/* Count the original line breaks */
-		pg_wcssize((const unsigned char *) *cell, strlen(*cell), encoding,
-				   &width, &nl_lines, NULL);
-
-		/* Count extra lines due to wrapping */
-		if (width > 0 && width_wrap && width_wrap[i])
-			nl_lines += (width - 1) / width_wrap[i];
-
-		if (vertical)
-		{
-			/* Pick the height of the header or cell, whichever is taller */
-			if (nl_lines > header_height[i])
-				lines += nl_lines;
-			else
-				lines += header_height[i];
-		}
-		else
-		{
-			/* Remember max height in the current row */
-			if (nl_lines > max_lines)
-				max_lines = nl_lines;
-		}
-
-		/* i is the current column number: increment with wrap */
-		if (++i >= cont->ncolumns)
-		{
-			i = 0;
-			if (!vertical)
-			{
-				/* At last column of each row, add tallest column height */
-				lines += max_lines;
-				max_lines = 0;
-			}
-			/* Stop scanning table body once we pass threshold */
-			if (lines > threshold)
-				break;
-		}
-	}
-
-	/* Account for header and footer decoration */
-	if (!cont->opt->tuples_only && lines <= threshold)
-	{
-		printTableFooter *f;
-
-		if (cont->title)
-		{
-			/* Add height of title */
-			pg_wcssize((const unsigned char *) cont->title, strlen(cont->title),
-					   encoding, NULL, &nl_lines, NULL);
-			lines += nl_lines;
-		}
-
-		if (!vertical)
-		{
-			/* Add height of tallest header column */
-			max_lines = 0;
-			for (i = 0; i < cont->ncolumns; i++)
-			{
-				if (header_height[i] > max_lines)
-					max_lines = header_height[i];
-			}
-			lines += max_lines;
-		}
-
-		/*
-		 * Add all footer lines.  Vertical mode does not use the default
-		 * footer, but we must include that in normal mode.
-		 */
-		for (f = (vertical ? cont->footers : footers_with_default(cont));
-			 f != NULL; f = f->next)
-		{
-			pg_wcssize((const unsigned char *) f->data, strlen(f->data),
-					   encoding, NULL, &nl_lines, NULL);
-			lines += nl_lines;
-			/* Stop scanning footers once we pass threshold */
-			if (lines > threshold)
-				break;
-		}
-	}
-
-	pg_free(header_height);
-
-	return lines;
-}
-#endif							/* NEED_COUNT_TABLE_LINES */
 
 /*
  * Use this to print any table in the supported formats.
@@ -3667,7 +3442,7 @@ printTable(const printTableContent *cont,
 		cont->opt->format != PRINT_ALIGNED &&
 		cont->opt->format != PRINT_WRAPPED)
 	{
-		IsPagerNeeded(cont, NULL, (cont->opt->expanded == 1), &fout, &is_pager);
+		IsPagerNeeded(cont, 0, (cont->opt->expanded == 1), &fout, &is_pager);
 		is_local_pager = is_pager;
 	}
 
@@ -3675,6 +3450,10 @@ printTable(const printTableContent *cont,
 	clearerr(fout);
 
 	/* print the stuff */
+
+	if (flog)
+		print_aligned_text(cont, flog, false);
+
 	switch (cont->opt->format)
 	{
 		case PRINT_UNALIGNED:
@@ -3741,10 +3520,6 @@ printTable(const printTableContent *cont,
 
 	if (is_local_pager)
 		ClosePager(fout);
-
-	/* also produce log output if wanted */
-	if (flog)
-		print_aligned_text(cont, flog, false);
 }
 
 /*
@@ -3793,10 +3568,6 @@ printQuery(const PGresult *result, const printQueryOpt *opt,
 
 			if (PQgetisnull(result, r, c))
 				cell = opt->nullPrint ? opt->nullPrint : "";
-			else if (PQftype(result, c) == BOOLOID)
-				cell = (PQgetvalue(result, r, c)[0] == 't' ?
-						(opt->truePrint ? opt->truePrint : "t") :
-						(opt->falsePrint ? opt->falsePrint : "f"));
 			else
 			{
 				cell = PQgetvalue(result, r, c);
@@ -3839,7 +3610,6 @@ column_type_alignment(Oid ftype)
 		case FLOAT8OID:
 		case NUMERICOID:
 		case OIDOID:
-		case OID8OID:
 		case XIDOID:
 		case XID8OID:
 		case CIDOID:

@@ -3,7 +3,7 @@
  * buffile.c
  *	  Management of large buffered temporary files.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -49,11 +49,10 @@
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/buf_internals.h"
 #include "storage/buffile.h"
-#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "utils/resowner.h"
-#include "utils/wait_event.h"
 
 /*
  * We break BufFiles into gigabyte-sized segments, regardless of RELSEG_SIZE.
@@ -93,12 +92,12 @@ struct BufFile
 	 * Position as seen by user of BufFile is (curFile, curOffset + pos).
 	 */
 	int			curFile;		/* file index (0..n) part of current pos */
-	pgoff_t		curOffset;		/* offset part of current pos */
-	int64		pos;			/* next read/write position in buffer */
-	int64		nbytes;			/* total # of valid bytes in buffer */
+	off_t		curOffset;		/* offset part of current pos */
+	int			pos;			/* next read/write position in buffer */
+	int			nbytes;			/* total # of valid bytes in buffer */
 
 	/*
-	 * XXX Should ideally use PGIOAlignedBlock, but might need a way to avoid
+	 * XXX Should ideally us PGIOAlignedBlock, but might need a way to avoid
 	 * wasting per-file alignment padding when some users create many files.
 	 */
 	PGAlignedBlock buffer;
@@ -118,7 +117,7 @@ static File MakeNewFileSetSegment(BufFile *buffile, int segment);
 static BufFile *
 makeBufFileCommon(int nfiles)
 {
-	BufFile    *file = palloc_object(BufFile);
+	BufFile    *file = (BufFile *) palloc(sizeof(BufFile));
 
 	file->numFiles = nfiles;
 	file->isInterXact = false;
@@ -141,7 +140,7 @@ makeBufFile(File firstfile)
 {
 	BufFile    *file = makeBufFileCommon(1);
 
-	file->files = palloc_object(File);
+	file->files = (File *) palloc(sizeof(File));
 	file->files[0] = firstfile;
 	file->readOnly = false;
 	file->fileset = NULL;
@@ -272,7 +271,7 @@ BufFileCreateFileSet(FileSet *fileset, const char *name)
 	file = makeBufFileCommon(1);
 	file->fileset = fileset;
 	file->name = pstrdup(name);
-	file->files = palloc_object(File);
+	file->files = (File *) palloc(sizeof(File));
 	file->files[0] = MakeNewFileSetSegment(file, 0);
 	file->readOnly = false;
 
@@ -298,7 +297,7 @@ BufFileOpenFileSet(FileSet *fileset, const char *name, int mode,
 	File	   *files;
 	int			nfiles = 0;
 
-	files = palloc_array(File, capacity);
+	files = palloc(sizeof(File) * capacity);
 
 	/*
 	 * We don't know how many segments there are, so we'll probe the
@@ -310,7 +309,7 @@ BufFileOpenFileSet(FileSet *fileset, const char *name, int mode,
 		if (nfiles + 1 > capacity)
 		{
 			capacity *= 2;
-			files = repalloc_array(files, File, capacity);
+			files = repalloc(files, sizeof(File) * capacity);
 		}
 		/* Try to load a segment. */
 		FileSetSegmentName(segment_name, name, nfiles);
@@ -494,8 +493,8 @@ BufFileLoadBuffer(BufFile *file)
 static void
 BufFileDumpBuffer(BufFile *file)
 {
-	int64		wpos = 0;
-	int64		bytestowrite;
+	int			wpos = 0;
+	int			bytestowrite;
 	File		thisfile;
 
 	/*
@@ -504,7 +503,7 @@ BufFileDumpBuffer(BufFile *file)
 	 */
 	while (wpos < file->nbytes)
 	{
-		int64		availbytes;
+		off_t		availbytes;
 		instr_time	io_start;
 		instr_time	io_time;
 
@@ -525,8 +524,8 @@ BufFileDumpBuffer(BufFile *file)
 		bytestowrite = file->nbytes - wpos;
 		availbytes = MAX_PHYSICAL_FILESIZE - file->curOffset;
 
-		if (bytestowrite > availbytes)
-			bytestowrite = availbytes;
+		if ((off_t) bytestowrite > availbytes)
+			bytestowrite = (int) availbytes;
 
 		thisfile = file->files[file->curFile];
 
@@ -730,7 +729,7 @@ BufFileFlush(BufFile *file)
  * BufFileSeek
  *
  * Like fseek(), except that target position needs two values in order to
- * work when logical filesize exceeds maximum value representable by pgoff_t.
+ * work when logical filesize exceeds maximum value representable by off_t.
  * We do not support relative seeks across more than that, however.
  * I/O errors are reported by ereport().
  *
@@ -738,10 +737,10 @@ BufFileFlush(BufFile *file)
  * impossible seek is attempted.
  */
 int
-BufFileSeek(BufFile *file, int fileno, pgoff_t offset, int whence)
+BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 {
 	int			newFile;
-	pgoff_t		newOffset;
+	off_t		newOffset;
 
 	switch (whence)
 	{
@@ -755,7 +754,8 @@ BufFileSeek(BufFile *file, int fileno, pgoff_t offset, int whence)
 
 			/*
 			 * Relative seek considers only the signed offset, ignoring
-			 * fileno.
+			 * fileno. Note that large offsets (> 1 GB) risk overflow in this
+			 * add, unless we have 64-bit off_t.
 			 */
 			newFile = file->curFile;
 			newOffset = (file->curOffset + file->pos) + offset;
@@ -795,7 +795,7 @@ BufFileSeek(BufFile *file, int fileno, pgoff_t offset, int whence)
 		 * whether reading or writing, but buffer remains dirty if we were
 		 * writing.
 		 */
-		file->pos = (int64) (newOffset - file->curOffset);
+		file->pos = (int) (newOffset - file->curOffset);
 		return 0;
 	}
 	/* Otherwise, must reposition buffer, so flush any dirty data */
@@ -830,7 +830,7 @@ BufFileSeek(BufFile *file, int fileno, pgoff_t offset, int whence)
 }
 
 void
-BufFileTell(BufFile *file, int *fileno, pgoff_t *offset)
+BufFileTell(BufFile *file, int *fileno, off_t *offset)
 {
 	*fileno = file->curFile;
 	*offset = file->curOffset + file->pos;
@@ -841,31 +841,51 @@ BufFileTell(BufFile *file, int *fileno, pgoff_t *offset)
  *
  * Performs absolute seek to the start of the n'th BLCKSZ-sized block of
  * the file.  Note that users of this interface will fail if their files
- * exceed BLCKSZ * PG_INT64_MAX bytes, but that is quite a lot; we don't
- * work with tables bigger than that, either...
+ * exceed BLCKSZ * LONG_MAX bytes, but that is quite a lot; we don't work
+ * with tables bigger than that, either...
  *
  * Result is 0 if OK, EOF if not.  Logical position is not moved if an
  * impossible seek is attempted.
  */
 int
-BufFileSeekBlock(BufFile *file, int64 blknum)
+BufFileSeekBlock(BufFile *file, long blknum)
 {
 	return BufFileSeek(file,
 					   (int) (blknum / BUFFILE_SEG_SIZE),
-					   (pgoff_t) (blknum % BUFFILE_SEG_SIZE) * BLCKSZ,
+					   (off_t) (blknum % BUFFILE_SEG_SIZE) * BLCKSZ,
 					   SEEK_SET);
 }
 
+#ifdef NOT_USED
 /*
- * Returns the amount of data in the given BufFile, in bytes.
+ * BufFileTellBlock --- block-oriented tell
  *
- * Returned value includes the size of any holes left behind by BufFileAppend.
+ * Any fractional part of a block in the current seek position is ignored.
+ */
+long
+BufFileTellBlock(BufFile *file)
+{
+	long		blknum;
+
+	blknum = (file->curOffset + file->pos) / BLCKSZ;
+	blknum += file->curFile * BUFFILE_SEG_SIZE;
+	return blknum;
+}
+
+#endif
+
+/*
+ * Return the current fileset based BufFile size.
+ *
+ * Counts any holes left behind by BufFileAppend as part of the size.
  * ereport()s on failure.
  */
 int64
 BufFileSize(BufFile *file)
 {
 	int64		lastFileSize;
+
+	Assert(file->fileset != NULL);
 
 	/* Get the size of the last physical file. */
 	lastFileSize = FileSize(file->files[file->numFiles - 1]);
@@ -881,7 +901,8 @@ BufFileSize(BufFile *file)
 }
 
 /*
- * Append the contents of the source file to the end of the target file.
+ * Append the contents of source file (managed within fileset) to
+ * end of target file (managed within same fileset).
  *
  * Note that operation subsumes ownership of underlying resources from
  * "source".  Caller should never call BufFileClose against source having
@@ -898,15 +919,17 @@ BufFileSize(BufFile *file)
  * begins.  Caller should apply this as an offset when working off block
  * positions that are in terms of the original BufFile space.
  */
-int64
+long
 BufFileAppend(BufFile *target, BufFile *source)
 {
-	int64		startBlock = (int64) target->numFiles * BUFFILE_SEG_SIZE;
+	long		startBlock = target->numFiles * BUFFILE_SEG_SIZE;
 	int			newNumFiles = target->numFiles + source->numFiles;
 	int			i;
 
+	Assert(target->fileset != NULL);
 	Assert(source->readOnly);
 	Assert(!source->dirty);
+	Assert(source->fileset != NULL);
 
 	if (target->resowner != source->resowner)
 		elog(ERROR, "could not append BufFile with non-matching resource owner");
@@ -925,11 +948,11 @@ BufFileAppend(BufFile *target, BufFile *source)
  * and the offset.
  */
 void
-BufFileTruncateFileSet(BufFile *file, int fileno, pgoff_t offset)
+BufFileTruncateFileSet(BufFile *file, int fileno, off_t offset)
 {
 	int			numFiles = file->numFiles;
 	int			newFile = fileno;
-	pgoff_t		newOffset = file->curOffset;
+	off_t		newOffset = file->curOffset;
 	char		segment_name[MAXPGPATH];
 	int			i;
 
@@ -984,10 +1007,10 @@ BufFileTruncateFileSet(BufFile *file, int fileno, pgoff_t offset)
 	{
 		/* No need to reset the current pos if the new pos is greater. */
 		if (newOffset <= file->curOffset + file->pos)
-			file->pos = (int64) newOffset - file->curOffset;
+			file->pos = (int) (newOffset - file->curOffset);
 
 		/* Adjust the nbytes for the current buffer. */
-		file->nbytes = (int64) newOffset - file->curOffset;
+		file->nbytes = (int) (newOffset - file->curOffset);
 	}
 	else if (newFile == file->curFile &&
 			 newOffset < file->curOffset)

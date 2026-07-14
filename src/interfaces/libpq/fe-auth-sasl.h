@@ -8,7 +8,7 @@
  *
  * See src/include/libpq/sasl.h for the backend counterpart.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/fe-auth-sasl.h
@@ -22,21 +22,9 @@
 #include "libpq-fe.h"
 
 /*
- * Possible states for the SASL exchange, see the comment on exchange for an
- * explanation of these.
- */
-typedef enum
-{
-	SASL_COMPLETE = 0,
-	SASL_FAILED,
-	SASL_CONTINUE,
-	SASL_ASYNC,
-} SASLStatus;
-
-/*
  * Frontend SASL mechanism callbacks.
  *
- * To implement a frontend mechanism, declare a pg_fe_sasl_mech struct with
+ * To implement a frontend mechanism, declare a pg_be_sasl_mech struct with
  * appropriate callback implementations, then hook it into conn->sasl during
  * pg_SASL_init()'s mechanism negotiation.
  */
@@ -71,14 +59,11 @@ typedef struct pg_fe_sasl_mech
 	 * Produces a client response to a server challenge.  As a special case
 	 * for client-first SASL mechanisms, exchange() is called with a NULL
 	 * server response once at the start of the authentication exchange to
-	 * generate an initial response. Returns a SASLStatus indicating the
-	 * state and status of the exchange.
+	 * generate an initial response.
 	 *
 	 * Input parameters:
 	 *
 	 *	state:	   The opaque mechanism state returned by init()
-	 *
-	 *	final:	   true if the server has sent a final exchange outcome
 	 *
 	 *	input:	   The challenge data sent by the server, or NULL when
 	 *			   generating a client-first initial response (that is, when
@@ -94,29 +79,22 @@ typedef struct pg_fe_sasl_mech
 	 *
 	 *	output:	   A malloc'd buffer containing the client's response to
 	 *			   the server (can be empty), or NULL if the exchange should
-	 *			   be aborted.  (The callback should return SASL_FAILED in the
+	 *			   be aborted.  (*success should be set to false in the
 	 *			   latter case.)
 	 *
 	 *	outputlen: The length (0 or higher) of the client response buffer,
 	 *			   ignored if output is NULL.
 	 *
-	 * Return value:
+	 *	done:      Set to true if the SASL exchange should not continue,
+	 *			   because the exchange is either complete or failed
 	 *
-	 *	SASL_CONTINUE:	The output buffer is filled with a client response.
-	 *					Additional server challenge is expected
-	 *	SASL_ASYNC:		Some asynchronous processing external to the
-	 *					connection needs to be done before a response can be
-	 *					generated. The mechanism is responsible for setting up
-	 *					conn->async_auth/cleanup_async_auth appropriately
-	 *					before returning.
-	 *	SASL_COMPLETE:	The SASL exchange has completed successfully.
-	 *	SASL_FAILED:	The exchange has failed and the connection should be
-	 *					dropped.
+	 *	success:   Set to true if the SASL exchange completed successfully.
+	 *			   Ignored if *done is false.
 	 *--------
 	 */
-	SASLStatus	(*exchange) (void *state, bool final,
-							 char *input, int inputlen,
-							 char **output, int *outputlen);
+	void		(*exchange) (void *state, char *input, int inputlen,
+							 char **output, int *outputlen,
+							 bool *done, bool *success);
 
 	/*--------
 	 * channel_bound()

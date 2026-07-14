@@ -3,7 +3,7 @@
  * nodeWorktablescan.c
  *	  routines to handle WorkTableScan nodes.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,9 +15,8 @@
 
 #include "postgres.h"
 
-#include "executor/executor.h"
+#include "executor/execdebug.h"
 #include "executor/nodeWorktablescan.h"
-#include "utils/tuplestore.h"
 
 static TupleTableSlot *WorkTableScanNext(WorkTableScanState *node);
 
@@ -166,7 +165,7 @@ ExecInitWorkTableScan(WorkTableScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.resultopsset = true;
 	scanstate->ss.ps.resultopsfixed = false;
 
-	ExecInitScanTupleSlot(estate, &scanstate->ss, NULL, &TTSOpsMinimalTuple, 0);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, NULL, &TTSOpsMinimalTuple);
 
 	/*
 	 * initialize child expressions
@@ -180,6 +179,28 @@ ExecInitWorkTableScan(WorkTableScan *node, EState *estate, int eflags)
 	 */
 
 	return scanstate;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEndWorkTableScan
+ *
+ *		frees any storage allocated through C routines.
+ * ----------------------------------------------------------------
+ */
+void
+ExecEndWorkTableScan(WorkTableScanState *node)
+{
+	/*
+	 * Free exprcontext
+	 */
+	ExecFreeExprContext(&node->ss.ps);
+
+	/*
+	 * clean out the tuple table
+	 */
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

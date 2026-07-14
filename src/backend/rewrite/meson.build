@@ -1,8 +1,7 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 backend_sources += files(
   'rewriteDefine.c',
-  'rewriteGraphTable.c',
   'rewriteHandler.c',
   'rewriteManip.c',
   'rewriteRemove.c',

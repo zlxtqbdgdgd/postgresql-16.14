@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 if not llvm.found()
   subdir_done()
@@ -53,7 +53,7 @@ llvm_irgen_args = [
 
 if ccache.found()
   llvm_irgen_command = ccache
-  llvm_irgen_args = [clang.full_path()] + llvm_irgen_args
+  llvm_irgen_args = [clang.path()] + llvm_irgen_args
 else
   llvm_irgen_command = clang
 endif
@@ -61,7 +61,9 @@ endif
 
 # XXX: Need to determine proper version of the function cflags for clang
 bitcode_cflags = ['-fno-strict-aliasing', '-fwrapv']
-bitcode_cflags += get_option('c_args')
+if llvm.version().version_compare('=15.0')
+  bitcode_cflags += ['-Xclang', '-no-opaque-pointers']
+endif
 bitcode_cflags += cppflags
 
 # XXX: Worth improving on the logic to find directories here

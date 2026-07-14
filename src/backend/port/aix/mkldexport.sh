@@ -13,21 +13,14 @@
 #		object file (if different from the current
 #		working directory).
 #
-# On AIX, executables do not automatically expose their symbols to shared
-# modules. Extensions therefore cannot call functions in the main Postgres
-# binary unless those symbols are explicitly exported. Unlike other platforms,
-# AIX executables are not default symbol providers; each shared module must
-# link against an export list that defines which symbols it can use.
+# [This file comes from the Postgres 4.2 distribution. - ay 7/95]
 #
-# The mkldexport.sh script fixes AIX's symbol export issue by generating an
-# explicit export list. It uses nm to gather all symbols from the Postgres
-# object files, then writes them into the export file. When invoked with ".",
-# it outputs #! ., which tells AIX the list applies to the main executable.
-# This way, extension modules can link against that list and resolve their
-# undefined symbols directly from the Postgres binary.
+# Header: /usr/local/devel/postgres/src/tools/mkldexport/RCS/mkldexport.sh,v 1.2 1994/03/13 04:59:12 aoki Exp
 #
 
-# Search for the nm command binary.
+# setting this to nm -B might be better
+# ... due to changes in AIX 4.x ...
+# ... let us search in different directories - Gerhard Reithofer
 if [ -x /usr/ucb/nm ]
 then NM=/usr/ucb/nm
 elif [ -x /usr/bin/nm ]
@@ -39,9 +32,6 @@ then NM=/usr/usg/bin/nm
 else echo "Fatal error: cannot find `nm' ... please check your installation."
      exit 1
 fi
-
-# instruct nm to process 64-bit objects
-export OBJECT_MODE=64
 
 CMDNAME=`basename $0`
 if [ -z "$1" ]; then
@@ -63,9 +53,9 @@ else
 	fi
 fi
 $NM -BCg $1 | \
-	grep ' [TDB] ' | \
+	egrep ' [TDB] ' | \
 	sed -e 's/.* //' | \
-	grep -v '\$' | \
+	egrep -v '\$' | \
 	sed -e 's/^[.]//' | \
 	sort | \
 	uniq

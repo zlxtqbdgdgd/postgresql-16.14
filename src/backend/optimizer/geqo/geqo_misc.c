@@ -3,7 +3,7 @@
  * geqo_misc.c
  *	   misc. printout and debug stuff
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_misc.c
@@ -11,13 +11,12 @@
  *-------------------------------------------------------------------------
  */
 
-/*
- * contributed by:
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
- * *  Martin Utesch				 * Institute of Automatic Control	   *
- * =							 = University of Mining and Technology =
- * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/* contributed by:
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+   *  Martin Utesch				 * Institute of Automatic Control	   *
+   =							 = University of Mining and Technology =
+   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 #include "postgres.h"
@@ -52,8 +51,7 @@ avg_pool(Pool *pool)
 	return cumulative;
 }
 
-/*
- * print_pool
+/* print_pool
  */
 void
 print_pool(FILE *fp, Pool *pool, int start, int stop)
@@ -85,8 +83,7 @@ print_pool(FILE *fp, Pool *pool, int start, int stop)
 	fflush(fp);
 }
 
-/*
- * print_gen
+/* print_gen
  *
  *	 printout for chromosome: best, worst, mean, average
  */

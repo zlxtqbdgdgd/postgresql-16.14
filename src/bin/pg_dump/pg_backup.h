@@ -24,7 +24,6 @@
 #define PG_BACKUP_H
 
 #include "common/compression.h"
-#include "common/file_utils.h"
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
@@ -33,7 +32,7 @@ typedef enum trivalue
 {
 	TRI_DEFAULT,
 	TRI_NO,
-	TRI_YES,
+	TRI_YES
 } trivalue;
 
 typedef enum _archiveFormat
@@ -42,14 +41,14 @@ typedef enum _archiveFormat
 	archCustom = 1,
 	archTar = 3,
 	archNull = 4,
-	archDirectory = 5,
+	archDirectory = 5
 } ArchiveFormat;
 
 typedef enum _archiveMode
 {
 	archModeAppend,
 	archModeWrite,
-	archModeRead,
+	archModeRead
 } ArchiveMode;
 
 typedef enum _teSection
@@ -57,7 +56,7 @@ typedef enum _teSection
 	SECTION_NONE = 1,			/* comments, ACLs, etc; can be anywhere */
 	SECTION_PRE_DATA,			/* stuff to be processed before data */
 	SECTION_DATA,				/* table data, large objects, LO comments */
-	SECTION_POST_DATA,			/* stuff to be processed after data */
+	SECTION_POST_DATA			/* stuff to be processed after data */
 } teSection;
 
 /* We need one enum entry per prepared query in pg_dump */
@@ -68,17 +67,14 @@ enum _dumpPreparedQueries
 	PREPQUERY_DUMPCOMPOSITETYPE,
 	PREPQUERY_DUMPDOMAIN,
 	PREPQUERY_DUMPENUMTYPE,
-	PREPQUERY_DUMPEXTSTATSOBJSTATS,
 	PREPQUERY_DUMPFUNC,
 	PREPQUERY_DUMPOPR,
 	PREPQUERY_DUMPRANGETYPE,
 	PREPQUERY_DUMPTABLEATTACH,
-	PREPQUERY_GETATTRIBUTESTATS,
 	PREPQUERY_GETCOLUMNACLS,
 	PREPQUERY_GETDOMAINCONSTRAINTS,
+	NUM_PREP_QUERIES			/* must be last */
 };
-
-#define NUM_PREP_QUERIES (PREPQUERY_GETDOMAINCONSTRAINTS + 1)
 
 /* Parameters needed by ConnectDatabase; same for dump and restore */
 typedef struct _connParams
@@ -112,13 +108,14 @@ typedef struct _restoreOptions
 	int			column_inserts;
 	int			if_exists;
 	int			no_comments;	/* Skip comments */
-	int			no_policies;	/* Skip row security policies */
 	int			no_publications;	/* Skip publication entries */
 	int			no_security_labels; /* Skip security label entries */
 	int			no_subscriptions;	/* Skip subscription entries */
 	int			strict_names;
 
 	const char *filename;
+	int			dataOnly;
+	int			schemaOnly;
 	int			dumpSections;
 	int			verbose;
 	int			aclsSkip;
@@ -151,19 +148,12 @@ typedef struct _restoreOptions
 												 * compression */
 	int			suppressDumpWarnings;	/* Suppress output of WARNING entries
 										 * to stderr */
-
-	bool		single_txn;		/* restore all TOCs in one transaction */
-	int			txn_size;		/* restore this many TOCs per txn, if > 0 */
+	bool		single_txn;
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
 	int			enable_row_security;
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			binary_upgrade;
-
-	/* flags derived from the user-settable flags */
-	bool		dumpSchema;
-	bool		dumpData;
-	bool		dumpStatistics;
 
 	char	   *restrict_key;
 } RestoreOptions;
@@ -175,6 +165,8 @@ typedef struct _dumpOptions
 	int			binary_upgrade;
 
 	/* various user-settable parameters */
+	bool		schemaOnly;
+	bool		dataOnly;
 	int			dumpSections;	/* bitmask of chosen sections */
 	bool		aclsSkip;
 	const char *lockWaitTimeout;
@@ -185,9 +177,8 @@ typedef struct _dumpOptions
 	int			column_inserts;
 	int			if_exists;
 	int			no_comments;
-	int			no_policies;	/* Skip row security policies */
-	int			no_publications;
 	int			no_security_labels;
+	int			no_publications;
 	int			no_subscriptions;
 	int			no_toast_compression;
 	int			no_unlogged_table_data;
@@ -211,11 +202,6 @@ typedef struct _dumpOptions
 
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			do_nothing;
-
-	/* flags derived from the user-settable flags */
-	bool		dumpSchema;
-	bool		dumpData;
-	bool		dumpStatistics;
 
 	char	   *restrict_key;
 } DumpOptions;
@@ -289,15 +275,18 @@ typedef int DumpId;
 /*
  * Function pointer prototypes for assorted callback methods.
  */
+
+typedef int (*DataDumperPtr) (Archive *AH, const void *userArg);
+
 typedef void (*SetupWorkerPtrType) (Archive *AH);
 
 /*
  * Main archiver interface.
  */
 
-extern void ConnectDatabaseAhx(Archive *AHX,
-							   const ConnParams *cparams,
-							   bool isReconnect);
+extern void ConnectDatabase(Archive *AHX,
+							const ConnParams *cparams,
+							bool isReconnect);
 extern void DisconnectDatabase(Archive *AHX);
 extern PGconn *GetConnection(Archive *AHX);
 
@@ -322,8 +311,7 @@ extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
 extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
 							  const pg_compress_specification compression_spec,
 							  bool dosync, ArchiveMode mode,
-							  SetupWorkerPtrType setupDumpWorker,
-							  DataDirSyncMethod sync_method);
+							  SetupWorkerPtrType setupDumpWorker);
 
 /* The --list option */
 extern void PrintTOCSummary(Archive *AHX);
@@ -339,7 +327,7 @@ extern void SortTocFromFile(Archive *AHX);
 
 /* Convenience functions used only when writing DATA */
 extern void archputs(const char *s, Archive *AH);
-extern int	archprintf(Archive *AH, const char *fmt, ...) pg_attribute_printf(2, 3);
+extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3);
 
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)

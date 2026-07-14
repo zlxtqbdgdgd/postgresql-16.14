@@ -3,7 +3,7 @@
  * ts_utils.c
  *		various support functions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -16,10 +16,9 @@
 
 #include <ctype.h>
 
-#include "catalog/pg_collation_d.h"
 #include "miscadmin.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_public.h"
+#include "tsearch/ts_utils.h"
 
 
 /*
@@ -66,7 +65,7 @@ get_tsearch_config_filename(const char *basename,
  * or palloc a new version.
  */
 void
-readstoplist(const char *fname, StopList *s, char *(*wordop) (const char *, size_t, Oid))
+readstoplist(const char *fname, StopList *s, char *(*wordop) (const char *))
 {
 	char	  **stop = NULL;
 
@@ -89,7 +88,7 @@ readstoplist(const char *fname, StopList *s, char *(*wordop) (const char *, size
 			char	   *pbuf = line;
 
 			/* Trim trailing space */
-			while (*pbuf && !isspace((unsigned char) *pbuf))
+			while (*pbuf && !t_isspace_cstr(pbuf))
 				pbuf += pg_mblen_cstr(pbuf);
 			*pbuf = '\0';
 
@@ -105,18 +104,18 @@ readstoplist(const char *fname, StopList *s, char *(*wordop) (const char *, size
 				if (reallen == 0)
 				{
 					reallen = 64;
-					stop = palloc_array(char *, reallen);
+					stop = (char **) palloc(sizeof(char *) * reallen);
 				}
 				else
 				{
 					reallen *= 2;
-					stop = repalloc_array(stop, char *, reallen);
+					stop = (char **) repalloc(stop, sizeof(char *) * reallen);
 				}
 			}
 
 			if (wordop)
 			{
-				stop[s->len] = wordop(line, strlen(line), DEFAULT_COLLATION_OID);
+				stop[s->len] = wordop(line);
 				if (stop[s->len] != line)
 					pfree(line);
 			}

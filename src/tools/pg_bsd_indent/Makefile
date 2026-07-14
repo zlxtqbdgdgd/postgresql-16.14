@@ -2,7 +2,7 @@
 #
 # src/tools/pg_bsd_indent/Makefile
 #
-# Copyright (c) 2017-2026, PostgreSQL Global Development Group
+# Copyright (c) 2017-2023, PostgreSQL Global Development Group
 #
 #-------------------------------------------------------------------------
 
@@ -25,8 +25,6 @@ OBJS = \
 	parse.o \
 	pr_comment.o
 
-$(OBJS): CFLAGS += $(PERMIT_MISSING_VARIABLE_DECLARATIONS)
-
 all: pg_bsd_indent
 
 pg_bsd_indent: $(OBJS) | submake-libpgport
@@ -41,7 +39,7 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_bsd_indent$(X)'
 
-clean distclean:
+clean distclean maintainer-clean:
 	rm -f pg_bsd_indent$(X) $(OBJS)
 	rm -rf log/ tmp_check/
 

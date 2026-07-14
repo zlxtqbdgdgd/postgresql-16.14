@@ -513,7 +513,7 @@ SELECT jdoc->'guid', jdoc->'name' FROM api WHERE jdoc @@ '$.tags[*] == "qui"';
 </programlisting>
     For these operators, a GIN index extracts clauses of the form
     <literal><replaceable>accessors_chain</replaceable>
-    == <replaceable>constant</replaceable></literal> out of
+    = <replaceable>constant</replaceable></literal> out of
     the <type>jsonpath</type> pattern, and does the index search based on
     the keys and values mentioned in these clauses.  The accessors chain
     may include <literal>.<replaceable>key</replaceable></literal>,
@@ -882,10 +882,9 @@ UPDATE table_name SET jsonb_field[1]['a'] = '1';
       <entry><literal>$varname</literal></entry>
       <entry>
         A named variable. Its value can be set by the parameter
-        <parameter>vars</parameter> of several JSON processing functions
-        (see <xref linkend="functions-json-processing-table"/>), or by
-        using the SQL/JSON <literal>PASSING</literal> clause as described
-        in <xref linkend="sqljson-query-functions"/>.
+        <parameter>vars</parameter> of several JSON processing functions;
+        see <xref linkend="functions-json-processing-table"/> for details.
+        <!-- TODO: describe PASSING clause once implemented !-->
       </entry>
      </row>
      <row>

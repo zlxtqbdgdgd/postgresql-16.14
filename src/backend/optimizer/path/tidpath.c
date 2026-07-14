@@ -27,7 +27,7 @@
  * "CTID relop pseudoconstant", where relop is one of >,>=,<,<=, and
  * AND-clauses composed of such conditions.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,7 +42,7 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "nodes/nodeFuncs.h"
-#include "optimizer/cost.h"
+#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -226,37 +226,42 @@ IsCurrentOfClause(RestrictInfo *rinfo, RelOptInfo *rel)
 }
 
 /*
- * Is the RestrictInfo usable as a CTID qual for the specified rel?
+ * Extract a set of CTID conditions from the given RestrictInfo
+ *
+ * Returns a List of CTID qual RestrictInfos for the specified rel (with
+ * implicit OR semantics across the list), or NIL if there are no usable
+ * conditions.
  *
  * This function considers only base cases; AND/OR combination is handled
- * below.
+ * below.  Therefore the returned List never has more than one element.
+ * (Using a List may seem a bit weird, but it simplifies the caller.)
  */
-static bool
-RestrictInfoIsTidQual(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
+static List *
+TidQualFromRestrictInfo(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
 {
 	/*
 	 * We may ignore pseudoconstant clauses (they can't contain Vars, so could
 	 * not match anyway).
 	 */
 	if (rinfo->pseudoconstant)
-		return false;
+		return NIL;
 
 	/*
 	 * If clause must wait till after some lower-security-level restriction
 	 * clause, reject it.
 	 */
 	if (!restriction_is_securely_promotable(rinfo, rel))
-		return false;
+		return NIL;
 
 	/*
-	 * Check all base cases.
+	 * Check all base cases.  If we get a match, return the clause.
 	 */
 	if (IsTidEqualClause(rinfo, rel) ||
 		IsTidEqualAnyClause(root, rinfo, rel) ||
 		IsCurrentOfClause(rinfo, rel))
-		return true;
+		return list_make1(rinfo);
 
-	return false;
+	return NIL;
 }
 
 /*
@@ -266,26 +271,13 @@ RestrictInfoIsTidQual(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
  * implicit OR semantics across the list), or NIL if there are no usable
  * equality conditions.
  *
- * This function is mainly concerned with handling AND/OR recursion.
- * However, we do have a special rule to enforce: if there is a CurrentOfExpr
- * qual, we *must* return that and only that, else the executor may fail.
- * Ordinarily a CurrentOfExpr would be all alone anyway because of grammar
- * restrictions, but it is possible for RLS quals to appear AND'ed with it.
- * It's even possible (if fairly useless) for the RLS quals to be CTID quals.
- * So we must scan the whole rlist to see if there's a CurrentOfExpr.  Since
- * we have to do that, we also apply some very-trivial preference rules about
- * which of the other possibilities should be chosen, in the unlikely event
- * that there's more than one choice.
+ * This function is just concerned with handling AND/OR recursion.
  */
 static List *
-TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
-							bool *isCurrentOf)
+TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel)
 {
-	RestrictInfo *tidclause = NULL; /* best simple CTID qual so far */
-	List	   *orlist = NIL;	/* best OR'ed CTID qual so far */
+	List	   *rlst = NIL;
 	ListCell   *l;
-
-	*isCurrentOf = false;
 
 	foreach(l, rlist)
 	{
@@ -293,7 +285,6 @@ TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
 
 		if (restriction_is_or_clause(rinfo))
 		{
-			List	   *rlst = NIL;
 			ListCell   *j;
 
 			/*
@@ -309,23 +300,16 @@ TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
 				if (is_andclause(orarg))
 				{
 					List	   *andargs = ((BoolExpr *) orarg)->args;
-					bool		sublistIsCurrentOf;
 
 					/* Recurse in case there are sub-ORs */
-					sublist = TidQualFromRestrictInfoList(root, andargs, rel,
-														  &sublistIsCurrentOf);
-					if (sublistIsCurrentOf)
-						elog(ERROR, "IS CURRENT OF within OR clause");
+					sublist = TidQualFromRestrictInfoList(root, andargs, rel);
 				}
 				else
 				{
 					RestrictInfo *ri = castNode(RestrictInfo, orarg);
 
 					Assert(!restriction_is_or_clause(ri));
-					if (RestrictInfoIsTidQual(root, ri, rel))
-						sublist = list_make1(ri);
-					else
-						sublist = NIL;
+					sublist = TidQualFromRestrictInfo(root, ri, rel);
 				}
 
 				/*
@@ -343,47 +327,25 @@ TidQualFromRestrictInfoList(PlannerInfo *root, List *rlist, RelOptInfo *rel,
 				 */
 				rlst = list_concat(rlst, sublist);
 			}
-
-			if (rlst)
-			{
-				/*
-				 * Accept the OR'ed list if it's the first one, or if it's
-				 * shorter than the previous one.
-				 */
-				if (orlist == NIL || list_length(rlst) < list_length(orlist))
-					orlist = rlst;
-			}
 		}
 		else
 		{
 			/* Not an OR clause, so handle base cases */
-			if (RestrictInfoIsTidQual(root, rinfo, rel))
-			{
-				/* We can stop immediately if it's a CurrentOfExpr */
-				if (IsCurrentOfClause(rinfo, rel))
-				{
-					*isCurrentOf = true;
-					return list_make1(rinfo);
-				}
-
-				/*
-				 * Otherwise, remember the first non-OR CTID qual.  We could
-				 * try to apply some preference order if there's more than
-				 * one, but such usage seems very unlikely, so don't bother.
-				 */
-				if (tidclause == NULL)
-					tidclause = rinfo;
-			}
+			rlst = TidQualFromRestrictInfo(root, rinfo, rel);
 		}
+
+		/*
+		 * Stop as soon as we find any usable CTID condition.  In theory we
+		 * could get CTID equality conditions from different AND'ed clauses,
+		 * in which case we could try to pick the most efficient one.  In
+		 * practice, such usage seems very unlikely, so we don't bother; we
+		 * just exit as soon as we find the first candidate.
+		 */
+		if (rlst)
+			break;
 	}
 
-	/*
-	 * Prefer any singleton CTID qual to an OR'ed list.  Again, it seems
-	 * unlikely to be worth thinking harder than that.
-	 */
-	if (tidclause)
-		return list_make1(tidclause);
-	return orlist;
+	return rlst;
 }
 
 /*
@@ -444,7 +406,7 @@ BuildParameterizedTidPaths(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 		 * might find a suitable ScalarArrayOpExpr in the rel's joininfo list,
 		 * but it seems unlikely to be worth expending the cycles to check.
 		 * And we definitely won't find a CurrentOfExpr here.  Hence, we don't
-		 * use RestrictInfoIsTidQual; but this must match that function
+		 * use TidQualFromRestrictInfo; but this must match that function
 		 * otherwise.
 		 */
 		if (rinfo->pseudoconstant ||
@@ -490,28 +452,23 @@ ec_member_matches_ctid(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_tidscan_paths
- *	  Create paths corresponding to direct TID scans of the given rel and add
- *	  them to the corresponding path list via add_path or add_partial_path.
+ *	  Create paths corresponding to direct TID scans of the given rel.
+ *
+ *	  Candidate paths are added to the rel's pathlist (using add_path).
  */
-bool
+void
 create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 {
 	List	   *tidquals;
 	List	   *tidrangequals;
-	bool		isCurrentOf;
-	bool		enabled = (rel->pgs_mask & PGS_TIDSCAN) != 0;
 
 	/*
 	 * If any suitable quals exist in the rel's baserestrict list, generate a
 	 * plain (unparameterized) TidPath with them.
-	 *
-	 * We skip this when TID scans are disabled, except when the qual is
-	 * CurrentOfExpr. In that case, a TID scan is the only correct path.
 	 */
-	tidquals = TidQualFromRestrictInfoList(root, rel->baserestrictinfo, rel,
-										   &isCurrentOf);
+	tidquals = TidQualFromRestrictInfoList(root, rel->baserestrictinfo, rel);
 
-	if (tidquals != NIL && (enabled || isCurrentOf))
+	if (tidquals != NIL)
 	{
 		/*
 		 * This path uses no join clauses, but it could still have required
@@ -521,20 +478,7 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 
 		add_path(rel, (Path *) create_tidscan_path(root, rel, tidquals,
 												   required_outer));
-
-		/*
-		 * When the qual is CurrentOfExpr, the path that we just added is the
-		 * only one the executor can handle, so we should return before adding
-		 * any others. Returning true lets the caller know not to add any
-		 * others, either.
-		 */
-		if (isCurrentOf)
-			return true;
 	}
-
-	/* Skip the rest if TID scans are disabled. */
-	if (!enabled)
-		return false;
 
 	/*
 	 * If there are range quals in the baserestrict list, generate a
@@ -553,24 +497,7 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 
 		add_path(rel, (Path *) create_tidrangescan_path(root, rel,
 														tidrangequals,
-														required_outer,
-														0));
-
-		/* If appropriate, consider parallel tid range scan. */
-		if (rel->consider_parallel && required_outer == NULL)
-		{
-			int			parallel_workers;
-
-			parallel_workers = compute_parallel_worker(rel, rel->pages, -1,
-													   max_parallel_workers_per_gather);
-
-			if (parallel_workers > 0)
-				add_partial_path(rel, (Path *) create_tidrangescan_path(root,
-																		rel,
-																		tidrangequals,
-																		required_outer,
-																		parallel_workers));
-		}
+														required_outer));
 	}
 
 	/*
@@ -599,6 +526,4 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 	 * join quals, for example.
 	 */
 	BuildParameterizedTidPaths(root, rel, rel->joininfo);
-
-	return false;
 }

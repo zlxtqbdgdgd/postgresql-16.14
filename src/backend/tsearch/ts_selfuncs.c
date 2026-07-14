@@ -3,7 +3,7 @@
  * ts_selfuncs.c
  *	  Selectivity estimation functions for text search operators.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -19,9 +19,10 @@
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "tsearch/ts_type.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 
 /*
@@ -47,8 +48,8 @@ typedef struct
 
 static Selectivity tsquerysel(VariableStatData *vardata, Datum constval);
 static Selectivity mcelem_tsquery_selec(TSQuery query,
-										const Datum *mcelem, int nmcelem,
-										const float4 *numbers, int nnumbers);
+										Datum *mcelem, int nmcelem,
+										float4 *numbers, int nnumbers);
 static Selectivity tsquery_opr_selec(QueryItem *item, char *operand,
 									 TextFreq *lookup, int length, float4 minfreq);
 static int	compare_lexeme_textfreq(const void *e1, const void *e2);
@@ -206,8 +207,8 @@ tsquerysel(VariableStatData *vardata, Datum constval)
  * Extract data from the pg_statistic arrays into useful format.
  */
 static Selectivity
-mcelem_tsquery_selec(TSQuery query, const Datum *mcelem, int nmcelem,
-					 const float4 *numbers, int nnumbers)
+mcelem_tsquery_selec(TSQuery query, Datum *mcelem, int nmcelem,
+					 float4 *numbers, int nnumbers)
 {
 	float4		minfreq;
 	TextFreq   *lookup;
@@ -228,21 +229,21 @@ mcelem_tsquery_selec(TSQuery query, const Datum *mcelem, int nmcelem,
 	/*
 	 * Transpose the data into a single array so we can use bsearch().
 	 */
-	lookup = palloc_array(TextFreq, nmcelem);
+	lookup = (TextFreq *) palloc(sizeof(TextFreq) * nmcelem);
 	for (i = 0; i < nmcelem; i++)
 	{
 		/*
 		 * The text Datums came from an array, so it cannot be compressed or
 		 * stored out-of-line -- it's safe to use VARSIZE_ANY*.
 		 */
-		Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(mcelem[i])) && !VARATT_IS_EXTERNAL(DatumGetPointer(mcelem[i])));
+		Assert(!VARATT_IS_COMPRESSED(mcelem[i]) && !VARATT_IS_EXTERNAL(mcelem[i]));
 		lookup[i].element = (text *) DatumGetPointer(mcelem[i]);
 		lookup[i].frequency = numbers[i];
 	}
 
 	/*
-	 * Grab the lowest MCE frequency. compute_tsvector_stats() stored it for
-	 * us in the one before the last cell of the Numbers array.
+	 * Grab the lowest frequency. compute_tsvector_stats() stored it for us in
+	 * the one before the last cell of the Numbers array. See ts_typanalyze.c
 	 */
 	minfreq = numbers[nnumbers - 2];
 
@@ -376,11 +377,8 @@ tsquery_opr_selec(QueryItem *item, char *operand,
 			else
 			{
 				/*
-				 * The element is not in MCELEM.  Estimate its frequency as
-				 * half that of the least-frequent MCE.  (We know it cannot be
-				 * more than minfreq, and it could be a great deal less.  Half
-				 * seems like a good compromise.)  For probably-historical
-				 * reasons, clamp to not more than DEFAULT_TS_MATCH_SEL.
+				 * The element is not in MCELEM.  Punt, but assume that the
+				 * selectivity cannot be more than minfreq / 2.
 				 */
 				selec = Min(DEFAULT_TS_MATCH_SEL, minfreq / 2);
 			}

@@ -4,7 +4,7 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -33,13 +33,13 @@
 #include "access/xact.h"
 #include "commands/copy.h"
 #include "commands/createas.h"
-#include "commands/explain_dr.h"
 #include "commands/matview.h"
 #include "executor/functions.h"
 #include "executor/tqueue.h"
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
+#include "utils/portal.h"
 
 
 /* ----------------
@@ -152,9 +152,6 @@ CreateDestReceiver(CommandDest dest)
 
 		case DestTupleQueue:
 			return CreateTupleQueueDestReceiver(NULL);
-
-		case DestExplainSerialize:
-			return CreateExplainSerializeDestReceiver(NULL);
 	}
 
 	/* should never get here */
@@ -165,10 +162,8 @@ CreateDestReceiver(CommandDest dest)
  *		EndCommand - clean up the destination at end of command
  * ----------------
  */
-
 void
-EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
-				   bool force_undecorated_output, bool noblock)
+EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
 {
 	char		completionTag[COMPLETION_TAG_BUFSIZE];
 	Size		len;
@@ -181,11 +176,7 @@ EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
 
 			len = BuildQueryCompletionString(completionTag, qc,
 											 force_undecorated_output);
-			if (noblock)
-				pq_putmessage_noblock(PqMsg_CommandComplete, completionTag, len + 1);
-			else
-				pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
-			break;
+			pq_putmessage('C', completionTag, len + 1);
 
 		case DestNone:
 		case DestDebug:
@@ -196,15 +187,8 @@ EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
-		case DestExplainSerialize:
 			break;
 	}
-}
-
-void
-EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
-{
-	EndCommandExtended(qc, dest, force_undecorated_output, false);
 }
 
 /* ----------------
@@ -216,7 +200,7 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 void
 EndReplicationCommand(const char *commandTag)
 {
-	pq_putmessage(PqMsg_CommandComplete, commandTag, strlen(commandTag) + 1);
+	pq_putmessage('C', commandTag, strlen(commandTag) + 1);
 }
 
 /* ----------------
@@ -236,7 +220,7 @@ NullCommand(CommandDest dest)
 		case DestRemoteSimple:
 
 			/* Tell the FE that we saw an empty query string */
-			pq_putemptymessage(PqMsg_EmptyQueryResponse);
+			pq_putemptymessage('I');
 			break;
 
 		case DestNone:
@@ -248,7 +232,6 @@ NullCommand(CommandDest dest)
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
-		case DestExplainSerialize:
 			break;
 	}
 }
@@ -275,7 +258,7 @@ ReadyForQuery(CommandDest dest)
 			{
 				StringInfoData buf;
 
-				pq_beginmessage(&buf, PqMsg_ReadyForQuery);
+				pq_beginmessage(&buf, 'Z');
 				pq_sendbyte(&buf, TransactionBlockStatusCode());
 				pq_endmessage(&buf);
 			}
@@ -292,7 +275,6 @@ ReadyForQuery(CommandDest dest)
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
-		case DestExplainSerialize:
 			break;
 	}
 }

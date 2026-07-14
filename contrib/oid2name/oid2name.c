@@ -62,7 +62,7 @@ void		sql_exec_dumpalltbspc(PGconn *conn, struct options *opts);
 void
 get_opts(int argc, char **argv, struct options *my_opts)
 {
-	static const struct option long_options[] = {
+	static struct option long_options[] = {
 		{"dbname", required_argument, NULL, 'd'},
 		{"host", required_argument, NULL, 'h'},
 		{"host", required_argument, NULL, 'H'}, /* deprecated */
@@ -237,13 +237,13 @@ add_one_elt(char *eltname, eary *eary)
 	if (eary->alloc == 0)
 	{
 		eary	  ->alloc = 8;
-		eary	  ->array = pg_malloc_array(char *, 8);
+		eary	  ->array = (char **) pg_malloc(8 * sizeof(char *));
 	}
 	else if (eary->num >= eary->alloc)
 	{
 		eary	  ->alloc *= 2;
-		eary	  ->array = pg_realloc_array(eary->array, char *,
-											 eary->alloc);
+		eary	  ->array = (char **) pg_realloc(eary->array,
+												 eary->alloc * sizeof(char *));
 	}
 
 	eary	  ->array[eary->num] = pg_strdup(eltname);
@@ -353,7 +353,7 @@ sql_conn(struct options *my_opts)
 	res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		pg_log_error("could not clear \"search_path\": %s",
+		pg_log_error("could not clear search_path: %s",
 					 PQerrorMessage(conn));
 		PQclear(res);
 		PQfinish(conn);
@@ -400,7 +400,7 @@ sql_exec(PGconn *conn, const char *todo, bool quiet)
 	nfields = PQnfields(res);
 
 	/* for each field, get the needed width */
-	length = pg_malloc_array(int, nfields);
+	length = (int *) pg_malloc(sizeof(int) * nfields);
 	for (j = 0; j < nfields; j++)
 		length[j] = strlen(PQfname(res, j));
 
@@ -427,7 +427,7 @@ sql_exec(PGconn *conn, const char *todo, bool quiet)
 		memset(pad, '-', l);
 		pad[l] = '\0';
 		fprintf(stdout, "%s\n", pad);
-		pg_free(pad);
+		free(pad);
 	}
 
 	/* for each row, dump the information */
@@ -440,7 +440,7 @@ sql_exec(PGconn *conn, const char *todo, bool quiet)
 
 	/* cleanup */
 	PQclear(res);
-	pg_free(length);
+	free(length);
 
 	return 0;
 }
@@ -469,7 +469,7 @@ void
 sql_exec_dumpalltables(PGconn *conn, struct options *opts)
 {
 	char		todo[1024];
-	char	   *addfields = ",c.oid AS \"Oid\", nspname AS \"Schema\", spcname as \"Tablespace\", pg_relation_filepath(c.oid) as \"Path\" ";
+	char	   *addfields = ",c.oid AS \"Oid\", nspname AS \"Schema\", spcname as \"Tablespace\" ";
 
 	snprintf(todo, sizeof(todo),
 			 "SELECT pg_catalog.pg_relation_filenode(c.oid) as \"Filenode\", relname as \"Table Name\" %s "
@@ -507,7 +507,7 @@ sql_exec_searchtables(PGconn *conn, struct options *opts)
 			   *comma_filenumbers,
 			   *comma_tables;
 	bool		written = false;
-	char	   *addfields = ",c.oid AS \"Oid\", nspname AS \"Schema\", spcname as \"Tablespace\", pg_relation_filepath(c.oid) as \"Path\" ";
+	char	   *addfields = ",c.oid AS \"Oid\", nspname AS \"Schema\", spcname as \"Tablespace\" ";
 
 	/* get tables qualifiers, whether names, filenumbers, or OIDs */
 	comma_oids = get_comma_elts(opts->oids);
@@ -562,7 +562,7 @@ sql_exec_searchtables(PGconn *conn, struct options *opts)
 					opts->extended ? addfields : "",
 					qualifiers);
 
-	pg_free(qualifiers);
+	free(qualifiers);
 
 	sql_exec(conn, todo, opts->quiet);
 }
@@ -585,11 +585,11 @@ main(int argc, char **argv)
 	struct options *my_opts;
 	PGconn	   *pgconn;
 
-	my_opts = pg_malloc_object(struct options);
+	my_opts = (struct options *) pg_malloc(sizeof(struct options));
 
-	my_opts->oids = pg_malloc_object(eary);
-	my_opts->tables = pg_malloc_object(eary);
-	my_opts->filenumbers = pg_malloc_object(eary);
+	my_opts->oids = (eary *) pg_malloc(sizeof(eary));
+	my_opts->tables = (eary *) pg_malloc(sizeof(eary));
+	my_opts->filenumbers = (eary *) pg_malloc(sizeof(eary));
 
 	my_opts->oids->num = my_opts->oids->alloc = 0;
 	my_opts->tables->num = my_opts->tables->alloc = 0;

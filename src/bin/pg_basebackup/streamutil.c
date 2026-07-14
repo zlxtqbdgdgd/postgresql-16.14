@@ -5,7 +5,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/streamutil.c
@@ -19,12 +19,14 @@
 
 #include "access/xlog_internal.h"
 #include "common/connect.h"
+#include "common/fe_memutils.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/string.h"
 #include "datatype/timestamp.h"
 #include "port/pg_bswap.h"
 #include "pqexpbuffer.h"
+#include "receivelog.h"
 #include "streamutil.h"
 
 #define ERRCODE_DUPLICATE_OBJECT  "42710"
@@ -71,15 +73,15 @@ GetConnection(void)
 	PQconninfoOption *conn_opt;
 	char	   *err_msg = NULL;
 
-	/*
-	 * pg_recvlogical uses dbname only; others use connection_string only.
-	 * (Note: both variables will be NULL if there's no command line options.)
-	 */
+	/* pg_recvlogical uses dbname only; others use connection_string only. */
 	Assert(dbname == NULL || connection_string == NULL);
 
 	/*
 	 * Merge the connection info inputs given in form of connection string,
 	 * options and default values (dbname=replication, replication=true, etc.)
+	 * Explicitly discard any dbname value in the connection string;
+	 * otherwise, PQconnectdbParams() would interpret that value as being
+	 * itself a connection string.
 	 */
 	i = 0;
 	if (connection_string)
@@ -90,24 +92,18 @@ GetConnection(void)
 
 		for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
 		{
-			if (conn_opt->val != NULL && conn_opt->val[0] != '\0')
+			if (conn_opt->val != NULL && conn_opt->val[0] != '\0' &&
+				strcmp(conn_opt->keyword, "dbname") != 0)
 				argcount++;
 		}
 
-		keywords = pg_malloc0_array(const char *, argcount + 1);
-		values = pg_malloc0_array(const char *, argcount + 1);
-
-		/*
-		 * Set dbname here already, so it can be overridden by a dbname in the
-		 * connection string.
-		 */
-		keywords[i] = "dbname";
-		values[i] = "replication";
-		i++;
+		keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
+		values = pg_malloc0((argcount + 1) * sizeof(*values));
 
 		for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
 		{
-			if (conn_opt->val != NULL && conn_opt->val[0] != '\0')
+			if (conn_opt->val != NULL && conn_opt->val[0] != '\0' &&
+				strcmp(conn_opt->keyword, "dbname") != 0)
 			{
 				keywords[i] = conn_opt->keyword;
 				values[i] = conn_opt->val;
@@ -117,15 +113,15 @@ GetConnection(void)
 	}
 	else
 	{
-		keywords = pg_malloc0_array(const char *, argcount + 1);
-		values = pg_malloc0_array(const char *, argcount + 1);
-		keywords[i] = "dbname";
-		values[i] = (dbname == NULL) ? "replication" : dbname;
-		i++;
+		keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
+		values = pg_malloc0((argcount + 1) * sizeof(*values));
 	}
 
+	keywords[i] = "dbname";
+	values[i] = dbname == NULL ? "replication" : dbname;
+	i++;
 	keywords[i] = "replication";
-	values[i] = (dbname == NULL) ? "true" : "database";
+	values[i] = dbname == NULL ? "true" : "database";
 	i++;
 	keywords[i] = "fallback_application_name";
 	values[i] = progname;
@@ -175,11 +171,7 @@ GetConnection(void)
 			values[i] = NULL;
 		}
 
-		/*
-		 * Only expand dbname when we did not already parse the argument as a
-		 * connection string ourselves.
-		 */
-		tmpconn = PQconnectdbParams(keywords, values, !connection_string);
+		tmpconn = PQconnectdbParams(keywords, values, true);
 
 		/*
 		 * If there is too little memory even to allocate the PGconn object
@@ -203,15 +195,15 @@ GetConnection(void)
 	{
 		pg_log_error("%s", PQerrorMessage(tmpconn));
 		PQfinish(tmpconn);
-		pg_free(values);
-		pg_free(keywords);
+		free(values);
+		free(keywords);
 		PQconninfoFree(conn_opts);
 		return NULL;
 	}
 
 	/* Connection ok! */
-	pg_free(values);
-	pg_free(keywords);
+	free(values);
+	free(keywords);
 	PQconninfoFree(conn_opts);
 
 	/*
@@ -227,7 +219,7 @@ GetConnection(void)
 		res = PQexec(tmpconn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			pg_log_error("could not clear \"search_path\": %s",
+			pg_log_error("could not clear search_path: %s",
 						 PQerrorMessage(tmpconn));
 			PQclear(res);
 			PQfinish(tmpconn);
@@ -243,14 +235,14 @@ GetConnection(void)
 	tmpparam = PQparameterStatus(tmpconn, "integer_datetimes");
 	if (!tmpparam)
 	{
-		pg_log_error("could not determine server setting for \"integer_datetimes\"");
+		pg_log_error("could not determine server setting for integer_datetimes");
 		PQfinish(tmpconn);
 		exit(1);
 	}
 
 	if (strcmp(tmpparam, "on") != 0)
 	{
-		pg_log_error("\"integer_datetimes\" compile flag does not match server");
+		pg_log_error("integer_datetimes compile flag does not match server");
 		PQfinish(tmpconn);
 		exit(1);
 	}
@@ -329,11 +321,10 @@ RetrieveWalSegSize(PGconn *conn)
 
 	if (!IsValidWalSegSize(WalSegSz))
 	{
-		pg_log_error(ngettext("remote server reported invalid WAL segment size (%d byte)",
-							  "remote server reported invalid WAL segment size (%d bytes)",
+		pg_log_error(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the remote server reported a value of %d byte",
+							  "WAL segment size must be a power of two between 1 MB and 1 GB, but the remote server reported a value of %d bytes",
 							  WalSegSz),
 					 WalSegSz);
-		pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
 		return false;
 	}
 
@@ -445,7 +436,7 @@ RunIdentifySystem(PGconn *conn, char **sysid, TimeLineID *starttli,
 	/* Get LSN start position if necessary */
 	if (startpos != NULL)
 	{
-		if (sscanf(PQgetvalue(res, 0, 2), "%X/%08X", &hi, &lo) != 2)
+		if (sscanf(PQgetvalue(res, 0, 2), "%X/%X", &hi, &lo) != 2)
 		{
 			pg_log_error("could not parse write-ahead log location \"%s\"",
 						 PQgetvalue(res, 0, 2));
@@ -501,8 +492,7 @@ GetSlotInformation(PGconn *conn, const char *slot_name,
 		*restart_tli = tli_loc;
 
 	query = createPQExpBuffer();
-	appendPQExpBufferStr(query, "READ_REPLICATION_SLOT ");
-	AppendQuotedIdentifier(query, slot_name);
+	appendPQExpBuffer(query, "READ_REPLICATION_SLOT %s", slot_name);
 	res = PQexec(conn, query->data);
 	destroyPQExpBuffer(query);
 
@@ -552,7 +542,7 @@ GetSlotInformation(PGconn *conn, const char *slot_name,
 		uint32		hi,
 					lo;
 
-		if (sscanf(PQgetvalue(res, 0, 1), "%X/%08X", &hi, &lo) != 2)
+		if (sscanf(PQgetvalue(res, 0, 1), "%X/%X", &hi, &lo) != 2)
 		{
 			pg_log_error("could not parse restart_lsn \"%s\" for replication slot \"%s\"",
 						 PQgetvalue(res, 0, 1), slot_name);
@@ -564,7 +554,7 @@ GetSlotInformation(PGconn *conn, const char *slot_name,
 
 	/* current TLI */
 	if (!PQgetisnull(res, 0, 2))
-		tli_loc = (TimeLineID) atoll(PQgetvalue(res, 0, 2));
+		tli_loc = (TimeLineID) atol(PQgetvalue(res, 0, 2));
 
 	PQclear(res);
 
@@ -584,7 +574,7 @@ GetSlotInformation(PGconn *conn, const char *slot_name,
 bool
 CreateReplicationSlot(PGconn *conn, const char *slot_name, const char *plugin,
 					  bool is_temporary, bool is_physical, bool reserve_wal,
-					  bool slot_exists_ok, bool two_phase, bool failover)
+					  bool slot_exists_ok, bool two_phase)
 {
 	PQExpBuffer query;
 	PGresult   *res;
@@ -595,21 +585,16 @@ CreateReplicationSlot(PGconn *conn, const char *slot_name, const char *plugin,
 	Assert((is_physical && plugin == NULL) ||
 		   (!is_physical && plugin != NULL));
 	Assert(!(two_phase && is_physical));
-	Assert(!(failover && is_physical));
 	Assert(slot_name != NULL);
 
 	/* Build base portion of query */
-	appendPQExpBufferStr(query, "CREATE_REPLICATION_SLOT ");
-	AppendQuotedIdentifier(query, slot_name);
+	appendPQExpBuffer(query, "CREATE_REPLICATION_SLOT \"%s\"", slot_name);
 	if (is_temporary)
 		appendPQExpBufferStr(query, " TEMPORARY");
 	if (is_physical)
 		appendPQExpBufferStr(query, " PHYSICAL");
 	else
-	{
-		appendPQExpBufferStr(query, " LOGICAL ");
-		AppendQuotedIdentifier(query, plugin);
-	}
+		appendPQExpBuffer(query, " LOGICAL \"%s\"", plugin);
 
 	/* Add any requested options */
 	if (use_new_option_syntax)
@@ -622,10 +607,6 @@ CreateReplicationSlot(PGconn *conn, const char *slot_name, const char *plugin,
 	}
 	else
 	{
-		if (failover && PQserverVersion(conn) >= 170000)
-			AppendPlainCommandOption(query, use_new_option_syntax,
-									 "FAILOVER");
-
 		if (two_phase && PQserverVersion(conn) >= 150000)
 			AppendPlainCommandOption(query, use_new_option_syntax,
 									 "TWO_PHASE");
@@ -709,8 +690,8 @@ DropReplicationSlot(PGconn *conn, const char *slot_name)
 	query = createPQExpBuffer();
 
 	/* Build query */
-	appendPQExpBufferStr(query, "DROP_REPLICATION_SLOT ");
-	AppendQuotedIdentifier(query, slot_name);
+	appendPQExpBuffer(query, "DROP_REPLICATION_SLOT \"%s\"",
+					  slot_name);
 	res = PQexec(conn, query->data);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
@@ -739,29 +720,6 @@ DropReplicationSlot(PGconn *conn, const char *slot_name)
 }
 
 /*
- * Append a suitably-quoted identifier or string literal to buf.
- * "quote" should be either a double-quote or single-quote character.
- *
- * Caution: this quoting logic is sufficient for identifiers and literals
- * in the replication grammar, but not always in regular SQL.  Specifically,
- * it'd fail for a string literal if standard_conforming_strings is off.
- */
-void
-AppendQuotedString(PQExpBuffer buf, const char *str, char quote)
-{
-	appendPQExpBufferChar(buf, quote);
-	while (*str)
-	{
-		char		c = *str++;
-
-		if (c == quote)
-			appendPQExpBufferChar(buf, c);
-		appendPQExpBufferChar(buf, c);
-	}
-	appendPQExpBufferChar(buf, quote);
-}
-
-/*
  * Append a "plain" option - one with no value - to a server command that
  * is being constructed.
  *
@@ -769,13 +727,10 @@ AppendQuotedString(PQExpBuffer buf, const char *str, char quote)
  * write things like SOME_COMMAND OPTION1 OPTION2 'opt2value' OPTION3 42. The
  * new syntax uses a comma-separated list surrounded by parentheses, so the
  * equivalent is SOME_COMMAND (OPTION1, OPTION2 'optvalue', OPTION3 42).
- *
- * Note: we assume option names do not require quotes.  Do not use this
- * with option names coming from outside sources.
  */
 void
 AppendPlainCommandOption(PQExpBuffer buf, bool use_new_option_syntax,
-						 const char *option_name)
+						 char *option_name)
 {
 	if (buf->len > 0 && buf->data[buf->len - 1] != '(')
 	{
@@ -796,26 +751,30 @@ AppendPlainCommandOption(PQExpBuffer buf, bool use_new_option_syntax,
  */
 void
 AppendStringCommandOption(PQExpBuffer buf, bool use_new_option_syntax,
-						  const char *option_name, const char *option_value)
+						  char *option_name, char *option_value)
 {
 	AppendPlainCommandOption(buf, use_new_option_syntax, option_name);
 
 	if (option_value != NULL)
 	{
-		appendPQExpBufferChar(buf, ' ');
-		AppendQuotedLiteral(buf, option_value);
+		size_t		length = strlen(option_value);
+		char	   *escaped_value = palloc(1 + 2 * length);
+
+		PQescapeStringConn(conn, escaped_value, option_value, length, NULL);
+		appendPQExpBuffer(buf, " '%s'", escaped_value);
+		pfree(escaped_value);
 	}
 }
 
 /*
- * Append an option with an associated integer value to a server command that
+ * Append an option with an associated integer value to a server command
  * is being constructed.
  *
  * See comments for AppendPlainCommandOption, above.
  */
 void
 AppendIntegerCommandOption(PQExpBuffer buf, bool use_new_option_syntax,
-						   const char *option_name, int32 option_value)
+						   char *option_name, int32 option_value)
 {
 	AppendPlainCommandOption(buf, use_new_option_syntax, option_name);
 

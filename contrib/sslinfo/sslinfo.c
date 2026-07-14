@@ -19,13 +19,21 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "sslinfo",
-					.version = PG_VERSION
-);
+/*
+ * On Windows, <wincrypt.h> includes a #define for X509_NAME, which breaks our
+ * ability to use OpenSSL's version of that symbol if <wincrypt.h> is pulled
+ * in after <openssl/ssl.h> ... and, at least on some builds, it is.  We
+ * can't reliably fix that by re-ordering #includes, because libpq/libpq-be.h
+ * #includes <openssl/ssl.h>.  Instead, just zap the #define again here.
+ */
+#ifdef X509_NAME
+#undef X509_NAME
+#endif
 
-static Datum X509_NAME_field_to_text(const X509_NAME *name, text *fieldName);
-static Datum ASN1_STRING_to_text(const ASN1_STRING *str);
+PG_MODULE_MAGIC;
+
+static Datum X509_NAME_field_to_text(X509_NAME *name, text *fieldName);
+static Datum ASN1_STRING_to_text(ASN1_STRING *str);
 
 /*
  * Function context for data persisting over repeated calls.
@@ -148,7 +156,7 @@ ssl_client_serial(PG_FUNCTION_ARGS)
  * function.
  */
 static Datum
-ASN1_STRING_to_text(const ASN1_STRING *str)
+ASN1_STRING_to_text(ASN1_STRING *str)
 {
 	BIO		   *membuf;
 	size_t		size;
@@ -194,12 +202,12 @@ ASN1_STRING_to_text(const ASN1_STRING *str)
  * part of name
  */
 static Datum
-X509_NAME_field_to_text(const X509_NAME *name, text *fieldName)
+X509_NAME_field_to_text(X509_NAME *name, text *fieldName)
 {
 	char	   *string_fieldname;
 	int			nid,
 				index;
-	const ASN1_STRING *data;
+	ASN1_STRING *data;
 
 	string_fieldname = text_to_cstring(fieldName);
 	nid = OBJ_txt2nid(string_fieldname);
@@ -209,7 +217,7 @@ X509_NAME_field_to_text(const X509_NAME *name, text *fieldName)
 				 errmsg("invalid X.509 field name: \"%s\"",
 						string_fieldname)));
 	pfree(string_fieldname);
-	index = X509_NAME_get_index_by_NID(unconstify(X509_NAME *, name), nid, -1);
+	index = X509_NAME_get_index_by_NID(name, nid, -1);
 	if (index < 0)
 		return (Datum) 0;
 	data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, index));
@@ -374,7 +382,7 @@ ssl_extension_info(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* Create a user function context for cross-call persistence */
-		fctx = palloc_object(SSLExtensionInfoContext);
+		fctx = (SSLExtensionInfoContext *) palloc(sizeof(SSLExtensionInfoContext));
 
 		/* Construct tuple descriptor */
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -421,8 +429,8 @@ ssl_extension_info(PG_FUNCTION_ARGS)
 		HeapTuple	tuple;
 		Datum		result;
 		BIO		   *membuf;
-		const X509_EXTENSION *ext;
-		const ASN1_OBJECT *obj;
+		X509_EXTENSION *ext;
+		ASN1_OBJECT *obj;
 		int			nid;
 		int			len;
 
@@ -435,7 +443,7 @@ ssl_extension_info(PG_FUNCTION_ARGS)
 
 		/* Get the extension from the certificate */
 		ext = X509_get_ext(cert, call_cntr);
-		obj = X509_EXTENSION_get_object(unconstify(X509_EXTENSION *, ext));
+		obj = X509_EXTENSION_get_object(ext);
 
 		/* Get the extension name */
 		nid = OBJ_obj2nid(obj);
@@ -448,7 +456,7 @@ ssl_extension_info(PG_FUNCTION_ARGS)
 		nulls[0] = false;
 
 		/* Get the extension value */
-		if (X509V3_EXT_print(membuf, unconstify(X509_EXTENSION *, ext), 0, 0) <= 0)
+		if (X509V3_EXT_print(membuf, ext, 0, 0) <= 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("could not print extension value in certificate at position %d",

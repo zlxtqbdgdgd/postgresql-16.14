@@ -3,7 +3,7 @@
  * signal.c
  *	  Microsoft Windows Win32 Signal Emulation Functions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32/signal.c
@@ -88,7 +88,7 @@ pgwin32_signal_initialize(void)
 		pg_signal_array[i].sa_handler = SIG_DFL;
 		pg_signal_array[i].sa_mask = 0;
 		pg_signal_array[i].sa_flags = 0;
-		pg_signal_defaults[i] = PG_SIG_IGN;
+		pg_signal_defaults[i] = SIG_IGN;
 	}
 	pg_signal_mask = 0;
 	pg_signal_queue = 0;
@@ -134,19 +134,15 @@ pgwin32_dispatch_queued_signals(void)
 			{
 				/* Execute this signal */
 				struct sigaction *act = &pg_signal_array[i];
-				pqsigfunc	sig = (pqsigfunc) (pg_funcptr_t) act->sa_handler;
+				pqsigfunc	sig = act->sa_handler;
 
-				if (sig == PG_SIG_DFL)
+				if (sig == SIG_DFL)
 					sig = pg_signal_defaults[i];
 				pg_signal_queue &= ~sigmask(i);
-				if (sig != (pqsigfunc) (pg_funcptr_t) SIG_ERR && sig != PG_SIG_IGN && sig != PG_SIG_DFL)
+				if (sig != SIG_ERR && sig != SIG_IGN && sig != SIG_DFL)
 				{
 					sigset_t	block_mask;
 					sigset_t	save_mask;
-					struct pg_signal_info nodata;
-
-					nodata.pid = 0;
-					nodata.uid = 0;
 
 					LeaveCriticalSection(&pg_signal_crit_sec);
 
@@ -155,7 +151,7 @@ pgwin32_dispatch_queued_signals(void)
 						block_mask |= sigmask(i);
 
 					sigprocmask(SIG_BLOCK, &block_mask, &save_mask);
-					sig(i, &nodata);
+					sig(i);
 					sigprocmask(SIG_SETMASK, &save_mask, NULL);
 
 					EnterCriticalSection(&pg_signal_crit_sec);
@@ -375,10 +371,8 @@ pg_signal_thread(LPVOID param)
 }
 
 
-/*
- * Console control handler will execute on a thread created
- * by the OS at the time of invocation
- */
+/* Console control handler will execute on a thread created
+   by the OS at the time of invocation */
 static BOOL WINAPI
 pg_console_handler(DWORD dwCtrlType)
 {

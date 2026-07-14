@@ -3,7 +3,7 @@
  *
  *	execution functions
  *
- *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/exec.c
  */
 
@@ -12,7 +12,6 @@
 #include <fcntl.h>
 
 #include "common/string.h"
-#include "fe_utils/version.h"
 #include "pg_upgrade.h"
 
 static void check_data_dir(ClusterInfo *cluster);
@@ -45,7 +44,8 @@ get_bin_version(ClusterInfo *cluster)
 
 	if ((output = popen(cmd, "r")) == NULL ||
 		fgets(cmd_output, sizeof(cmd_output), output) == NULL)
-		pg_fatal("could not get pg_ctl version data using %s: %m", cmd);
+		pg_fatal("could not get pg_ctl version data using %s: %s",
+				 cmd, strerror(errno));
 
 	rc = pclose(output);
 	if (rc != 0)
@@ -55,7 +55,16 @@ get_bin_version(ClusterInfo *cluster)
 	if (sscanf(cmd_output, "%*s %*s %d.%d", &v1, &v2) < 1)
 		pg_fatal("could not get pg_ctl version output from %s", cmd);
 
-	cluster->bin_version = v1 * 10000;
+	if (v1 < 10)
+	{
+		/* old style, e.g. 9.6.1 */
+		cluster->bin_version = v1 * 10000 + v2 * 100;
+	}
+	else
+	{
+		/* new style, e.g. 10.1 */
+		cluster->bin_version = v1 * 10000;
+	}
 }
 
 
@@ -75,7 +84,7 @@ get_bin_version(ClusterInfo *cluster)
  */
 bool
 exec_prog(const char *log_filename, const char *opt_log_file,
-		  bool report_error, bool exit_on_error, const char *fmt, ...)
+		  bool report_error, bool exit_on_error, const char *fmt,...)
 {
 	int			result = 0;
 	int			written;
@@ -233,7 +242,8 @@ pid_lock_file_exists(const char *datadir)
 	{
 		/* ENOTDIR means we will throw a more useful error later */
 		if (errno != ENOENT && errno != ENOTDIR)
-			pg_fatal("could not open file \"%s\" for reading: %m", path);
+			pg_fatal("could not open file \"%s\" for reading: %s",
+					 path, strerror(errno));
 
 		return false;
 	}
@@ -312,8 +322,8 @@ check_single_dir(const char *pg_data, const char *subdir)
 			 subdir);
 
 	if (stat(subDirName, &statBuf) != 0)
-		report_status(PG_FATAL, "check for \"%s\" failed: %m",
-					  subDirName);
+		report_status(PG_FATAL, "check for \"%s\" failed: %s",
+					  subDirName, strerror(errno));
 	else if (!S_ISDIR(statBuf.st_mode))
 		report_status(PG_FATAL, "\"%s\" is not a directory",
 					  subDirName);
@@ -335,17 +345,27 @@ check_data_dir(ClusterInfo *cluster)
 	const char *pg_data = cluster->pgdata;
 
 	/* get the cluster version */
-	cluster->major_version = get_pg_version(cluster->pgdata,
-											&cluster->major_version_str);
+	cluster->major_version = get_major_server_version(cluster);
+
 	check_single_dir(pg_data, "");
 	check_single_dir(pg_data, "base");
 	check_single_dir(pg_data, "global");
 	check_single_dir(pg_data, "pg_multixact");
 	check_single_dir(pg_data, "pg_subtrans");
-	check_single_dir(pg_data, PG_TBLSPC_DIR);
+	check_single_dir(pg_data, "pg_tblspc");
 	check_single_dir(pg_data, "pg_twophase");
-	check_single_dir(pg_data, "pg_wal");
-	check_single_dir(pg_data, "pg_xact");
+
+	/* pg_xlog has been renamed to pg_wal in v10 */
+	if (GET_MAJOR_VERSION(cluster->major_version) <= 906)
+		check_single_dir(pg_data, "pg_xlog");
+	else
+		check_single_dir(pg_data, "pg_wal");
+
+	/* pg_clog has been renamed to pg_xact in v10 */
+	if (GET_MAJOR_VERSION(cluster->major_version) <= 906)
+		check_single_dir(pg_data, "pg_clog");
+	else
+		check_single_dir(pg_data, "pg_xact");
 }
 
 
@@ -368,8 +388,8 @@ check_bin_dir(ClusterInfo *cluster, bool check_versions)
 
 	/* check bindir */
 	if (stat(cluster->bindir, &statBuf) != 0)
-		report_status(PG_FATAL, "check for \"%s\" failed: %m",
-					  cluster->bindir);
+		report_status(PG_FATAL, "check for \"%s\" failed: %s",
+					  cluster->bindir, strerror(errno));
 	else if (!S_ISDIR(statBuf.st_mode))
 		report_status(PG_FATAL, "\"%s\" is not a directory",
 					  cluster->bindir);
@@ -385,7 +405,11 @@ check_bin_dir(ClusterInfo *cluster, bool check_versions)
 	 */
 	get_bin_version(cluster);
 
-	check_exec(cluster->bindir, "pg_resetwal", check_versions);
+	/* pg_resetxlog has been renamed to pg_resetwal in version 10 */
+	if (GET_MAJOR_VERSION(cluster->bin_version) <= 906)
+		check_exec(cluster->bindir, "pg_resetxlog", check_versions);
+	else
+		check_exec(cluster->bindir, "pg_resetwal", check_versions);
 
 	if (cluster == &new_cluster)
 	{
@@ -407,7 +431,7 @@ static void
 check_exec(const char *dir, const char *program, bool check_version)
 {
 	char		path[MAXPGPATH];
-	char	   *line;
+	char		line[MAXPGPATH];
 	char		cmd[MAXPGPATH];
 	char		versionstr[128];
 
@@ -418,7 +442,7 @@ check_exec(const char *dir, const char *program, bool check_version)
 
 	snprintf(cmd, sizeof(cmd), "\"%s\" -V", path);
 
-	if ((line = pipe_read_line(cmd)) == NULL)
+	if (!pipe_read_line(cmd, line, sizeof(line)))
 		pg_fatal("check for \"%s\" failed: cannot execute",
 				 path);
 
@@ -432,6 +456,4 @@ check_exec(const char *dir, const char *program, bool check_version)
 			pg_fatal("check for \"%s\" failed: incorrect version: found \"%s\", expected \"%s\"",
 					 path, line, versionstr);
 	}
-
-	pg_free(line);
 }

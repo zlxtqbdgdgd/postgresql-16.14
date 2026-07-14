@@ -55,7 +55,6 @@
    &alterOperatorFamily;
    &alterPolicy;
    &alterProcedure;
-   &alterPropertyGraph;
    &alterPublication;
    &alterRole;
    &alterRoutine;
@@ -108,7 +107,6 @@
    &createOperatorFamily;
    &createPolicy;
    &createProcedure;
-   &createPropertyGraph;
    &createPublication;
    &createRole;
    &createRule;
@@ -157,7 +155,6 @@
    &dropOwned;
    &dropPolicy;
    &dropProcedure;
-   &dropPropertyGraph;
    &dropPublication;
    &dropRole;
    &dropRoutine;
@@ -198,7 +195,6 @@
    &refreshMaterializedView;
    &reindex;
    &releaseSavepoint;
-   &repack;
    &reset;
    &revoke;
    &rollback;
@@ -220,7 +216,6 @@
    &update;
    &vacuum;
    &values;
-   &waitFor;
 
  </reference>
 
@@ -255,7 +250,6 @@
    &pgamcheck;
    &pgBasebackup;
    &pgbench;
-   &pgCombinebackup;
    &pgConfig;
    &pgDump;
    &pgDumpall;
@@ -287,7 +281,6 @@
    &pgarchivecleanup;
    &pgChecksums;
    &pgControldata;
-   &pgCreateSubscriber;
    &pgCtl;
    &pgResetwal;
    &pgRewind;
@@ -295,7 +288,6 @@
    &pgtesttiming;
    &pgupgrade;
    &pgwaldump;
-   &pgwalsummary;
    &postgres;
 
  </reference>

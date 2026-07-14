@@ -4,7 +4,7 @@
  *	  prototypes for tablecmds.c.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/tablecmds.h
@@ -18,24 +18,21 @@
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
-#include "storage/lockdefs.h"
+#include "storage/lock.h"
 #include "utils/relcache.h"
 
-typedef struct AlterTableUtilityContext AlterTableUtilityContext;	/* avoid including
-																	 * tcop/utility.h here */
+struct AlterTableUtilityContext;	/* avoid including tcop/utility.h here */
 
 
 extern ObjectAddress DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 									ObjectAddress *typaddress, const char *queryString);
-
-extern TupleDesc BuildDescForRelation(const List *columns);
 
 extern void RemoveRelations(DropStmt *drop);
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 
 extern void AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
-					   AlterTableUtilityContext *context);
+					   struct AlterTableUtilityContext *context);
 
 extern LOCKMODE AlterTableGetLockLevel(List *cmds);
 
@@ -99,9 +96,8 @@ extern void AtEOSubXact_on_commit_actions(bool isCommit,
 										  SubTransactionId mySubid,
 										  SubTransactionId parentSubid);
 
-extern void RangeVarCallbackMaintainsTable(const RangeVar *relation,
-										   Oid relId, Oid oldRelId,
-										   void *arg);
+extern void RangeVarCallbackOwnsTable(const RangeVar *relation,
+									  Oid relId, Oid oldRelId, void *arg);
 
 extern void RangeVarCallbackOwnsRelation(const RangeVar *relation,
 										 Oid relId, Oid oldRelId, void *arg);

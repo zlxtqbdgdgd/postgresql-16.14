@@ -3,7 +3,7 @@
  * compress_none.c
  *	 Routines for archivers to read or write an uncompressed stream.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,18 +21,6 @@
  * Compressor API
  *----------------------
  */
-
-/*
- * We buffer outgoing data, just to ensure that data blocks written to the
- * archive file are of reasonable size.  The read side could use this struct,
- * but there's no need because it does not retain data across calls.
- */
-typedef struct NoneCompressorState
-{
-	char	   *buffer;			/* buffer for unwritten data */
-	size_t		buflen;			/* allocated size of buffer */
-	size_t		bufdata;		/* amount of valid data currently in buffer */
-} NoneCompressorState;
 
 /*
  * Private routines
@@ -53,7 +41,7 @@ ReadDataFromArchiveNone(ArchiveHandle *AH, CompressorState *cs)
 		ahwrite(buf, 1, cnt, AH);
 	}
 
-	pg_free(buf);
+	free(buf);
 }
 
 
@@ -61,45 +49,13 @@ static void
 WriteDataToArchiveNone(ArchiveHandle *AH, CompressorState *cs,
 					   const void *data, size_t dLen)
 {
-	NoneCompressorState *nonecs = (NoneCompressorState *) cs->private_data;
-	size_t		remaining = dLen;
-
-	while (remaining > 0)
-	{
-		size_t		chunk;
-
-		/* Dump buffer if full */
-		if (nonecs->bufdata >= nonecs->buflen)
-		{
-			cs->writeF(AH, nonecs->buffer, nonecs->bufdata);
-			nonecs->bufdata = 0;
-		}
-		/* And fill it */
-		chunk = nonecs->buflen - nonecs->bufdata;
-		if (chunk > remaining)
-			chunk = remaining;
-		memcpy(nonecs->buffer + nonecs->bufdata, data, chunk);
-		nonecs->bufdata += chunk;
-		data = ((const char *) data) + chunk;
-		remaining -= chunk;
-	}
+	cs->writeF(AH, data, dLen);
 }
 
 static void
 EndCompressorNone(ArchiveHandle *AH, CompressorState *cs)
 {
-	NoneCompressorState *nonecs = (NoneCompressorState *) cs->private_data;
-
-	if (nonecs)
-	{
-		/* Dump buffer if nonempty */
-		if (nonecs->bufdata > 0)
-			cs->writeF(AH, nonecs->buffer, nonecs->bufdata);
-		/* Free working state */
-		pg_free(nonecs->buffer);
-		pg_free(nonecs);
-		cs->private_data = NULL;
-	}
+	/* no op */
 }
 
 /*
@@ -115,22 +71,6 @@ InitCompressorNone(CompressorState *cs,
 	cs->end = EndCompressorNone;
 
 	cs->compression_spec = compression_spec;
-
-	/*
-	 * If the caller has defined a write function, prepare the necessary
-	 * buffer.
-	 */
-	if (cs->writeF)
-	{
-		NoneCompressorState *nonecs;
-
-		nonecs = pg_malloc_object(NoneCompressorState);
-		nonecs->buflen = DEFAULT_IO_BUFFER_SIZE;
-		nonecs->buffer = pg_malloc(nonecs->buflen);
-		nonecs->bufdata = 0;
-
-		cs->private_data = nonecs;
-	}
 }
 
 
@@ -151,7 +91,8 @@ read_none(void *ptr, size_t size, CompressFileHandle *CFH)
 
 	ret = fread(ptr, 1, size, fp);
 	if (ferror(fp))
-		pg_fatal("could not read from input file: %m");
+		pg_fatal("could not read from input file: %s",
+				 strerror(errno));
 
 	return ret;
 }
@@ -192,7 +133,7 @@ getc_none(CompressFileHandle *CFH)
 	if (ret == EOF)
 	{
 		if (!feof(fp))
-			pg_fatal("could not read from input file: %m");
+			pg_fatal("could not read from input file: %s", strerror(errno));
 		else
 			pg_fatal("could not read from input file: end of file");
 	}
@@ -231,24 +172,12 @@ open_none(const char *path, int fd, const char *mode, CompressFileHandle *CFH)
 	Assert(CFH->private_data == NULL);
 
 	if (fd >= 0)
-	{
-		int			dup_fd = dup(fd);
-
-		if (dup_fd < 0)
-			return false;
-		CFH->private_data = fdopen(dup_fd, mode);
-		if (CFH->private_data == NULL)
-		{
-			close(dup_fd);
-			return false;
-		}
-	}
+		CFH->private_data = fdopen(dup(fd), mode);
 	else
-	{
 		CFH->private_data = fopen(path, mode);
-		if (CFH->private_data == NULL)
-			return false;
-	}
+
+	if (CFH->private_data == NULL)
+		return false;
 
 	return true;
 }

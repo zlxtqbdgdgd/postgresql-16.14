@@ -4,7 +4,7 @@
  *	  Implement PGSemaphores using SysV semaphore facilities
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -142,7 +142,7 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems, bool retry_ok)
 						 "semaphore sets (SEMMNI), or the system wide maximum number of "
 						 "semaphores (SEMMNS), would be exceeded.  You need to raise the "
 						 "respective kernel parameter.  Alternatively, reduce PostgreSQL's "
-						 "consumption of semaphores by reducing its \"max_connections\" parameter.\n"
+						 "consumption of semaphores by reducing its max_connections parameter.\n"
 						 "The PostgreSQL documentation contains more information about "
 						 "configuring your system for PostgreSQL.") : 0));
 	}
@@ -301,20 +301,16 @@ IpcSemaphoreCreate(int numSems)
 
 
 /*
- * Request shared memory needed for semaphores
+ * Report amount of shared memory needed for semaphores
  */
-void
-PGSemaphoreShmemRequest(int maxSemas)
+Size
+PGSemaphoreShmemSize(int maxSemas)
 {
-	/* Need a PGSemaphoreData per semaphore */
-	ShmemRequestStruct(.name = "Semaphores",
-					   .size = mul_size(maxSemas, sizeof(PGSemaphoreData)),
-					   .ptr = (void **) &sharedSemas,
-		);
+	return mul_size(maxSemas, sizeof(PGSemaphoreData));
 }
 
 /*
- * PGSemaphoreInit --- initialize semaphore support
+ * PGReserveSemaphores --- initialize semaphore support
  *
  * This is called during postmaster start or shared memory reinitialization.
  * It should do whatever is needed to be able to support up to maxSemas
@@ -331,7 +327,7 @@ PGSemaphoreShmemRequest(int maxSemas)
  * have clobbered.)
  */
 void
-PGSemaphoreInit(int maxSemas)
+PGReserveSemaphores(int maxSemas)
 {
 	struct stat statbuf;
 
@@ -347,6 +343,13 @@ PGSemaphoreInit(int maxSemas)
 				 errmsg("could not stat data directory \"%s\": %m",
 						DataDir)));
 
+	/*
+	 * We must use ShmemAllocUnlocked(), since the spinlock protecting
+	 * ShmemAlloc() won't be ready yet.  (This ordering is necessary when we
+	 * are emulating spinlocks with semaphores.)
+	 */
+	sharedSemas = (PGSemaphore)
+		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));
 	numSharedSemas = 0;
 	maxSharedSemas = maxSemas;
 

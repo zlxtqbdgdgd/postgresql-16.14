@@ -22,30 +22,30 @@ INSERT INTO pxtest1 VALUES ('aaa');
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 UPDATE pxtest1 SET foobar = 'bbb' WHERE foobar = 'aaa';
 SELECT * FROM pxtest1;
-PREPARE TRANSACTION 'regress_foo1';
+PREPARE TRANSACTION 'foo1';
 
 SELECT * FROM pxtest1;
 
 -- Test pg_prepared_xacts system view
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 -- Test ROLLBACK PREPARED
-ROLLBACK PREPARED 'regress_foo1';
+ROLLBACK PREPARED 'foo1';
 
 SELECT * FROM pxtest1;
 
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 
 -- Test COMMIT PREPARED
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 INSERT INTO pxtest1 VALUES ('ddd');
 SELECT * FROM pxtest1;
-PREPARE TRANSACTION 'regress_foo2';
+PREPARE TRANSACTION 'foo2';
 
 SELECT * FROM pxtest1;
 
-COMMIT PREPARED 'regress_foo2';
+COMMIT PREPARED 'foo2';
 
 SELECT * FROM pxtest1;
 
@@ -53,19 +53,19 @@ SELECT * FROM pxtest1;
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 UPDATE pxtest1 SET foobar = 'eee' WHERE foobar = 'ddd';
 SELECT * FROM pxtest1;
-PREPARE TRANSACTION 'regress_foo3';
+PREPARE TRANSACTION 'foo3';
 
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 INSERT INTO pxtest1 VALUES ('fff');
 
 -- This should fail, because the gid foo3 is already in use
-PREPARE TRANSACTION 'regress_foo3';
+PREPARE TRANSACTION 'foo3';
 
 SELECT * FROM pxtest1;
 
-ROLLBACK PREPARED 'regress_foo3';
+ROLLBACK PREPARED 'foo3';
 
 SELECT * FROM pxtest1;
 
@@ -73,22 +73,22 @@ SELECT * FROM pxtest1;
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 UPDATE pxtest1 SET foobar = 'eee' WHERE foobar = 'ddd';
 SELECT * FROM pxtest1;
-PREPARE TRANSACTION 'regress_foo4';
+PREPARE TRANSACTION 'foo4';
 
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 SELECT * FROM pxtest1;
 
 -- This should fail, because the two transactions have a write-skew anomaly
 INSERT INTO pxtest1 VALUES ('fff');
-PREPARE TRANSACTION 'regress_foo5';
+PREPARE TRANSACTION 'foo5';
 
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
-ROLLBACK PREPARED 'regress_foo4';
+ROLLBACK PREPARED 'foo4';
 
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 -- Clean up
 DROP TABLE pxtest1;
@@ -97,7 +97,7 @@ DROP TABLE pxtest1;
 BEGIN;
 SELECT pg_advisory_lock(1);
 SELECT pg_advisory_xact_lock_shared(1);
-PREPARE TRANSACTION 'regress_foo6';  -- fails
+PREPARE TRANSACTION 'foo6';  -- fails
 
 -- Test subtransactions
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
@@ -108,7 +108,7 @@ BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
   ROLLBACK TO a;
   SAVEPOINT b;
   INSERT INTO pxtest2 VALUES (3);
-PREPARE TRANSACTION 'regress_sub1';
+PREPARE TRANSACTION 'regress-one';
 
 CREATE TABLE pxtest3(fff int);
 
@@ -121,7 +121,7 @@ BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
   DECLARE foo CURSOR FOR SELECT * FROM pxtest4;
   -- Fetch 1 tuple, keeping the cursor open
   FETCH 1 FROM foo;
-PREPARE TRANSACTION 'regress_sub2';
+PREPARE TRANSACTION 'regress-two';
 
 -- No such cursor
 FETCH 1 FROM foo;
@@ -130,7 +130,7 @@ FETCH 1 FROM foo;
 SELECT * FROM pxtest2;
 
 -- There should be two prepared transactions
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 -- pxtest3 should be locked because of the pending DROP
 begin;
@@ -141,7 +141,7 @@ rollback;
 \c -
 
 -- There should still be two prepared transactions
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 -- pxtest3 should still be locked because of the pending DROP
 begin;
@@ -149,46 +149,21 @@ lock table pxtest3 in access share mode nowait;
 rollback;
 
 -- Commit table creation
-COMMIT PREPARED 'regress_sub1';
+COMMIT PREPARED 'regress-one';
 \d pxtest2
 SELECT * FROM pxtest2;
 
 -- There should be one prepared transaction
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
+SELECT gid FROM pg_prepared_xacts;
 
 -- Commit table drop
-COMMIT PREPARED 'regress_sub2';
+COMMIT PREPARED 'regress-two';
 SELECT * FROM pxtest3;
 
 -- There should be no prepared transactions
-SELECT gid FROM pg_prepared_xacts WHERE gid ~ '^regress_' ORDER BY gid;
-
-
--- Test row-level locks held by prepared transactions
-CREATE TABLE pxtest_rowlock (id int PRIMARY KEY, data text);
-INSERT INTO pxtest_rowlock VALUES (1, 'test data');
-
-BEGIN;
-SELECT * FROM pxtest_rowlock WHERE id = 1 FOR SHARE;
-PREPARE TRANSACTION 'regress_p1';
-
--- Should fail because the row is locked
-SELECT * FROM pxtest_rowlock WHERE id = 1 FOR UPDATE NOWAIT;
-
--- Test prepared transactions that participate in multixacts. For
--- that, lock the same row again, creating a multixid.
-BEGIN;
-SELECT * FROM pxtest_rowlock WHERE id = 1 FOR SHARE;
-PREPARE TRANSACTION 'regress_p2';
-
--- Should fail because the row is locked
-SELECT * FROM pxtest_rowlock WHERE id = 1 FOR UPDATE NOWAIT;
-
-ROLLBACK PREPARED 'regress_p1';
-ROLLBACK PREPARED 'regress_p2';
+SELECT gid FROM pg_prepared_xacts;
 
 -- Clean up
 DROP TABLE pxtest2;
 -- pxtest3 was already dropped
 DROP TABLE pxtest4;
-DROP TABLE pxtest_rowlock;

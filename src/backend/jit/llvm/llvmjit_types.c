@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -47,7 +47,6 @@
  */
 PGFunction	TypePGFunction;
 size_t		TypeSizeT;
-Datum		TypeDatum;
 bool		TypeStorageBool;
 
 ExecEvalSubroutine TypeExecEvalSubroutine;
@@ -81,7 +80,7 @@ extern Datum AttributeTemplate(PG_FUNCTION_ARGS);
 Datum
 AttributeTemplate(PG_FUNCTION_ARGS)
 {
-	StaticAssertVariableIsOfType(&AttributeTemplate, PGFunction);
+	AssertVariableIsOfType(&AttributeTemplate, PGFunction);
 
 	PG_RETURN_NULL();
 }
@@ -99,8 +98,8 @@ ExecEvalSubroutineTemplate(ExprState *state,
 						   struct ExprEvalStep *op,
 						   ExprContext *econtext)
 {
-	StaticAssertVariableIsOfType(&ExecEvalSubroutineTemplate,
-								 ExecEvalSubroutine);
+	AssertVariableIsOfType(&ExecEvalSubroutineTemplate,
+						   ExecEvalSubroutine);
 }
 
 extern bool ExecEvalBoolSubroutineTemplate(ExprState *state,
@@ -111,16 +110,18 @@ ExecEvalBoolSubroutineTemplate(ExprState *state,
 							   struct ExprEvalStep *op,
 							   ExprContext *econtext)
 {
-	StaticAssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
-								 ExecEvalBoolSubroutine);
+	AssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
+						   ExecEvalBoolSubroutine);
 
 	return false;
 }
 
 /*
- * Clang represents bool returned by functions differently (as i1) than stored
- * ones (as i8).  Therefore we do not just need TypeStorageBool (above), but
- * also a way to determine the width of a returned integer.
+ * Clang represents stdbool.h style booleans that are returned by functions
+ * differently (as i1) than stored ones (as i8). Therefore we do not just need
+ * TypeBool (above), but also a way to determine the width of a returned
+ * integer. This allows us to keep compatible with non-stdbool using
+ * architectures.
  */
 extern bool FunctionReturningBool(void);
 bool
@@ -154,16 +155,13 @@ void	   *referenced_functions[] =
 	ExecEvalFuncExprFusage,
 	ExecEvalFuncExprStrictFusage,
 	ExecEvalGroupingFunc,
-	ExecEvalMergeSupportFunc,
 	ExecEvalMinMax,
 	ExecEvalNextValueExpr,
 	ExecEvalParamExec,
 	ExecEvalParamExtern,
-	ExecEvalParamSet,
 	ExecEvalRow,
 	ExecEvalRowNotNull,
 	ExecEvalRowNull,
-	ExecEvalCoerceViaIOSafe,
 	ExecEvalSQLValueFunction,
 	ExecEvalScalarArrayOp,
 	ExecEvalHashedScalarArrayOp,
@@ -173,9 +171,6 @@ void	   *referenced_functions[] =
 	ExecEvalXmlExpr,
 	ExecEvalJsonConstructor,
 	ExecEvalJsonIsPredicate,
-	ExecEvalJsonCoercion,
-	ExecEvalJsonCoercionFinish,
-	ExecEvalJsonExprPath,
 	MakeExpandedObjectReadOnlyInternal,
 	slot_getmissingattrs,
 	slot_getsomeattrs_int,

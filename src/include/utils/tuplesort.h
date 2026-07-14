@@ -11,7 +11,7 @@
  * algorithm.  Parallel sorts use a variant of this external sort
  * algorithm, and are typically only used for large amounts of data.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/tuplesort.h
@@ -22,16 +22,12 @@
 #define TUPLESORT_H
 
 #include "access/itup.h"
-#include "executor/instrument_node.h"
 #include "executor/tuptable.h"
 #include "storage/dsm.h"
 #include "utils/logtape.h"
 #include "utils/relcache.h"
 #include "utils/sortsupport.h"
 
-/* We don't want this file to depend on AM-specific header files */
-typedef struct BrinTuple BrinTuple;
-typedef struct GinTuple GinTuple;
 
 /*
  * Tuplesortstate and Sharedsort are opaque types whose details are not
@@ -59,9 +55,38 @@ typedef struct SortCoordinateData
 
 	/* Private opaque state (points to shared memory) */
 	Sharedsort *sharedsort;
-} SortCoordinateData;
+}			SortCoordinateData;
 
 typedef struct SortCoordinateData *SortCoordinate;
+
+/*
+ * Data structures for reporting sort statistics.  Note that
+ * TuplesortInstrumentation can't contain any pointers because we
+ * sometimes put it in shared memory.
+ *
+ * The parallel-sort infrastructure relies on having a zero TuplesortMethod
+ * to indicate that a worker never did anything, so we assign zero to
+ * SORT_TYPE_STILL_IN_PROGRESS.  The other values of this enum can be
+ * OR'ed together to represent a situation where different workers used
+ * different methods, so we need a separate bit for each one.  Keep the
+ * NUM_TUPLESORTMETHODS constant in sync with the number of bits!
+ */
+typedef enum
+{
+	SORT_TYPE_STILL_IN_PROGRESS = 0,
+	SORT_TYPE_TOP_N_HEAPSORT = 1 << 0,
+	SORT_TYPE_QUICKSORT = 1 << 1,
+	SORT_TYPE_EXTERNAL_SORT = 1 << 2,
+	SORT_TYPE_EXTERNAL_MERGE = 1 << 3
+} TuplesortMethod;
+
+#define NUM_TUPLESORTMETHODS 4
+
+typedef enum
+{
+	SORT_SPACE_TYPE_DISK,
+	SORT_SPACE_TYPE_MEMORY
+} TuplesortSpaceType;
 
 /* Bitwise option flags for tuple sorts */
 #define TUPLESORT_NONE					0
@@ -72,24 +97,21 @@ typedef struct SortCoordinateData *SortCoordinate;
 /* specifies if the tuplesort is able to support bounded sorts */
 #define TUPLESORT_ALLOWBOUNDED			(1 << 1)
 
-/*
- * For bounded sort, tuples get pfree'd when they fall outside of the bound.
- * When bounded sorts are not required, we can use a bump context for tuple
- * allocation as there's no risk that pfree will ever be called for a tuple.
- * Define a macro to make it easier for code to figure out if we're using a
- * bump allocator.
- */
-#define TupleSortUseBumpTupleCxt(opt) (((opt) & TUPLESORT_ALLOWBOUNDED) == 0)
+typedef struct TuplesortInstrumentation
+{
+	TuplesortMethod sortMethod; /* sort algorithm used */
+	TuplesortSpaceType spaceType;	/* type of space spaceUsed represents */
+	int64		spaceUsed;		/* space consumption, in kB */
+} TuplesortInstrumentation;
 
 /*
  * The objects we actually sort are SortTuple structs.  These contain
  * a pointer to the tuple proper (might be a MinimalTuple or IndexTuple),
  * which is a separate palloc chunk --- we assume it is just one chunk and
- * can be freed by a simple pfree() (except during merge, where we use a
- * simple slab allocator, and during a non-bounded sort where we use a bump
- * allocator).  SortTuples also contain the tuple's first key column in
- * Datum/nullflag format, and a source/input tape number that tracks which
- * tape each heap element/slot belongs to during merging.
+ * can be freed by a simple pfree() (except during merge, when we use a
+ * simple slab allocator).  SortTuples also contain the tuple's first key
+ * column in Datum/nullflag format, and a source/input tape number that
+ * tracks which tape each heap element/slot belongs to during merging.
  *
  * Storing the first key column lets us save heap_getattr or index_getattr
  * calls during tuple comparisons.  We could extract and save all the key
@@ -116,7 +138,6 @@ typedef struct
 	void	   *tuple;			/* the tuple itself */
 	Datum		datum1;			/* value of first key column */
 	bool		isnull1;		/* is first key column NULL? */
-	uint8		curbyte;		/* chunk of datum1 for current radix sort pass */
 	int			srctape;		/* source tape number */
 } SortTuple;
 
@@ -140,13 +161,6 @@ typedef struct
 	 * qsort_arg_comparator.
 	 */
 	SortTupleComparator comparetup;
-
-	/*
-	 * Fall back to the full tuple for comparison, but only compare the first
-	 * sortkey if it was abbreviated. Otherwise, only compare second and later
-	 * sortkeys.
-	 */
-	SortTupleComparator comparetup_tiebreak;
 
 	/*
 	 * Alter datum1 representation in the SortTuple's array back from the
@@ -261,9 +275,6 @@ typedef struct
  * The "index_hash" API is similar to index_btree, but the tuples are
  * actually sorted by their hash codes not the raw data.
  *
- * The "index_brin" API is similar to index_btree, but the tuples are
- * BrinTuple and are sorted by their block number not the raw data.
- *
  * Parallel sort callers are required to coordinate multiple tuplesort states
  * in a leader process and one or more worker processes.  The leader process
  * must launch workers, and have each perform an independent "partial"
@@ -345,8 +356,7 @@ extern Tuplesortstate *tuplesort_begin_common(int workMem,
 extern void tuplesort_set_bound(Tuplesortstate *state, int64 bound);
 extern bool tuplesort_used_bound(Tuplesortstate *state);
 extern void tuplesort_puttuple_common(Tuplesortstate *state,
-									  SortTuple *tuple, bool useAbbrev,
-									  Size tuplen);
+									  SortTuple *tuple, bool useAbbrev);
 extern void tuplesort_performsort(Tuplesortstate *state);
 extern bool tuplesort_gettuple_common(Tuplesortstate *state, bool forward,
 									  SortTuple *stup);
@@ -409,12 +419,6 @@ extern Tuplesortstate *tuplesort_begin_index_gist(Relation heapRel,
 												  Relation indexRel,
 												  int workMem, SortCoordinate coordinate,
 												  int sortopt);
-extern Tuplesortstate *tuplesort_begin_index_brin(int workMem, SortCoordinate coordinate,
-												  int sortopt);
-extern Tuplesortstate *tuplesort_begin_index_gin(Relation heapRel,
-												 Relation indexRel,
-												 int workMem, SortCoordinate coordinate,
-												 int sortopt);
 extern Tuplesortstate *tuplesort_begin_datum(Oid datumType,
 											 Oid sortOperator, Oid sortCollation,
 											 bool nullsFirstFlag,
@@ -425,10 +429,8 @@ extern void tuplesort_puttupleslot(Tuplesortstate *state,
 								   TupleTableSlot *slot);
 extern void tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup);
 extern void tuplesort_putindextuplevalues(Tuplesortstate *state,
-										  Relation rel, const ItemPointerData *self,
-										  const Datum *values, const bool *isnull);
-extern void tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size);
-extern void tuplesort_putgintuple(Tuplesortstate *state, GinTuple *tuple, Size size);
+										  Relation rel, ItemPointer self,
+										  Datum *values, bool *isnull);
 extern void tuplesort_putdatum(Tuplesortstate *state, Datum val,
 							   bool isNull);
 
@@ -436,10 +438,6 @@ extern bool tuplesort_gettupleslot(Tuplesortstate *state, bool forward,
 								   bool copy, TupleTableSlot *slot, Datum *abbrev);
 extern HeapTuple tuplesort_getheaptuple(Tuplesortstate *state, bool forward);
 extern IndexTuple tuplesort_getindextuple(Tuplesortstate *state, bool forward);
-extern BrinTuple *tuplesort_getbrintuple(Tuplesortstate *state, Size *len,
-										 bool forward);
-extern GinTuple *tuplesort_getgintuple(Tuplesortstate *state, Size *len,
-									   bool forward);
 extern bool tuplesort_getdatum(Tuplesortstate *state, bool forward, bool copy,
 							   Datum *val, bool *isNull, Datum *abbrev);
 

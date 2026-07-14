@@ -47,13 +47,11 @@
 
 #include "dumputils.h"
 #include "fe_utils/option_utils.h"
-#include "filter.h"
 #include "getopt_long.h"
 #include "parallel.h"
 #include "pg_backup_utils.h"
 
 static void usage(const char *progname);
-static void read_restore_filters(const char *filename, RestoreOptions *opts);
 
 int
 main(int argc, char **argv)
@@ -64,8 +62,6 @@ main(int argc, char **argv)
 	int			numWorkers = 1;
 	Archive    *AH;
 	char	   *inputFileSpec;
-	bool		data_only = false;
-	bool		schema_only = false;
 	static int	disable_triggers = 0;
 	static int	enable_row_security = 0;
 	static int	if_exists = 0;
@@ -74,16 +70,10 @@ main(int argc, char **argv)
 	static int	outputNoTablespaces = 0;
 	static int	use_setsessauth = 0;
 	static int	no_comments = 0;
-	static int	no_data = 0;
-	static int	no_policies = 0;
 	static int	no_publications = 0;
-	static int	no_schema = 0;
 	static int	no_security_labels = 0;
-	static int	no_statistics = 0;
 	static int	no_subscriptions = 0;
 	static int	strict_names = 0;
-	static int	statistics_only = 0;
-	static int	with_statistics = 0;
 
 	struct option cmdopts[] = {
 		{"clean", 0, NULL, 'c'},
@@ -128,19 +118,11 @@ main(int argc, char **argv)
 		{"role", required_argument, NULL, 2},
 		{"section", required_argument, NULL, 3},
 		{"strict-names", no_argument, &strict_names, 1},
-		{"transaction-size", required_argument, NULL, 5},
 		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
 		{"no-comments", no_argument, &no_comments, 1},
-		{"no-data", no_argument, &no_data, 1},
-		{"no-policies", no_argument, &no_policies, 1},
 		{"no-publications", no_argument, &no_publications, 1},
-		{"no-schema", no_argument, &no_schema, 1},
 		{"no-security-labels", no_argument, &no_security_labels, 1},
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
-		{"no-statistics", no_argument, &no_statistics, 1},
-		{"statistics", no_argument, &with_statistics, 1},
-		{"statistics-only", no_argument, &statistics_only, 1},
-		{"filter", required_argument, NULL, 4},
 		{"restrict-key", required_argument, NULL, 6},
 
 		{NULL, 0, NULL, 0}
@@ -176,7 +158,7 @@ main(int argc, char **argv)
 		switch (c)
 		{
 			case 'a':			/* Dump data only */
-				data_only = true;
+				opts->dataOnly = 1;
 				break;
 			case 'c':			/* clean (i.e., drop) schema prior to create */
 				opts->dropSchema = 1;
@@ -252,7 +234,7 @@ main(int argc, char **argv)
 				simple_string_list_append(&opts->triggerNames, optarg);
 				break;
 			case 's':			/* dump schema only */
-				schema_only = true;
+				opts->schemaOnly = 1;
 				break;
 			case 'S':			/* Superuser username */
 				if (strlen(optarg) != 0)
@@ -305,18 +287,6 @@ main(int argc, char **argv)
 				set_dump_section(optarg, &(opts->dumpSections));
 				break;
 
-			case 4:				/* filter */
-				read_restore_filters(optarg, opts);
-				break;
-
-			case 5:				/* transaction-size */
-				if (!option_parse_int(optarg, "--transaction-size",
-									  1, INT_MAX,
-									  &opts->txn_size))
-					exit(1);
-				opts->exit_on_error = true;
-				break;
-
 			case 6:
 				opts->restrict_key = pg_strdup(optarg);
 				break;
@@ -352,15 +322,13 @@ main(int argc, char **argv)
 	{
 		if (opts->filename)
 		{
-			pg_log_error("options %s and %s cannot be used together",
-						 "-d/--dbname", "-f/--file");
+			pg_log_error("options -d/--dbname and -f/--file cannot be used together");
 			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 			exit_nicely(1);
 		}
 
 		if (opts->restrict_key)
-			pg_fatal("options %s and %s cannot be used together",
-					 "-d/--dbname", "--restrict-key");
+			pg_fatal("options -d/--dbname and --restrict-key cannot be used together");
 
 		opts->useDB = 1;
 	}
@@ -377,72 +345,22 @@ main(int argc, char **argv)
 			pg_fatal("invalid restrict key");
 	}
 
-	/* reject conflicting "-only" options */
-	if (data_only && schema_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "-a/--data-only");
-	if (schema_only && statistics_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--statistics-only");
-	if (data_only && statistics_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--statistics-only");
+	if (opts->dataOnly && opts->schemaOnly)
+		pg_fatal("options -s/--schema-only and -a/--data-only cannot be used together");
 
-	/* reject conflicting "-only" and "no-" options */
-	if (data_only && no_data)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--no-data");
-	if (schema_only && no_schema)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--no-schema");
-	if (statistics_only && no_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics-only", "--no-statistics");
-
-	/* reject conflicting "no-" options */
-	if (with_statistics && no_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics", "--no-statistics");
-
-	/* reject conflicting "only-" options */
-	if (data_only && with_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--statistics");
-	if (schema_only && with_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--statistics");
-
-	if (data_only && opts->dropSchema)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-c/--clean", "-a/--data-only");
-
-	if (opts->single_txn && opts->txn_size > 0)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-1/--single-transaction", "--transaction-size");
+	if (opts->dataOnly && opts->dropSchema)
+		pg_fatal("options -c/--clean and -a/--data-only cannot be used together");
 
 	/*
 	 * -C is not compatible with -1, because we can't create a database inside
 	 * a transaction block.
 	 */
 	if (opts->createDB && opts->single_txn)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-C/--create", "-1/--single-transaction");
+		pg_fatal("options -C/--create and -1/--single-transaction cannot be used together");
 
 	/* Can't do single-txn mode with multiple connections */
 	if (opts->single_txn && numWorkers > 1)
 		pg_fatal("cannot specify both --single-transaction and multiple jobs");
-
-	/*
-	 * Set derivative flags. Ambiguous or nonsensical combinations, e.g.
-	 * "--schema-only --no-schema", will have already caused an error in one
-	 * of the checks above.
-	 */
-	opts->dumpData = ((opts->dumpData && !schema_only && !statistics_only) ||
-					  data_only) && !no_data;
-	opts->dumpSchema = ((opts->dumpSchema && !data_only && !statistics_only) ||
-						schema_only) && !no_schema;
-	opts->dumpStatistics = ((opts->dumpStatistics && !schema_only && !data_only) ||
-							(statistics_only || with_statistics)) && !no_statistics;
 
 	opts->disable_triggers = disable_triggers;
 	opts->enable_row_security = enable_row_security;
@@ -451,38 +369,38 @@ main(int argc, char **argv)
 	opts->noTablespace = outputNoTablespaces;
 	opts->use_setsessauth = use_setsessauth;
 	opts->no_comments = no_comments;
-	opts->no_policies = no_policies;
 	opts->no_publications = no_publications;
 	opts->no_security_labels = no_security_labels;
 	opts->no_subscriptions = no_subscriptions;
 
 	if (if_exists && !opts->dropSchema)
-		pg_fatal("option %s requires option %s",
-				 "--if-exists", "-c/--clean");
+		pg_fatal("option --if-exists requires option -c/--clean");
 	opts->if_exists = if_exists;
 	opts->strict_names = strict_names;
 
 	if (opts->formatName)
 	{
-		if (pg_strcasecmp(opts->formatName, "c") == 0 ||
-			pg_strcasecmp(opts->formatName, "custom") == 0)
-			opts->format = archCustom;
-		else if (pg_strcasecmp(opts->formatName, "d") == 0 ||
-				 pg_strcasecmp(opts->formatName, "directory") == 0)
-			opts->format = archDirectory;
-		else if (pg_strcasecmp(opts->formatName, "t") == 0 ||
-				 pg_strcasecmp(opts->formatName, "tar") == 0)
-			opts->format = archTar;
-		else if (pg_strcasecmp(opts->formatName, "p") == 0 ||
-				 pg_strcasecmp(opts->formatName, "plain") == 0)
+		switch (opts->formatName[0])
 		{
-			/* recognize this for consistency with pg_dump */
-			pg_fatal("archive format \"%s\" is not supported; please use psql",
-					 opts->formatName);
+			case 'c':
+			case 'C':
+				opts->format = archCustom;
+				break;
+
+			case 'd':
+			case 'D':
+				opts->format = archDirectory;
+				break;
+
+			case 't':
+			case 'T':
+				opts->format = archTar;
+				break;
+
+			default:
+				pg_fatal("unrecognized archive format \"%s\"; please specify \"c\", \"d\", or \"t\"",
+						 opts->formatName);
 		}
-		else
-			pg_fatal("unrecognized archive format \"%s\"; please specify \"c\", \"d\", or \"t\"",
-					 opts->formatName);
 	}
 
 	AH = OpenArchive(inputFileSpec, opts->format);
@@ -566,28 +484,19 @@ usage(const char *progname)
 	printf(_("  -1, --single-transaction     restore as a single transaction\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
 	printf(_("  --enable-row-security        enable row security\n"));
-	printf(_("  --filter=FILENAME            restore or skip objects based on expressions\n"
-			 "                               in FILENAME\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
-	printf(_("  --no-comments                do not restore comment commands\n"));
-	printf(_("  --no-data                    do not restore data\n"));
+	printf(_("  --no-comments                do not restore comments\n"));
 	printf(_("  --no-data-for-failed-tables  do not restore data of tables that could not be\n"
 			 "                               created\n"));
-	printf(_("  --no-policies                do not restore row security policies\n"));
 	printf(_("  --no-publications            do not restore publications\n"));
-	printf(_("  --no-schema                  do not restore schema\n"));
 	printf(_("  --no-security-labels         do not restore security labels\n"));
-	printf(_("  --no-statistics              do not restore statistics\n"));
 	printf(_("  --no-subscriptions           do not restore subscriptions\n"));
 	printf(_("  --no-table-access-method     do not restore table access methods\n"));
 	printf(_("  --no-tablespaces             do not restore tablespace assignments\n"));
 	printf(_("  --restrict-key=RESTRICT_KEY  use provided string as psql \\restrict key\n"));
 	printf(_("  --section=SECTION            restore named section (pre-data, data, or post-data)\n"));
-	printf(_("  --statistics                 restore the statistics\n"));
-	printf(_("  --statistics-only            restore only the statistics, not schema or data\n"));
 	printf(_("  --strict-names               require table and/or schema include patterns to\n"
 			 "                               match at least one entity each\n"));
-	printf(_("  --transaction-size=N         commit after every N objects\n"));
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
@@ -606,104 +515,4 @@ usage(const char *progname)
 	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
 	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
-}
-
-/*
- * read_restore_filters - retrieve object identifier patterns from file
- *
- * Parse the specified filter file for include and exclude patterns, and add
- * them to the relevant lists.  If the filename is "-" then filters will be
- * read from STDIN rather than a file.
- */
-static void
-read_restore_filters(const char *filename, RestoreOptions *opts)
-{
-	FilterStateData fstate;
-	char	   *objname;
-	FilterCommandType comtype;
-	FilterObjectType objtype;
-
-	filter_init(&fstate, filename, exit_nicely);
-
-	while (filter_read_item(&fstate, &objname, &comtype, &objtype))
-	{
-		if (comtype == FILTER_COMMAND_TYPE_INCLUDE)
-		{
-			switch (objtype)
-			{
-				case FILTER_OBJECT_TYPE_NONE:
-					break;
-				case FILTER_OBJECT_TYPE_TABLE_DATA:
-				case FILTER_OBJECT_TYPE_TABLE_DATA_AND_CHILDREN:
-				case FILTER_OBJECT_TYPE_TABLE_AND_CHILDREN:
-				case FILTER_OBJECT_TYPE_DATABASE:
-				case FILTER_OBJECT_TYPE_EXTENSION:
-				case FILTER_OBJECT_TYPE_FOREIGN_DATA:
-					pg_log_filter_error(&fstate, _("%s filter for \"%s\" is not allowed"),
-										"include",
-										filter_object_type_name(objtype));
-					exit_nicely(1);
-
-				case FILTER_OBJECT_TYPE_FUNCTION:
-					opts->selTypes = 1;
-					opts->selFunction = 1;
-					simple_string_list_append(&opts->functionNames, objname);
-					break;
-				case FILTER_OBJECT_TYPE_INDEX:
-					opts->selTypes = 1;
-					opts->selIndex = 1;
-					simple_string_list_append(&opts->indexNames, objname);
-					break;
-				case FILTER_OBJECT_TYPE_SCHEMA:
-					simple_string_list_append(&opts->schemaNames, objname);
-					break;
-				case FILTER_OBJECT_TYPE_TABLE:
-					opts->selTypes = 1;
-					opts->selTable = 1;
-					simple_string_list_append(&opts->tableNames, objname);
-					break;
-				case FILTER_OBJECT_TYPE_TRIGGER:
-					opts->selTypes = 1;
-					opts->selTrigger = 1;
-					simple_string_list_append(&opts->triggerNames, objname);
-					break;
-			}
-		}
-		else if (comtype == FILTER_COMMAND_TYPE_EXCLUDE)
-		{
-			switch (objtype)
-			{
-				case FILTER_OBJECT_TYPE_NONE:
-					break;
-				case FILTER_OBJECT_TYPE_TABLE_DATA:
-				case FILTER_OBJECT_TYPE_TABLE_DATA_AND_CHILDREN:
-				case FILTER_OBJECT_TYPE_DATABASE:
-				case FILTER_OBJECT_TYPE_EXTENSION:
-				case FILTER_OBJECT_TYPE_FOREIGN_DATA:
-				case FILTER_OBJECT_TYPE_FUNCTION:
-				case FILTER_OBJECT_TYPE_INDEX:
-				case FILTER_OBJECT_TYPE_TABLE:
-				case FILTER_OBJECT_TYPE_TABLE_AND_CHILDREN:
-				case FILTER_OBJECT_TYPE_TRIGGER:
-					pg_log_filter_error(&fstate, _("%s filter for \"%s\" is not allowed"),
-										"exclude",
-										filter_object_type_name(objtype));
-					exit_nicely(1);
-
-				case FILTER_OBJECT_TYPE_SCHEMA:
-					simple_string_list_append(&opts->schemaExcludeNames, objname);
-					break;
-			}
-		}
-		else
-		{
-			Assert(comtype == FILTER_COMMAND_TYPE_NONE);
-			Assert(objtype == FILTER_OBJECT_TYPE_NONE);
-		}
-
-		if (objname)
-			free(objname);
-	}
-
-	filter_free(&fstate);
 }

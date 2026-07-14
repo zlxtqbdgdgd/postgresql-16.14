@@ -79,14 +79,6 @@ CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', delimiter 
 ');       -- ERROR
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', null '
 ');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (on_error 'unsupported');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'binary', on_error 'ignore');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (log_verbosity 'unsupported');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (reject_limit '1');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (on_error 'ignore', reject_limit '0');       -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (header '-1');           -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (header '2.5');          -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (header 'unsupported');  -- ERROR
 CREATE FOREIGN TABLE tbl () SERVER file_server;  -- ERROR
 
 \set filename :abs_srcdir '/data/agg.data'
@@ -121,16 +113,6 @@ SELECT * FROM header_match;
 CREATE FOREIGN TABLE header_doesnt_match (a int, foo text) SERVER file_server
 OPTIONS (format 'csv', filename :'filename', delimiter ',', header 'match');
 SELECT * FROM header_doesnt_match; -- ERROR
-
--- test multi-line header
-\set filename :abs_srcdir '/data/multiline_header.csv'
-CREATE FOREIGN TABLE multi_header (a int, b text) SERVER file_server
-OPTIONS (format 'csv', filename :'filename', header '2');
-SELECT * FROM multi_header ORDER BY a;
-
-CREATE FOREIGN TABLE multi_header_skip (a int, b text) SERVER file_server
-OPTIONS (format 'csv', filename :'filename', header '5');
-SELECT count(*) FROM multi_header_skip;
 
 -- per-column options tests
 \set filename :abs_srcdir '/data/text.csv'
@@ -169,19 +151,6 @@ SELECT * FROM agg_csv c JOIN agg_text t ON (t.a = c.a) ORDER BY c.a;
 
 -- error context report tests
 SELECT * FROM agg_bad;               -- ERROR
-
--- on_error, log_verbosity and reject_limit tests
-ALTER FOREIGN TABLE agg_bad OPTIONS (ADD on_error 'set_null');
-SELECT * FROM agg_bad;
-ALTER FOREIGN TABLE agg_bad OPTIONS (SET on_error 'ignore');
-SELECT * FROM agg_bad;
-ALTER FOREIGN TABLE agg_bad OPTIONS (ADD log_verbosity 'silent');
-SELECT * FROM agg_bad;
-ALTER FOREIGN TABLE agg_bad OPTIONS (ADD reject_limit '1'); -- ERROR
-SELECT * FROM agg_bad;
-ALTER FOREIGN TABLE agg_bad OPTIONS (SET reject_limit '2');
-SELECT * FROM agg_bad;
-ANALYZE agg_bad;
 
 -- misc query tests
 \t on

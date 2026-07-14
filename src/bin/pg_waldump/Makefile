@@ -3,9 +3,6 @@
 PGFILEDESC = "pg_waldump - decode and display WAL"
 PGAPPICON=win32
 
-# make these available to TAP test scripts
-export TAR
-
 subdir = src/bin/pg_waldump
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
@@ -13,15 +10,13 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	$(RMGRDESCOBJS) \
 	$(WIN32RES) \
-	archive_waldump.o \
 	compat.o \
 	pg_waldump.o \
 	rmgrdesc.o \
 	xlogreader.o \
 	xlogstats.o
 
-override CPPFLAGS := -DFRONTEND -I$(libpq_srcdir) $(CPPFLAGS)
-LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
+override CPPFLAGS := -DFRONTEND $(CPPFLAGS)
 
 RMGRDESCSOURCES = $(sort $(notdir $(wildcard $(top_srcdir)/src/backend/access/rmgrdesc/*desc*.c)))
 RMGRDESCOBJS = $(patsubst %.c,%.o,$(RMGRDESCSOURCES))
@@ -50,7 +45,7 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_waldump$(X)'
 
-clean distclean:
+clean distclean maintainer-clean:
 	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c xlogstats.c
 	rm -rf tmp_check
 

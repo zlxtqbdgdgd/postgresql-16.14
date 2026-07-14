@@ -3,7 +3,7 @@
  * to_tsany.c
  *		to_ts* function definitions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "common/jsonapi.h"
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
@@ -84,7 +85,7 @@ uniqueWORD(ParsedWord *a, int32 l)
 	{
 		tmppos = LIMITPOS(a->pos.pos);
 		a->alen = 2;
-		a->pos.apos = palloc_array(uint16, a->alen);
+		a->pos.apos = (uint16 *) palloc(sizeof(uint16) * a->alen);
 		a->pos.apos[0] = 1;
 		a->pos.apos[1] = tmppos;
 		return l;
@@ -103,7 +104,7 @@ uniqueWORD(ParsedWord *a, int32 l)
 	 */
 	tmppos = LIMITPOS(a->pos.pos);
 	a->alen = 2;
-	a->pos.apos = palloc_array(uint16, a->alen);
+	a->pos.apos = (uint16 *) palloc(sizeof(uint16) * a->alen);
 	a->pos.apos[0] = 1;
 	a->pos.apos[1] = tmppos;
 
@@ -123,7 +124,7 @@ uniqueWORD(ParsedWord *a, int32 l)
 			res->word = ptr->word;
 			tmppos = LIMITPOS(ptr->pos.pos);
 			res->alen = 2;
-			res->pos.apos = palloc_array(uint16, res->alen);
+			res->pos.apos = (uint16 *) palloc(sizeof(uint16) * res->alen);
 			res->pos.apos[0] = 1;
 			res->pos.apos[1] = tmppos;
 		}
@@ -141,7 +142,7 @@ uniqueWORD(ParsedWord *a, int32 l)
 				if (res->pos.apos[0] + 1 >= res->alen)
 				{
 					res->alen *= 2;
-					res->pos.apos = repalloc_array(res->pos.apos, uint16, res->alen);
+					res->pos.apos = (uint16 *) repalloc(res->pos.apos, sizeof(uint16) * res->alen);
 				}
 				if (res->pos.apos[0] == 0 || res->pos.apos[res->pos.apos[0]] != LIMITPOS(ptr->pos.pos))
 				{
@@ -255,7 +256,7 @@ to_tsvector_byid(PG_FUNCTION_ARGS)
 		prs.lenwords = MaxAllocSize / sizeof(ParsedWord);
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = palloc_array(ParsedWord, prs.lenwords);
+	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
 	parsetext(cfgId, &prs, VARDATA_ANY(in), VARSIZE_ANY_EXHDR(in));
 
@@ -453,7 +454,7 @@ add_to_tsvector(void *_state, char *elem_value, int elem_len)
 		 * (parsetext() will realloc it bigger as needed.)
 		 */
 		prs->lenwords = 16;
-		prs->words = palloc_array(ParsedWord, prs->lenwords);
+		prs->words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs->lenwords);
 		prs->curwords = 0;
 		prs->pos = 0;
 	}
@@ -489,7 +490,7 @@ add_to_tsvector(void *_state, char *elem_value, int elem_len)
  * and different variants are ORed together.
  */
 static void
-pushval_morph(void *opaque, TSQueryParserState state, char *strval, int lenval, int16 weight, bool prefix)
+pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, int16 weight, bool prefix)
 {
 	int32		count = 0;
 	ParsedText	prs;
@@ -498,12 +499,12 @@ pushval_morph(void *opaque, TSQueryParserState state, char *strval, int lenval, 
 				cntvar = 0,
 				cntpos = 0,
 				cnt = 0;
-	MorphOpaque *data = opaque;
+	MorphOpaque *data = (MorphOpaque *) DatumGetPointer(opaque);
 
 	prs.lenwords = 4;
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = palloc_array(ParsedWord, prs.lenwords);
+	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
 	parsetext(data->cfg_id, &prs, strval, lenval);
 
@@ -594,7 +595,7 @@ to_tsquery_byid(PG_FUNCTION_ARGS)
 
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
-						  &data,
+						  PointerGetDatum(&data),
 						  0,
 						  NULL);
 
@@ -631,7 +632,7 @@ plainto_tsquery_byid(PG_FUNCTION_ARGS)
 
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
-						  &data,
+						  PointerGetDatum(&data),
 						  P_TSQ_PLAIN,
 						  NULL);
 
@@ -669,7 +670,7 @@ phraseto_tsquery_byid(PG_FUNCTION_ARGS)
 
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
-						  &data,
+						  PointerGetDatum(&data),
 						  P_TSQ_PLAIN,
 						  NULL);
 
@@ -707,7 +708,7 @@ websearch_to_tsquery_byid(PG_FUNCTION_ARGS)
 
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
-						  &data,
+						  PointerGetDatum(&data),
 						  P_TSQ_WEB,
 						  NULL);
 

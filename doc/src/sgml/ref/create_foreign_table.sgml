@@ -23,8 +23,7 @@ PostgreSQL documentation
 <synopsis>
 CREATE FOREIGN TABLE [ IF NOT EXISTS ] <replaceable class="parameter">table_name</replaceable> ( [
   { <replaceable class="parameter">column_name</replaceable> <replaceable class="parameter">data_type</replaceable> [ OPTIONS ( <replaceable class="parameter">option</replaceable> '<replaceable class="parameter">value</replaceable>' [, ... ] ) ] [ COLLATE <replaceable>collation</replaceable> ] [ <replaceable class="parameter">column_constraint</replaceable> [ ... ] ]
-    | <replaceable>table_constraint</replaceable>
-    | LIKE <replaceable>source_table</replaceable> [ <replaceable>like_option</replaceable> ... ] }
+    | <replaceable>table_constraint</replaceable> }
     [, ... ]
 ] )
 [ INHERITS ( <replaceable>parent_table</replaceable> [, ... ] ) ]
@@ -44,23 +43,16 @@ CREATE FOREIGN TABLE [ IF NOT EXISTS ] <replaceable class="parameter">table_name
 <phrase>where <replaceable class="parameter">column_constraint</replaceable> is:</phrase>
 
 [ CONSTRAINT <replaceable class="parameter">constraint_name</replaceable> ]
-{ NOT NULL [ NO INHERIT ] |
+{ NOT NULL |
   NULL |
   CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ] |
   DEFAULT <replaceable>default_expr</replaceable> |
-  GENERATED ALWAYS AS ( <replaceable>generation_expr</replaceable> ) [ STORED | VIRTUAL ] }
-[ ENFORCED | NOT ENFORCED ]
+  GENERATED ALWAYS AS ( <replaceable>generation_expr</replaceable> ) STORED }
 
 <phrase>and <replaceable class="parameter">table_constraint</replaceable> is:</phrase>
 
 [ CONSTRAINT <replaceable class="parameter">constraint_name</replaceable> ]
-{  NOT NULL <replaceable class="parameter">column_name</replaceable> [ NO INHERIT ] |
-   CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ] }
-[ ENFORCED | NOT ENFORCED ]
-
-<phrase>and <replaceable class="parameter">like_option</replaceable> is:</phrase>
-
-{ INCLUDING | EXCLUDING } { COMMENTS | CONSTRAINTS | DEFAULTS | GENERATED | STATISTICS | ALL }
+CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ]
 
 <phrase>and <replaceable class="parameter">partition_bound_spec</replaceable> is:</phrase>
 
@@ -109,12 +101,12 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
   </para>
  </refsect1>
 
- <refsect1 id="sql-createforeigntable-parameters">
+ <refsect1>
   <title>Parameters</title>
 
   <variablelist>
 
-   <varlistentry id="sql-createforeigntable-parms-if-not-exists">
+   <varlistentry>
     <term><literal>IF NOT EXISTS</literal></term>
     <listitem>
      <para>
@@ -126,7 +118,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-table-name">
+   <varlistentry>
     <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
      <para>
@@ -135,7 +127,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-column-name">
+   <varlistentry>
     <term><replaceable class="parameter">column_name</replaceable></term>
     <listitem>
      <para>
@@ -144,7 +136,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-data-type">
+   <varlistentry>
     <term><replaceable class="parameter">data_type</replaceable></term>
     <listitem>
      <para>
@@ -156,7 +148,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-collate">
+   <varlistentry>
     <term><literal>COLLATE <replaceable>collation</replaceable></literal></term>
     <listitem>
      <para>
@@ -167,7 +159,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-inherit">
+   <varlistentry>
     <term><literal>INHERITS ( <replaceable>parent_table</replaceable> [, ... ] )</literal></term>
     <listitem>
      <para>
@@ -180,7 +172,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-partition">
+   <varlistentry>
     <term><literal>PARTITION OF <replaceable>parent_table</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT }</literal></term>
     <listitem>
      <para>
@@ -196,112 +188,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-like">
-    <term><literal>LIKE <replaceable>source_table</replaceable> [ <replaceable>like_option</replaceable> ... ]</literal></term>
-    <listitem>
-     <para>
-      The <literal>LIKE</literal> clause specifies a table from which
-      the new table automatically copies all column names, their data types,
-      and their not-null constraints.
-     </para>
-     <para>
-      Unlike <literal>INHERITS</literal>, the new table and original table
-      are completely decoupled after creation is complete.  Changes to the
-      original table will not be applied to the new table, and it is not
-      possible to include data of the new table in scans of the original
-      table.
-     </para>
-      <para>
-      Also unlike <literal>INHERITS</literal>, columns and
-      constraints copied by <literal>LIKE</literal> are not merged with similarly
-      named columns and constraints.
-      If the same name is specified explicitly or in another
-      <literal>LIKE</literal> clause, an error is signaled.
-     </para>
-     <para>
-      The optional <replaceable>like_option</replaceable> clauses specify
-      which additional properties of the original table to copy.  Specifying
-      <literal>INCLUDING</literal> copies the property, specifying
-      <literal>EXCLUDING</literal> omits the property.
-      <literal>EXCLUDING</literal> is the default.  If multiple specifications
-      are made for the same kind of object, the last one is used.  The
-      available options are:
-
-      <variablelist>
-       <varlistentry id="sql-createforeigntable-parms-like-opt-comments">
-        <term><literal>INCLUDING COMMENTS</literal></term>
-        <listitem>
-         <para>
-          Comments for the copied columns, constraints, and extended statistics
-          will be copied.  The default behavior is to exclude comments,
-          resulting in the corresponding objects in the new table having no
-          comments.
-         </para>
-        </listitem>
-       </varlistentry>
-
-       <varlistentry id="sql-createforeigntable-parms-like-opt-constraints">
-        <term><literal>INCLUDING CONSTRAINTS</literal></term>
-        <listitem>
-         <para>
-          <literal>CHECK</literal> constraints will be copied.  No distinction
-          is made between column constraints and table constraints.  Not-null
-          constraints are always copied to the new table.
-         </para>
-        </listitem>
-       </varlistentry>
-
-       <varlistentry id="sql-createforeigntable-parms-like-opt-default">
-        <term><literal>INCLUDING DEFAULTS</literal></term>
-        <listitem>
-         <para>
-          Default expressions for the copied column definitions will be
-          copied.  Otherwise, default expressions are not copied, resulting in
-          the copied columns in the new table having null defaults.  Note that
-          copying defaults that call database-modification functions, such as
-          <function>nextval</function>, may create a functional linkage
-          between the original and new tables.
-         </para>
-        </listitem>
-       </varlistentry>
-
-       <varlistentry id="sql-createforeigntable-parms-like-opt-generated">
-        <term><literal>INCLUDING GENERATED</literal></term>
-        <listitem>
-         <para>
-          Any generation expressions of copied column definitions will be
-          copied.  By default, new columns will be regular base columns.
-         </para>
-        </listitem>
-       </varlistentry>
-
-       <varlistentry id="sql-createforeigntable-parms-like-opt-statistics">
-        <term><literal>INCLUDING STATISTICS</literal></term>
-        <listitem>
-         <para>
-          Extended statistics are copied to the new table.
-         </para>
-        </listitem>
-       </varlistentry>
-
-       <varlistentry id="sql-createforeigntable-parms-like-opt-all">
-        <term><literal>INCLUDING ALL</literal></term>
-        <listitem>
-         <para>
-          <literal>INCLUDING ALL</literal> is an abbreviated form selecting
-          all the available individual options.  (It could be useful to write
-          individual <literal>EXCLUDING</literal> clauses after
-          <literal>INCLUDING ALL</literal> to select all but some specific
-          options.)
-         </para>
-        </listitem>
-       </varlistentry>
-      </variablelist>
-     </para>
-    </listitem>
-   </varlistentry>
-
-   <varlistentry id="sql-createforeigntable-parms-constraint">
+   <varlistentry>
     <term><literal>CONSTRAINT <replaceable class="parameter">constraint_name</replaceable></literal></term>
     <listitem>
      <para>
@@ -315,21 +202,16 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-not-null">
-    <term><literal>NOT NULL</literal> [ NO INHERIT ]</term>
+   <varlistentry>
+    <term><literal>NOT NULL</literal></term>
     <listitem>
      <para>
       The column is not allowed to contain null values.
      </para>
-
-     <para>
-      A constraint marked with <literal>NO INHERIT</literal> will not propagate to
-      child tables.
-     </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-null">
+   <varlistentry>
     <term><literal>NULL</literal></term>
     <listitem>
      <para>
@@ -344,7 +226,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-check">
+   <varlistentry>
     <term><literal>CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ] </literal></term>
     <listitem>
      <para>
@@ -360,7 +242,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      <para>
       Currently, <literal>CHECK</literal> expressions cannot contain
       subqueries nor refer to variables other than columns of the
-      current row.  The system column <structfield>tableoid</structfield>
+      current row.  The system column <literal>tableoid</literal>
       may be referenced, but not any other system column.
      </para>
 
@@ -371,7 +253,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-default">
+   <varlistentry>
     <term><literal>DEFAULT
     <replaceable>default_expr</replaceable></literal></term>
     <listitem>
@@ -392,8 +274,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-generated-stored">
-    <term><literal>GENERATED ALWAYS AS ( <replaceable>generation_expr</replaceable> ) [ STORED | VIRTUAL ]</literal><indexterm><primary>generated column</primary></indexterm></term>
+   <varlistentry>
+    <term><literal>GENERATED ALWAYS AS ( <replaceable>generation_expr</replaceable> ) STORED</literal><indexterm><primary>generated column</primary></indexterm></term>
     <listitem>
      <para>
       This clause creates the column as a <firstterm>generated
@@ -402,13 +284,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
-      When <literal>VIRTUAL</literal> is specified, the column will be
-      computed when it is read.  (The foreign-data wrapper will see it as a
-      null value in new rows and may choose to store it as a null value or
-      ignore it altogether.)  When <literal>STORED</literal> is specified, the
+      The keyword <literal>STORED</literal> is required to signify that the
       column will be computed on write.  (The computed value will be presented
       to the foreign-data wrapper for storage and must be returned on
-      reading.)  <literal>VIRTUAL</literal> is the default.
+      reading.)
      </para>
 
      <para>
@@ -419,7 +298,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-server">
+   <varlistentry>
     <term><replaceable class="parameter">server_name</replaceable></term>
     <listitem>
      <para>
@@ -430,7 +309,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry id="sql-createforeigntable-parms-option">
+   <varlistentry>
     <term><literal>OPTIONS ( <replaceable class="parameter">option</replaceable> '<replaceable class="parameter">value</replaceable>' [, ...] )</literal></term>
     <listitem>
      <para>
@@ -448,7 +327,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
  </refsect1>
 
- <refsect1 id="sql-createforeigntable-notes">
+ <refsect1>
   <title>Notes</title>
 
    <para>
@@ -558,8 +437,6 @@ CREATE FOREIGN TABLE measurement_y2016m07
    The ability to specify column default values is also
    a <productname>PostgreSQL</productname> extension.  Table inheritance, in the form
    defined by <productname>PostgreSQL</productname>, is nonstandard.
-   The <literal>LIKE</literal> clause, as supported in this command, is
-   nonstandard.
   </para>
 
  </refsect1>

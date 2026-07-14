@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-GRANT { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN }
+GRANT { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER }
     [, ...] | ALL [ PRIVILEGES ] }
     ON { [ TABLE ] <replaceable class="parameter">table_name</replaceable> [, ...]
          | ALL TABLES IN SCHEMA <replaceable class="parameter">schema_name</replaceable> [, ...] }
@@ -82,11 +82,6 @@ GRANT { { SET | ALTER SYSTEM } [, ... ] | ALL [ PRIVILEGES ] }
     TO <replaceable class="parameter">role_specification</replaceable> [, ...] [ WITH GRANT OPTION ]
     [ GRANTED BY <replaceable class="parameter">role_specification</replaceable> ]
 
-GRANT { SELECT | ALL [ PRIVILEGES ] }
-    ON PROPERTY GRAPH <replaceable>graph_name</replaceable> [, ...]
-    TO <replaceable class="parameter">role_specification</replaceable> [, ...] [ WITH GRANT OPTION ]
-    [ GRANTED BY <replaceable class="parameter">role_specification</replaceable> ]
-
 GRANT { { CREATE | USAGE } [, ...] | ALL [ PRIVILEGES ] }
     ON SCHEMA <replaceable>schema_name</replaceable> [, ...]
     TO <replaceable class="parameter">role_specification</replaceable> [, ...] [ WITH GRANT OPTION ]
@@ -124,7 +119,7 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
    that grants privileges on a database object (table, column, view,
    foreign table, sequence, database, foreign-data wrapper, foreign server,
    function, procedure, procedural language, large object, configuration
-   parameter, property graph, schema, tablespace, or type), and one that grants
+   parameter, schema, tablespace, or type), and one that grants
    membership in a role.  These variants are similar in many ways, but
    they are different enough to be described separately.
   </para>
@@ -158,9 +153,9 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
   </para>
 
   <para>
-   If <literal>GRANTED BY</literal> is specified, the grant is recorded as
-   having been done by the specified role.  A role can only attribute a grant
-   to another role if it inherits the privileges of that role.
+   If <literal>GRANTED BY</literal> is specified, the specified grantor must
+   be the current user.  This clause is currently present in this form only
+   for SQL compatibility.
   </para>
 
   <para>
@@ -198,7 +193,6 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
      <term><literal>USAGE</literal></term>
      <term><literal>SET</literal></term>
      <term><literal>ALTER SYSTEM</literal></term>
-     <term><literal>MAINTAIN</literal></term>
      <listitem>
       <para>
        Specific types of privileges, as defined in <xref linkend="ddl-priv"/>.
@@ -325,7 +319,7 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
   <para>
    If <literal>GRANTED BY</literal> is specified, the grant is recorded as
    having been done by the specified role. A user can only attribute a grant
-   to another role if it inherits the privileges of that role. The role
+   to another role if they possess the privileges of that role. The role
    recorded as the grantor must have <literal>ADMIN OPTION</literal> on the
    target role, unless it is the bootstrap superuser. When a grant is recorded
    as having a grantor other than the bootstrap superuser, it depends on the
@@ -439,7 +433,7 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
   <title>Examples</title>
 
   <para>
-   Grant insert privilege to all users on table <structname>films</structname>:
+   Grant insert privilege to all users on table <literal>films</literal>:
 
 <programlisting>
 GRANT INSERT ON films TO PUBLIC;
@@ -448,14 +442,14 @@ GRANT INSERT ON films TO PUBLIC;
 
   <para>
    Grant all available privileges to user <literal>manuel</literal> on view
-   <structname>kinds</structname>:
+   <literal>kinds</literal>:
 
 <programlisting>
 GRANT ALL PRIVILEGES ON kinds TO manuel;
 </programlisting>
 
    Note that while the above will indeed grant all privileges if executed by a
-   superuser or the owner of <structname>kinds</structname>, when executed by someone
+   superuser or the owner of <literal>kinds</literal>, when executed by someone
    else it will only grant those permissions for which the someone else has
    grant options.
   </para>

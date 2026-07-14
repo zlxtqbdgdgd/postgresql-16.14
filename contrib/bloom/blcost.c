@@ -3,7 +3,7 @@
  * blcost.c
  *		Cost estimate function for bloom indexes.
  *
- * Copyright (c) 2016-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blcost.c
@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "bloom.h"
+#include "fmgr.h"
 #include "utils/selfuncs.h"
 
 /*
@@ -29,9 +30,6 @@ blcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	/* We have to visit all index tuples anyway */
 	costs.numIndexTuples = index->tuples;
-
-	/* As in btcostestimate, count only the metapage as non-leaf */
-	costs.numNonLeafPages = 1;
 
 	/* Use generic estimate */
 	genericcostestimate(root, path, loop_count, &costs);

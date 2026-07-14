@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -20,10 +20,7 @@ $node->command_fails(['pg_isready'], 'fails with no server running');
 $node->start;
 
 $node->command_ok(
-	[
-		'pg_isready',
-		'--timeout' => $PostgreSQL::Test::Utils::timeout_default,
-	],
+	[ 'pg_isready', "--timeout=$PostgreSQL::Test::Utils::timeout_default" ],
 	'succeeds with server running');
 
 done_testing();

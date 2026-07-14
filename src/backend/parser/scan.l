@@ -22,7 +22,7 @@
  * Postgres 9.2, this check is made automatically by the Makefile.)
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -60,13 +60,14 @@ fprintf_to_ereport(const char *fmt, const char *msg)
 }
 
 /*
- * GUC variable.  This is a DIRECT violation of the warning given at the
+ * GUC variables.  This is a DIRECT violation of the warning given at the
  * head of gram.y, ie flex/bison code must not depend on any GUC variables;
- * as such, changing its value can induce very unintuitive behavior.
- * In practice, backslash_quote is not too awful since it only controls
- * whether to throw an error: it cannot change non-error results.
+ * as such, changing their values can induce very unintuitive behavior.
+ * But we shall have to live with it until we can remove these variables.
  */
 int			backslash_quote = BACKSLASH_QUOTE_SAFE_ENCODING;
+bool		escape_string_warning = true;
+bool		standard_conforming_strings = true;
 
 /*
  * Constant data exported from this file.  This array maps from the
@@ -87,6 +88,12 @@ const uint16 ScanKeywordTokens[] = {
  * Set the type of YYSTYPE.
  */
 #define YYSTYPE core_YYSTYPE
+
+/*
+ * Set the type of yyextra.  All state variables used by the scanner should
+ * be in yyextra, *not* statically allocated.
+ */
+#define YY_EXTRA_TYPE core_yy_extra_type *
 
 /*
  * Each call to yylex must set yylloc to the location of the found token
@@ -120,11 +127,23 @@ static void addlitchar(unsigned char ychar, core_yyscan_t yyscanner);
 static char *litbufdup(core_yyscan_t yyscanner);
 static unsigned char unescape_single_char(unsigned char c, core_yyscan_t yyscanner);
 static int	process_integer_literal(const char *token, YYSTYPE *lval, int base);
-static void addunicode(char32_t c, yyscan_t yyscanner);
+static void addunicode(pg_wchar c, yyscan_t yyscanner);
 
 #define yyerror(msg)  scanner_yyerror(msg, yyscanner)
 
 #define lexer_errposition()  scanner_errposition(*(yylloc), yyscanner)
+
+static void check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner);
+static void check_escape_warning(core_yyscan_t yyscanner);
+
+/*
+ * Work around a bug in flex 2.5.35: it emits a couple of functions that
+ * it forgets to emit declarations for.  Since we use -Wmissing-prototypes,
+ * this would cause warnings.  Providing our own declarations should be
+ * harmless even when the bug gets fixed.
+ */
+extern int	core_yyget_column(yyscan_t yyscanner);
+extern void core_yyset_column(int column_no, yyscan_t yyscanner);
 
 %}
 
@@ -142,7 +161,6 @@ static void addunicode(char32_t c, yyscan_t yyscanner);
 %option noyyfree
 %option warn
 %option prefix="core_yy"
-%option extra-type="core_yy_extra_type *"
 
 /*
  * OK, here is a short description of lex/flex rules behavior.
@@ -195,16 +213,16 @@ static void addunicode(char32_t c, yyscan_t yyscanner);
  * versions of Postgres failed to recognize -- as a comment if the input
  * did not end with a newline.
  *
- * non_newline_space tracks all the other space characters except newlines.
+ * XXX perhaps \f (formfeed) should be treated as a newline as well?
  *
  * XXX if you change the set of whitespace characters, fix scanner_isspace()
  * to agree.
  */
 
-space				[ \t\n\r\f\v]
-non_newline_space	[ \t\f\v]
-newline				[\n\r]
-non_newline			[^\n\r]
+space			[ \t\n\r\f]
+horiz_space		[ \t\f]
+newline			[\n\r]
+non_newline		[^\n\r]
 
 comment			("--"{non_newline}*)
 
@@ -218,8 +236,8 @@ whitespace		({space}+|{comment})
  */
 
 special_whitespace		({space}+|{comment}{newline})
-non_newline_whitespace	({non_newline_space}|{comment})
-whitespace_with_newline	({non_newline_whitespace}*{newline}{special_whitespace}*)
+horiz_whitespace		({horiz_space}|{comment})
+whitespace_with_newline	({horiz_whitespace}*{newline}{special_whitespace}*)
 
 quote			'
 /* If we see {quote} then {quotecontinue}, the quoted string continues */
@@ -348,8 +366,6 @@ less_equals		"<="
 greater_equals	">="
 less_greater	"<>"
 not_equals		"!="
-/* Note there is no need for left_arrow, since "<-" is not a single operator. */
-right_arrow		"->"
 
 /*
  * "self" is the set of chars that should be returned as single-character
@@ -361,7 +377,7 @@ right_arrow		"->"
  * If you change either set, adjust the character lists appearing in the
  * rule for "operator"!
  */
-self			[,()\[\].;\:\|\+\-\*\/\%\^\<\>\=]
+self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
 op_chars		[\~\!\@\#\^\&\|\`\?\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
 
@@ -541,12 +557,17 @@ other			.
 				}
 
 {xqstart}		{
+					yyextra->warn_on_first_escape = true;
 					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
-					BEGIN(xq);
+					if (yyextra->standard_conforming_strings)
+						BEGIN(xq);
+					else
+						BEGIN(xe);
 					startlit();
 				}
 {xestart}		{
+					yyextra->warn_on_first_escape = false;
 					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
 					BEGIN(xe);
@@ -554,6 +575,12 @@ other			.
 				}
 {xusstart}		{
 					SET_YYLLOC();
+					if (!yyextra->standard_conforming_strings)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("unsafe use of string constant with Unicode escapes"),
+								 errdetail("String constants with Unicode escapes cannot be used when standard_conforming_strings is off."),
+								 lexer_errposition()));
 					BEGIN(xus);
 					startlit();
 				}
@@ -627,7 +654,14 @@ other			.
 					addlit(yytext, yyleng, yyscanner);
 				}
 <xe>{xeunicode} {
-					char32_t	c = strtoul(yytext + 2, NULL, 16);
+					pg_wchar	c = strtoul(yytext + 2, NULL, 16);
+
+					/*
+					 * For consistency with other productions, issue any
+					 * escape warning with cursor pointing to start of string.
+					 * We might want to change that, someday.
+					 */
+					check_escape_warning(yyscanner);
 
 					/* Remember start of overall string token ... */
 					PUSH_YYLLOC();
@@ -648,7 +682,7 @@ other			.
 					POP_YYLLOC();
 				}
 <xeu>{xeunicode} {
-					char32_t	c = strtoul(yytext + 2, NULL, 16);
+					pg_wchar	c = strtoul(yytext + 2, NULL, 16);
 
 					/* Remember start of overall string token ... */
 					PUSH_YYLLOC();
@@ -695,12 +729,14 @@ other			.
 									 errhint("Use '' to write quotes in strings. \\' is insecure in client-only encodings."),
 									 lexer_errposition()));
 					}
+					check_string_escape_warning(yytext[1], yyscanner);
 					addlitchar(unescape_single_char(yytext[1], yyscanner),
 							   yyscanner);
 				}
 <xe>{xeoctesc}  {
 					unsigned char c = strtoul(yytext + 1, NULL, 8);
 
+					check_escape_warning(yyscanner);
 					addlitchar(c, yyscanner);
 					if (c == '\0' || IS_HIGHBIT_SET(c))
 						yyextra->saw_non_ascii = true;
@@ -708,6 +744,7 @@ other			.
 <xe>{xehexesc}  {
 					unsigned char c = strtoul(yytext + 2, NULL, 16);
 
+					check_escape_warning(yyscanner);
 					addlitchar(c, yyscanner);
 					if (c == '\0' || IS_HIGHBIT_SET(c))
 						yyextra->saw_non_ascii = true;
@@ -855,11 +892,6 @@ other			.
 					return NOT_EQUALS;
 				}
 
-{right_arrow}	{
-					SET_YYLLOC();
-					return RIGHT_ARROW;
-				}
-
 {self}			{
 					SET_YYLLOC();
 					return yytext[0];
@@ -937,7 +969,7 @@ other			.
 						 * that the "self" rule would have.
 						 */
 						if (nchars == 1 &&
-							strchr(",()[].;:|+-*/%^<>=", yytext[0]))
+							strchr(",()[].;:+-*/%^<>=", yytext[0]))
 							return yytext[0];
 						/*
 						 * Likewise, if what we have left is two chars, and
@@ -957,8 +989,6 @@ other			.
 								return NOT_EQUALS;
 							if (yytext[0] == '!' && yytext[1] == '=')
 								return NOT_EQUALS;
-							if (yytext[0] == '-' && yytext[1] == '>')
-								return RIGHT_ARROW;
 						}
 					}
 
@@ -976,14 +1006,8 @@ other			.
 				}
 
 {param}			{
-					ErrorSaveContext escontext = {T_ErrorSaveContext};
-					int32		val;
-
 					SET_YYLLOC();
-					val = pg_strtoint32_safe(yytext + 1, (Node *) &escontext);
-					if (escontext.error_occurred)
-						yyerror("parameter number too large");
-					yylval->ival = val;
+					yylval->ival = atol(yytext + 1);
 					return PARAM;
 				}
 {param_junk}	{
@@ -1175,7 +1199,7 @@ setup_scanner_errposition_callback(ScannerCallbackState *scbstate,
 	scbstate->yyscanner = yyscanner;
 	scbstate->location = location;
 	scbstate->errcallback.callback = scb_error_callback;
-	scbstate->errcallback.arg = scbstate;
+	scbstate->errcallback.arg = (void *) scbstate;
 	scbstate->errcallback.previous = error_context_stack;
 	error_context_stack = &scbstate->errcallback;
 }
@@ -1247,6 +1271,8 @@ scanner_init(const char *str,
 	yyext->keyword_tokens = keyword_tokens;
 
 	yyext->backslash_quote = backslash_quote;
+	yyext->escape_string_warning = escape_string_warning;
+	yyext->standard_conforming_strings = standard_conforming_strings;
 
 	/*
 	 * Make a scan buffer with special termination needed by flex.
@@ -1358,7 +1384,7 @@ process_integer_literal(const char *token, YYSTYPE *lval, int base)
 }
 
 static void
-addunicode(char32_t c, core_yyscan_t yyscanner)
+addunicode(pg_wchar c, core_yyscan_t yyscanner)
 {
 	ScannerCallbackState scbstate;
 	char		buf[MAX_UNICODE_EQUIVALENT_STRING + 1];
@@ -1391,8 +1417,6 @@ unescape_single_char(unsigned char c, core_yyscan_t yyscanner)
 			return '\r';
 		case 't':
 			return '\t';
-		case 'v':
-			return '\v';
 		default:
 			/* check for backslash followed by non-7-bit-ASCII */
 			if (c == '\0' || IS_HIGHBIT_SET(c))
@@ -1400,6 +1424,45 @@ unescape_single_char(unsigned char c, core_yyscan_t yyscanner)
 
 			return c;
 	}
+}
+
+static void
+check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner)
+{
+	if (ychar == '\'')
+	{
+		if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
+			ereport(WARNING,
+					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
+					 errmsg("nonstandard use of \\' in a string literal"),
+					 errhint("Use '' to write quotes in strings, or use the escape string syntax (E'...')."),
+					 lexer_errposition()));
+		yyextra->warn_on_first_escape = false;	/* warn only once per string */
+	}
+	else if (ychar == '\\')
+	{
+		if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
+			ereport(WARNING,
+					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
+					 errmsg("nonstandard use of \\\\ in a string literal"),
+					 errhint("Use the escape string syntax for backslashes, e.g., E'\\\\'."),
+					 lexer_errposition()));
+		yyextra->warn_on_first_escape = false;	/* warn only once per string */
+	}
+	else
+		check_escape_warning(yyscanner);
+}
+
+static void
+check_escape_warning(core_yyscan_t yyscanner)
+{
+	if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
+		ereport(WARNING,
+				(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
+				 errmsg("nonstandard use of escape in a string literal"),
+		errhint("Use the escape string syntax for escapes, e.g., E'\\r\\n'."),
+				 lexer_errposition()));
+	yyextra->warn_on_first_escape = false;		/* warn only once per string */
 }
 
 /*

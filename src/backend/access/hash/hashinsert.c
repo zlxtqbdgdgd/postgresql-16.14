@@ -3,7 +3,7 @@
  * hashinsert.c
  *	  Item insertion in hash tables for Postgres.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,8 @@
 #include "access/hash_xlog.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
+#include "storage/buf_internals.h"
+#include "storage/lwlock.h"
 #include "storage/predicate.h"
 #include "utils/rel.h"
 
@@ -50,7 +52,6 @@ _hash_doinsert(Relation rel, IndexTuple itup, Relation heapRel, bool sorted)
 	uint32		hashkey;
 	Bucket		bucket;
 	OffsetNumber itup_off;
-	XLogRecPtr	recptr;
 
 	/*
 	 * Get the hash key for the item (it's stored in the index tuple itself).
@@ -217,24 +218,23 @@ restart_insert:
 	if (RelationNeedsWAL(rel))
 	{
 		xl_hash_insert xlrec;
+		XLogRecPtr	recptr;
 
 		xlrec.offnum = itup_off;
 
 		XLogBeginInsert();
-		XLogRegisterData(&xlrec, SizeOfHashInsert);
+		XLogRegisterData((char *) &xlrec, SizeOfHashInsert);
 
 		XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);
 
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterBufData(0, itup, IndexTupleSize(itup));
+		XLogRegisterBufData(0, (char *) itup, IndexTupleSize(itup));
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_INSERT);
-	}
-	else
-		recptr = XLogGetFakeLSN(rel);
 
-	PageSetLSN(BufferGetPage(buf), recptr);
-	PageSetLSN(BufferGetPage(metabuf), recptr);
+		PageSetLSN(BufferGetPage(buf), recptr);
+		PageSetLSN(BufferGetPage(metabuf), recptr);
+	}
 
 	END_CRIT_SECTION();
 
@@ -312,8 +312,10 @@ _hash_pgaddtup(Relation rel, Buffer buf, Size itemsize, IndexTuple itup,
 		itup_off = _hash_binsearch(page, hashkey);
 	}
 
-	if (PageAddItem(page, itup, itemsize, itup_off, false, false) == InvalidOffsetNumber)
-		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(rel));
+	if (PageAddItem(page, (Item) itup, itemsize, itup_off, false, false)
+		== InvalidOffsetNumber)
+		elog(ERROR, "failed to add index item to \"%s\"",
+			 RelationGetRelationName(rel));
 
 	return itup_off;
 }
@@ -352,8 +354,10 @@ _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 
 		itup_offsets[i] = itup_off;
 
-		if (PageAddItem(page, itups[i], itemsize, itup_off, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(rel));
+		if (PageAddItem(page, (Item) itups[i], itemsize, itup_off, false, false)
+			== InvalidOffsetNumber)
+			elog(ERROR, "failed to add index item to \"%s\"",
+				 RelationGetRelationName(rel));
 	}
 }
 
@@ -374,7 +378,6 @@ _hash_vacuum_one_page(Relation rel, Relation hrel, Buffer metabuf, Buffer buf)
 	Page		page = BufferGetPage(buf);
 	HashPageOpaque pageopaque;
 	HashMetaPage metap;
-	XLogRecPtr	recptr;
 
 	/* Scan each tuple in page to see if it is marked as LP_DEAD */
 	maxoff = PageGetMaxOffsetNumber(page);
@@ -427,6 +430,7 @@ _hash_vacuum_one_page(Relation rel, Relation hrel, Buffer metabuf, Buffer buf)
 		if (RelationNeedsWAL(rel))
 		{
 			xl_hash_vacuum_one_page xlrec;
+			XLogRecPtr	recptr;
 
 			xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(hrel);
 			xlrec.snapshotConflictHorizon = snapshotConflictHorizon;
@@ -434,25 +438,23 @@ _hash_vacuum_one_page(Relation rel, Relation hrel, Buffer metabuf, Buffer buf)
 
 			XLogBeginInsert();
 			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-			XLogRegisterData(&xlrec, SizeOfHashVacuumOnePage);
+			XLogRegisterData((char *) &xlrec, SizeOfHashVacuumOnePage);
 
 			/*
 			 * We need the target-offsets array whether or not we store the
 			 * whole buffer, to allow us to find the snapshotConflictHorizon
 			 * on a standby server.
 			 */
-			XLogRegisterData(deletable,
+			XLogRegisterData((char *) deletable,
 							 ndeletable * sizeof(OffsetNumber));
 
 			XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);
 
 			recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_VACUUM_ONE_PAGE);
-		}
-		else
-			recptr = XLogGetFakeLSN(rel);
 
-		PageSetLSN(BufferGetPage(buf), recptr);
-		PageSetLSN(BufferGetPage(metabuf), recptr);
+			PageSetLSN(BufferGetPage(buf), recptr);
+			PageSetLSN(BufferGetPage(metabuf), recptr);
+		}
 
 		END_CRIT_SECTION();
 

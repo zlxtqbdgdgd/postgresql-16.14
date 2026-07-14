@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_database.c
@@ -17,9 +17,9 @@
 
 #include "postgres.h"
 
-#include "storage/standby.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
+#include "storage/procsignal.h"
 
 
 static bool pgstat_should_report_connstat(void);
@@ -88,41 +88,31 @@ pgstat_report_recovery_conflict(int reason)
 
 	dbentry = pgstat_prep_database_pending(MyDatabaseId);
 
-	switch ((RecoveryConflictReason) reason)
+	switch (reason)
 	{
-		case RECOVERY_CONFLICT_DATABASE:
+		case PROCSIG_RECOVERY_CONFLICT_DATABASE:
 
 			/*
 			 * Since we drop the information about the database as soon as it
 			 * replicates, there is no point in counting these conflicts.
 			 */
 			break;
-		case RECOVERY_CONFLICT_TABLESPACE:
+		case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
 			dbentry->conflict_tablespace++;
 			break;
-		case RECOVERY_CONFLICT_LOCK:
+		case PROCSIG_RECOVERY_CONFLICT_LOCK:
 			dbentry->conflict_lock++;
 			break;
-		case RECOVERY_CONFLICT_SNAPSHOT:
+		case PROCSIG_RECOVERY_CONFLICT_SNAPSHOT:
 			dbentry->conflict_snapshot++;
 			break;
-		case RECOVERY_CONFLICT_BUFFERPIN:
+		case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
 			dbentry->conflict_bufferpin++;
 			break;
-		case RECOVERY_CONFLICT_LOGICALSLOT:
+		case PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT:
 			dbentry->conflict_logicalslot++;
 			break;
-		case RECOVERY_CONFLICT_STARTUP_DEADLOCK:
-			dbentry->conflict_startup_deadlock++;
-			break;
-		case RECOVERY_CONFLICT_BUFFERPIN_DEADLOCK:
-
-			/*
-			 * The difference between RECOVERY_CONFLICT_STARTUP_DEADLOCK and
-			 * RECOVERY_CONFLICT_BUFFERPIN_DEADLOCK is merely whether a buffer
-			 * pin was part of the deadlock. We use the same counter for both
-			 * reasons.
-			 */
+		case PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK:
 			dbentry->conflict_startup_deadlock++;
 			break;
 	}
@@ -144,33 +134,7 @@ pgstat_report_deadlock(void)
 }
 
 /*
- * Allow this backend to later report checksum failures for dboid, even if in
- * a critical section at the time of the report.
- *
- * Without this function having been called first, the backend might need to
- * allocate an EntryRef or might need to map in DSM segments. Neither should
- * happen in a critical section.
- */
-void
-pgstat_prepare_report_checksum_failure(Oid dboid)
-{
-	Assert(!CritSectionCount);
-
-	/*
-	 * Just need to ensure this backend has an entry ref for the database.
-	 * That will allows us to report checksum failures without e.g. needing to
-	 * map in DSM segments.
-	 */
-	pgstat_get_entry_ref(PGSTAT_KIND_DATABASE, dboid, InvalidOid,
-						 true, NULL);
-}
-
-/*
  * Report one or more checksum failures.
- *
- * To be allowed to report checksum failures in critical sections, we require
- * pgstat_prepare_report_checksum_failure() to have been called before this
- * function is called.
  */
 void
 pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
@@ -183,35 +147,25 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 
 	/*
 	 * Update the shared stats directly - checksum failures should never be
-	 * common enough for that to be a problem. Note that we pass create=false
-	 * here, as we want to be sure to not require memory allocations, so this
-	 * can be called in critical sections.
+	 * common enough for that to be a problem.
 	 */
-	entry_ref = pgstat_get_entry_ref(PGSTAT_KIND_DATABASE, dboid, InvalidOid,
-									 false, NULL);
-
-	/*
-	 * Should always have been created by
-	 * pgstat_prepare_report_checksum_failure().
-	 *
-	 * When not using assertions, we don't want to crash should something have
-	 * gone wrong, so just return.
-	 */
-	Assert(entry_ref);
-	if (!entry_ref)
-	{
-		elog(WARNING, "could not report %d checksum failures for database %u",
-			 failurecount, dboid);
-		return;
-	}
-
-	(void) pgstat_lock_entry(entry_ref, false);
+	entry_ref =
+		pgstat_get_entry_ref_locked(PGSTAT_KIND_DATABASE, dboid, InvalidOid, false);
 
 	sharedent = (PgStatShared_Database *) entry_ref->shared_stats;
 	sharedent->stats.checksum_failures += failurecount;
 	sharedent->stats.last_checksum_failure = GetCurrentTimestamp();
 
 	pgstat_unlock_entry(entry_ref);
+}
+
+/*
+ * Report one checksum failure in the current database.
+ */
+void
+pgstat_report_checksum_failure(void)
+{
+	pgstat_report_checksum_failures_in_db(MyDatabaseId, 1);
 }
 
 /*
@@ -288,7 +242,7 @@ PgStat_StatDBEntry *
 pgstat_fetch_stat_dbentry(Oid dboid)
 {
 	return (PgStat_StatDBEntry *)
-		pgstat_fetch_entry(PGSTAT_KIND_DATABASE, dboid, InvalidOid, NULL);
+		pgstat_fetch_entry(PGSTAT_KIND_DATABASE, dboid, InvalidOid);
 }
 
 void
@@ -306,23 +260,6 @@ AtEOXact_PgStat_Database(bool isCommit, bool parallel)
 		else
 			pgStatXactRollback++;
 	}
-}
-
-/*
- * Notify the stats system about parallel worker information.
- */
-void
-pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
-									 PgStat_Counter workers_launched)
-{
-	PgStat_StatDBEntry *dbentry;
-
-	if (!OidIsValid(MyDatabaseId))
-		return;
-
-	dbentry = pgstat_prep_database_pending(MyDatabaseId);
-	dbentry->parallel_workers_to_launch += workers_to_launch;
-	dbentry->parallel_workers_launched += workers_launched;
 }
 
 /*
@@ -488,8 +425,6 @@ pgstat_database_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	PGSTAT_ACCUM_DBCOUNT(sessions_abandoned);
 	PGSTAT_ACCUM_DBCOUNT(sessions_fatal);
 	PGSTAT_ACCUM_DBCOUNT(sessions_killed);
-	PGSTAT_ACCUM_DBCOUNT(parallel_workers_to_launch);
-	PGSTAT_ACCUM_DBCOUNT(parallel_workers_launched);
 #undef PGSTAT_ACCUM_DBCOUNT
 
 	pgstat_unlock_entry(entry_ref);

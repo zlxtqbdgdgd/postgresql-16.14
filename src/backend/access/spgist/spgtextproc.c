@@ -29,7 +29,7 @@
  * No new entries ever get pushed into a -2-labeled child, either.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -41,10 +41,9 @@
 
 #include "access/spgist.h"
 #include "catalog/pg_type.h"
-#include "common/int.h"
 #include "mb/pg_wchar.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
-#include "utils/fmgrprotos.h"
 #include "utils/pg_locale.h"
 #include "utils/varlena.h"
 #include "varatt.h"
@@ -95,9 +94,7 @@ typedef struct spgNodePtr
 Datum
 spg_text_config(PG_FUNCTION_ARGS)
 {
-#ifdef NOT_USED
-	spgConfigIn *cfgin = (spgConfigIn *) PG_GETARG_POINTER(0);
-#endif
+	/* spgConfigIn *cfgin = (spgConfigIn *) PG_GETARG_POINTER(0); */
 	spgConfigOut *cfg = (spgConfigOut *) PG_GETARG_POINTER(1);
 
 	cfg->prefixType = TEXTOID;
@@ -157,7 +154,7 @@ commonPrefix(const char *a, const char *b, int lena, int lenb)
  * On success, *i gets the match location; on failure, it gets where to insert
  */
 static bool
-searchChar(const Datum *nodeLabels, int nNodes, int16 c, int *i)
+searchChar(Datum *nodeLabels, int nNodes, int16 c, int *i)
 {
 	int			StopLow = 0,
 				StopHigh = nNodes;
@@ -232,7 +229,8 @@ spg_text_choose(PG_FUNCTION_ARGS)
 					formTextDatum(prefixStr, commonLen);
 			}
 			out->result.splitTuple.prefixNNodes = 1;
-			out->result.splitTuple.prefixNodeLabels = palloc_object(Datum);
+			out->result.splitTuple.prefixNodeLabels =
+				(Datum *) palloc(sizeof(Datum));
 			out->result.splitTuple.prefixNodeLabels[0] =
 				Int16GetDatum(*(unsigned char *) (prefixStr + commonLen));
 
@@ -304,7 +302,7 @@ spg_text_choose(PG_FUNCTION_ARGS)
 		out->result.splitTuple.prefixHasPrefix = in->hasPrefix;
 		out->result.splitTuple.prefixPrefixDatum = in->prefixDatum;
 		out->result.splitTuple.prefixNNodes = 1;
-		out->result.splitTuple.prefixNodeLabels = palloc_object(Datum);
+		out->result.splitTuple.prefixNodeLabels = (Datum *) palloc(sizeof(Datum));
 		out->result.splitTuple.prefixNodeLabels[0] = Int16GetDatum(-2);
 		out->result.splitTuple.childNodeN = 0;
 		out->result.splitTuple.postfixHasPrefix = false;
@@ -327,7 +325,7 @@ cmpNodePtr(const void *a, const void *b)
 	const spgNodePtr *aa = (const spgNodePtr *) a;
 	const spgNodePtr *bb = (const spgNodePtr *) b;
 
-	return pg_cmp_s16(aa->c, bb->c);
+	return aa->c - bb->c;
 }
 
 Datum
@@ -372,7 +370,7 @@ spg_text_picksplit(PG_FUNCTION_ARGS)
 	}
 
 	/* Extract the node label (first non-common byte) from each value */
-	nodes = palloc_array(spgNodePtr, in->nTuples);
+	nodes = (spgNodePtr *) palloc(sizeof(spgNodePtr) * in->nTuples);
 
 	for (i = 0; i < in->nTuples; i++)
 	{
@@ -395,9 +393,9 @@ spg_text_picksplit(PG_FUNCTION_ARGS)
 
 	/* And emit results */
 	out->nNodes = 0;
-	out->nodeLabels = palloc_array(Datum, in->nTuples);
-	out->mapTuplesToNodes = palloc_array(int, in->nTuples);
-	out->leafTupleDatums = palloc_array(Datum, in->nTuples);
+	out->nodeLabels = (Datum *) palloc(sizeof(Datum) * in->nTuples);
+	out->mapTuplesToNodes = (int *) palloc(sizeof(int) * in->nTuples);
+	out->leafTupleDatums = (Datum *) palloc(sizeof(Datum) * in->nTuples);
 
 	for (i = 0; i < in->nTuples; i++)
 	{
@@ -428,7 +426,7 @@ spg_text_inner_consistent(PG_FUNCTION_ARGS)
 {
 	spgInnerConsistentIn *in = (spgInnerConsistentIn *) PG_GETARG_POINTER(0);
 	spgInnerConsistentOut *out = (spgInnerConsistentOut *) PG_GETARG_POINTER(1);
-	bool		collate_is_c = pg_newlocale_from_collation(PG_GET_COLLATION())->collate_is_c;
+	bool		collate_is_c = lc_collate_is_c(PG_GET_COLLATION());
 	text	   *reconstructedValue;
 	text	   *reconstrText;
 	int			maxReconstrLen;
@@ -477,9 +475,9 @@ spg_text_inner_consistent(PG_FUNCTION_ARGS)
 	 * and see if it's consistent with the query.  If so, emit an entry into
 	 * the output arrays.
 	 */
-	out->nodeNumbers = palloc_array(int, in->nNodes);
-	out->levelAdds = palloc_array(int, in->nNodes);
-	out->reconstructedValues = palloc_array(Datum, in->nNodes);
+	out->nodeNumbers = (int *) palloc(sizeof(int) * in->nNodes);
+	out->levelAdds = (int *) palloc(sizeof(int) * in->nNodes);
+	out->reconstructedValues = (Datum *) palloc(sizeof(Datum) * in->nNodes);
 	out->nNodes = 0;
 
 	for (i = 0; i < in->nNodes; i++)

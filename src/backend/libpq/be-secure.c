@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,10 +29,11 @@
 
 #include "libpq/libpq.h"
 #include "miscadmin.h"
-#include "storage/latch.h"
+#include "pgstat.h"
+#include "storage/ipc.h"
+#include "storage/proc.h"
 #include "tcop/tcopprot.h"
-#include "utils/injection_point.h"
-#include "utils/wait_event.h"
+#include "utils/memutils.h"
 
 char	   *ssl_library;
 char	   *ssl_cert_file;
@@ -50,9 +51,8 @@ bool		ssl_loaded_verify_locations = false;
 
 /* GUC variable controlling SSL cipher list */
 char	   *SSLCipherSuites = NULL;
-char	   *SSLCipherList = NULL;
 
-/* GUC variable for default ECDH curve. */
+/* GUC variable for default ECHD curve. */
 char	   *SSLECDHCurve;
 
 /* GUC variable: if false, prefer client ciphers */
@@ -60,9 +60,6 @@ bool		SSLPreferServerCiphers;
 
 int			ssl_min_protocol_version = PG_TLS1_2_VERSION;
 int			ssl_max_protocol_version = PG_TLS_ANY;
-
-/* GUC variable: if false, discards hostname extensions in handshake */
-bool		ssl_sni = false;
 
 /* ------------------------------------------------------------ */
 /*			 Procedures common to all secure sessions			*/
@@ -115,53 +112,18 @@ secure_loaded_verify_locations(void)
 int
 secure_open_server(Port *port)
 {
-#ifdef USE_SSL
 	int			r = 0;
-	ssize_t		len;
 
-	/* push unencrypted buffered data back through SSL setup */
-	len = pq_buffer_remaining_data();
-	if (len > 0)
-	{
-		char	   *buf = palloc(len);
-
-		pq_startmsgread();
-		if (pq_getbytes(buf, len) == EOF)
-			return STATUS_ERROR;	/* shouldn't be possible */
-		pq_endmsgread();
-		port->raw_buf = buf;
-		port->raw_buf_remaining = len;
-		port->raw_buf_consumed = 0;
-	}
-	Assert(pq_buffer_remaining_data() == 0);
-
-	INJECTION_POINT("backend-ssl-startup", NULL);
-
+#ifdef USE_SSL
 	r = be_tls_open_server(port);
-
-	if (port->raw_buf_remaining > 0)
-	{
-		/*
-		 * This shouldn't be possible -- it would mean the client sent
-		 * encrypted data before we established a session key...
-		 */
-		elog(LOG, "buffered unencrypted data remains after negotiating SSL connection");
-		return STATUS_ERROR;
-	}
-	if (port->raw_buf != NULL)
-	{
-		pfree(port->raw_buf);
-		port->raw_buf = NULL;
-	}
 
 	ereport(DEBUG2,
 			(errmsg_internal("SSL connection from DN:\"%s\" CN:\"%s\"",
 							 port->peer_dn ? port->peer_dn : "(anonymous)",
 							 port->peer_cn ? port->peer_cn : "(anonymous)")));
-	return r;
-#else
-	return 0;
 #endif
+
+	return r;
 }
 
 /*
@@ -273,19 +235,6 @@ secure_raw_read(Port *port, void *ptr, size_t len)
 {
 	ssize_t		n;
 
-	/* Read from the "unread" buffered data first. c.f. libpq-be.h */
-	if (port->raw_buf_remaining > 0)
-	{
-		/* consume up to len bytes from the raw_buf */
-		if (len > port->raw_buf_remaining)
-			len = port->raw_buf_remaining;
-		Assert(port->raw_buf);
-		memcpy(ptr, port->raw_buf + port->raw_buf_consumed, len);
-		port->raw_buf_consumed += len;
-		port->raw_buf_remaining -= len;
-		return len;
-	}
-
 	/*
 	 * Try to read from the socket without blocking. If it succeeds we're
 	 * done, otherwise we'll wait for the socket using the latch mechanism.
@@ -306,7 +255,7 @@ secure_raw_read(Port *port, void *ptr, size_t len)
  *	Write data to a secure connection.
  */
 ssize_t
-secure_write(Port *port, const void *ptr, size_t len)
+secure_write(Port *port, void *ptr, size_t len)
 {
 	ssize_t		n;
 	int			waitfor;

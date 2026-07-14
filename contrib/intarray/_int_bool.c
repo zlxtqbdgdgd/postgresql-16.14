@@ -5,6 +5,7 @@
 
 #include "_int.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 
 PG_FUNCTION_INFO_V1(bqarr_in);
 PG_FUNCTION_INFO_V1(bqarr_out);
@@ -135,7 +136,7 @@ gettoken(WORKSTATE *state, int32 *val)
 static void
 pushquery(WORKSTATE *state, int32 type, int32 val)
 {
-	NODE	   *tmp = palloc_object(NODE);
+	NODE	   *tmp = (NODE *) palloc(sizeof(NODE));
 
 	tmp->type = type;
 	tmp->val = val;
@@ -298,7 +299,7 @@ bool
 signconsistent(QUERYTYPE *query, BITVECP sign, int siglen, bool calcnot)
 {
 	return execute(GETQUERY(query) + query->size - 1,
-				   sign, (void *) (intptr_t) siglen, calcnot,
+				   (void *) sign, (void *) (intptr_t) siglen, calcnot,
 				   checkcondition_bit);
 }
 
@@ -312,7 +313,7 @@ execconsistent(QUERYTYPE *query, ArrayType *array, bool calcnot)
 	chkval.arrb = ARRPTR(array);
 	chkval.arre = chkval.arrb + ARRNELEMS(array);
 	return execute(GETQUERY(query) + query->size - 1,
-				   &chkval, NULL, calcnot,
+				   (void *) &chkval, NULL, calcnot,
 				   checkcondition_arr);
 }
 
@@ -346,7 +347,7 @@ gin_bool_consistent(QUERYTYPE *query, bool *check)
 	 * extraction code in ginint4_queryextract.
 	 */
 	gcv.first = items;
-	gcv.mapped_check = palloc_array(bool, query->size);
+	gcv.mapped_check = (bool *) palloc(sizeof(bool) * query->size);
 	for (i = 0; i < query->size; i++)
 	{
 		if (items[i].type == VAL)
@@ -354,7 +355,7 @@ gin_bool_consistent(QUERYTYPE *query, bool *check)
 	}
 
 	return execute(GETQUERY(query) + query->size - 1,
-				   &gcv, NULL, true,
+				   (void *) &gcv, NULL, true,
 				   checkcondition_gin);
 }
 
@@ -659,7 +660,7 @@ infix(INFIX *in, bool first)
 
 		nrm.curpol = in->curpol;
 		nrm.buflen = 16;
-		nrm.cur = nrm.buf = palloc_array(char, nrm.buflen);
+		nrm.cur = nrm.buf = (char *) palloc(sizeof(char) * nrm.buflen);
 
 		/* get right operand */
 		infix(&nrm, false);
@@ -697,7 +698,7 @@ bqarr_out(PG_FUNCTION_ARGS)
 
 	nrm.curpol = GETQUERY(query) + query->size - 1;
 	nrm.buflen = 32;
-	nrm.cur = nrm.buf = palloc_array(char, nrm.buflen);
+	nrm.cur = nrm.buf = (char *) palloc(sizeof(char) * nrm.buflen);
 	*(nrm.cur) = '\0';
 	infix(&nrm, true);
 

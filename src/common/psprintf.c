@@ -4,7 +4,7 @@
  *		sprintf into an allocated-on-demand buffer
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -40,7 +40,7 @@
  * One should therefore think twice about using this in libpq.
  */
 char *
-psprintf(const char *fmt, ...)
+psprintf(const char *fmt,...)
 {
 	int			save_errno = errno;
 	size_t		len = 128;		/* initial assumption about buffer size */
@@ -112,8 +112,8 @@ pvsnprintf(char *buf, size_t len, const char *fmt, va_list args)
 #ifndef FRONTEND
 		elog(ERROR, "vsnprintf failed: %m with format string \"%s\"", fmt);
 #else
-		fprintf(stderr, "vsnprintf failed: %m with format string \"%s\"\n",
-				fmt);
+		fprintf(stderr, "vsnprintf failed: %s with format string \"%s\"\n",
+				strerror(errno), fmt);
 		exit(EXIT_FAILURE);
 #endif
 	}

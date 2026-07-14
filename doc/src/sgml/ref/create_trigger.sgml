@@ -29,7 +29,7 @@ PostgreSQL documentation
 CREATE [ OR REPLACE ] [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name</replaceable> { BEFORE | AFTER | INSTEAD OF } { <replaceable class="parameter">event</replaceable> [ OR ... ] }
     ON <replaceable class="parameter">table_name</replaceable>
     [ FROM <replaceable class="parameter">referenced_table_name</replaceable> ]
-    [ NOT DEFERRABLE | [ DEFERRABLE ] [ INITIALLY IMMEDIATE | INITIALLY DEFERRED ] ] [ ENFORCED ]
+    [ NOT DEFERRABLE | [ DEFERRABLE ] [ INITIALLY IMMEDIATE | INITIALLY DEFERRED ] ]
     [ REFERENCING { { OLD | NEW } TABLE [ AS ] <replaceable class="parameter">transition_relation_name</replaceable> } [ ... ] ]
     [ FOR [ EACH ] { ROW | STATEMENT } ]
     [ WHEN ( <replaceable class="parameter">condition</replaceable> ) ]
@@ -324,15 +324,6 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
    </varlistentry>
 
    <varlistentry>
-    <term><literal>ENFORCED</literal></term>
-    <listitem>
-     <para>
-      This is a noise word.  Constraint triggers are always enforced.
-     </para>
-    </listitem>
-   </varlistentry>
-
-   <varlistentry>
     <term><literal>REFERENCING</literal></term>
     <listitem>
      <para>
@@ -485,7 +476,7 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
    to change even when the trigger is not fired, because changes made to the
    row's contents by <literal>BEFORE UPDATE</literal> triggers are not considered.
    Conversely, a command such as <literal>UPDATE ... SET x = x ...</literal>
-   will fire a trigger on column <structfield>x</structfield>, even though the column's
+   will fire a trigger on column <literal>x</literal>, even though the column's
    value did not change.
   </para>
 
@@ -598,7 +589,7 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
 
   <para>
    Execute the function <function>check_account_update</function> whenever
-   a row of the table <structname>accounts</structname> is about to be updated:
+   a row of the table <literal>accounts</literal> is about to be updated:
 
 <programlisting>
 CREATE TRIGGER check_update
@@ -608,7 +599,7 @@ CREATE TRIGGER check_update
 </programlisting>
 
    Modify that trigger definition to only execute the function if
-   column <structfield>balance</structfield> is specified as a target in
+   column <literal>balance</literal> is specified as a target in
    the <command>UPDATE</command> command:
 
 <programlisting>
@@ -618,7 +609,7 @@ CREATE OR REPLACE TRIGGER check_update
     EXECUTE FUNCTION check_account_update();
 </programlisting>
 
-   This form only executes the function if column <structfield>balance</structfield>
+   This form only executes the function if column <literal>balance</literal>
    has in fact changed value:
 
 <programlisting>
@@ -629,7 +620,7 @@ CREATE TRIGGER check_update
     EXECUTE FUNCTION check_account_update();
 </programlisting>
 
-   Call a function to log updates of <structname>accounts</structname>, but only if
+   Call a function to log updates of <literal>accounts</literal>, but only if
    something changed:
 
 <programlisting>

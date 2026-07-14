@@ -2,7 +2,7 @@
  * brin_pageops.c
  *		Page-handling routines for BRIN indexes
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,6 +19,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/smgr.h"
 #include "utils/rel.h"
 
 /*
@@ -176,7 +177,7 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 		brin_can_do_samepage_update(oldbuf, origsz, newsz))
 	{
 		START_CRIT_SECTION();
-		if (!PageIndexTupleOverwrite(oldpage, oldoff, newtup, newsz))
+		if (!PageIndexTupleOverwrite(oldpage, oldoff, (Item) unconstify(BrinTuple *, newtup), newsz))
 			elog(ERROR, "failed to replace BRIN tuple");
 		MarkBufferDirty(oldbuf);
 
@@ -190,10 +191,10 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 			xlrec.offnum = oldoff;
 
 			XLogBeginInsert();
-			XLogRegisterData(&xlrec, SizeOfBrinSamepageUpdate);
+			XLogRegisterData((char *) &xlrec, SizeOfBrinSamepageUpdate);
 
 			XLogRegisterBuffer(0, oldbuf, REGBUF_STANDARD);
-			XLogRegisterBufData(0, newtup, newsz);
+			XLogRegisterBufData(0, (char *) unconstify(BrinTuple *, newtup), newsz);
 
 			recptr = XLogInsert(RM_BRIN_ID, info);
 
@@ -250,7 +251,8 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 			brin_page_init(newpage, BRIN_PAGETYPE_REGULAR);
 
 		PageIndexTupleDeleteNoCompact(oldpage, oldoff);
-		newoff = PageAddItem(newpage, newtup, newsz, InvalidOffsetNumber, false, false);
+		newoff = PageAddItem(newpage, (Item) unconstify(BrinTuple *, newtup), newsz,
+							 InvalidOffsetNumber, false, false);
 		if (newoff == InvalidOffsetNumber)
 			elog(ERROR, "failed to add BRIN tuple to new page");
 		MarkBufferDirty(oldbuf);
@@ -281,10 +283,10 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 			XLogBeginInsert();
 
 			/* new page */
-			XLogRegisterData(&xlrec, SizeOfBrinUpdate);
+			XLogRegisterData((char *) &xlrec, SizeOfBrinUpdate);
 
 			XLogRegisterBuffer(0, newbuf, REGBUF_STANDARD | (extended ? REGBUF_WILL_INIT : 0));
-			XLogRegisterBufData(0, newtup, newsz);
+			XLogRegisterBufData(0, (char *) unconstify(BrinTuple *, newtup), newsz);
 
 			/* revmap page */
 			XLogRegisterBuffer(1, revmapbuf, 0);
@@ -340,7 +342,7 @@ brin_can_do_samepage_update(Buffer buffer, Size origsz, Size newsz)
 OffsetNumber
 brin_doinsert(Relation idxrel, BlockNumber pagesPerRange,
 			  BrinRevmap *revmap, Buffer *buffer, BlockNumber heapBlk,
-			  const BrinTuple *tup, Size itemsz)
+			  BrinTuple *tup, Size itemsz)
 {
 	Page		page;
 	BlockNumber blk;
@@ -407,7 +409,8 @@ brin_doinsert(Relation idxrel, BlockNumber pagesPerRange,
 	START_CRIT_SECTION();
 	if (extended)
 		brin_page_init(page, BRIN_PAGETYPE_REGULAR);
-	off = PageAddItem(page, tup, itemsz, InvalidOffsetNumber, false, false);
+	off = PageAddItem(page, (Item) tup, itemsz, InvalidOffsetNumber,
+					  false, false);
 	if (off == InvalidOffsetNumber)
 		elog(ERROR, "failed to add BRIN tuple to new page");
 	MarkBufferDirty(*buffer);
@@ -433,10 +436,10 @@ brin_doinsert(Relation idxrel, BlockNumber pagesPerRange,
 		xlrec.offnum = off;
 
 		XLogBeginInsert();
-		XLogRegisterData(&xlrec, SizeOfBrinInsert);
+		XLogRegisterData((char *) &xlrec, SizeOfBrinInsert);
 
 		XLogRegisterBuffer(0, *buffer, REGBUF_STANDARD | (extended ? REGBUF_WILL_INIT : 0));
-		XLogRegisterBufData(0, tup, itemsz);
+		XLogRegisterBufData(0, (char *) tup, itemsz);
 
 		XLogRegisterBuffer(1, revmapbuf, 0);
 

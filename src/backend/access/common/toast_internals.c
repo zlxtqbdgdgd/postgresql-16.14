@@ -3,7 +3,7 @@
  * toast_internals.c
  *	  Functions for internal use by the TOAST system.
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/common/toast_internals.c
@@ -21,6 +21,7 @@
 #include "access/toast_internals.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "common/pg_lzcompress.h"
 #include "miscadmin.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -45,7 +46,7 @@ static bool toastid_valueid_exists(Oid toastrelid, Oid valueid);
 Datum
 toast_compress_datum(Datum value, char cmethod)
 {
-	varlena    *tmp = NULL;
+	struct varlena *tmp = NULL;
 	int32		valsize;
 	ToastCompressionId cmid = TOAST_INVALID_COMPRESSION_ID;
 
@@ -64,11 +65,11 @@ toast_compress_datum(Datum value, char cmethod)
 	switch (cmethod)
 	{
 		case TOAST_PGLZ_COMPRESSION:
-			tmp = pglz_compress_datum((const varlena *) DatumGetPointer(value));
+			tmp = pglz_compress_datum((const struct varlena *) value);
 			cmid = TOAST_PGLZ_COMPRESSION_ID;
 			break;
 		case TOAST_LZ4_COMPRESSION:
-			tmp = lz4_compress_datum((const varlena *) DatumGetPointer(value));
+			tmp = lz4_compress_datum((const struct varlena *) value);
 			cmid = TOAST_LZ4_COMPRESSION_ID;
 			break;
 		default:
@@ -117,14 +118,26 @@ toast_compress_datum(Datum value, char cmethod)
  */
 Datum
 toast_save_datum(Relation rel, Datum value,
-				 varlena *oldexternal, uint32 options)
+				 struct varlena *oldexternal, int options)
 {
 	Relation	toastrel;
 	Relation   *toastidxs;
+	HeapTuple	toasttup;
 	TupleDesc	toasttupDesc;
+	Datum		t_values[3];
+	bool		t_isnull[3];
 	CommandId	mycid = GetCurrentCommandId(true);
-	varlena    *result;
-	varatt_external toast_pointer;
+	struct varlena *result;
+	struct varatt_external toast_pointer;
+	union
+	{
+		struct varlena hdr;
+		/* this is to make the union big enough for a chunk: */
+		char		data[TOAST_MAX_CHUNK_SIZE + VARHDRSZ];
+		/* ensure union is aligned well enough: */
+		int32		align_it;
+	}			chunk_data = {0};	/* silence compiler warning */
+	int32		chunk_size;
 	int32		chunk_seq = 0;
 	char	   *data_p;
 	int32		data_todo;
@@ -132,7 +145,7 @@ toast_save_datum(Relation rel, Datum value,
 	int			num_indexes;
 	int			validIndex;
 
-	Assert(!VARATT_IS_EXTERNAL(dval));
+	Assert(!VARATT_IS_EXTERNAL(value));
 
 	/*
 	 * Open the toast relation and its indexes.  We can use the index to check
@@ -225,7 +238,7 @@ toast_save_datum(Relation rel, Datum value,
 		toast_pointer.va_valueid = InvalidOid;
 		if (oldexternal != NULL)
 		{
-			varatt_external old_toast_pointer;
+			struct varatt_external old_toast_pointer;
 
 			Assert(VARATT_IS_EXTERNAL_ONDISK(oldexternal));
 			/* Must copy to access aligned fields */
@@ -278,20 +291,20 @@ toast_save_datum(Relation rel, Datum value,
 	}
 
 	/*
+	 * Initialize constant parts of the tuple data
+	 */
+	t_values[0] = ObjectIdGetDatum(toast_pointer.va_valueid);
+	t_values[2] = PointerGetDatum(&chunk_data);
+	t_isnull[0] = false;
+	t_isnull[1] = false;
+	t_isnull[2] = false;
+
+	/*
 	 * Split up the item into chunks
 	 */
 	while (data_todo > 0)
 	{
-		HeapTuple	toasttup;
-		Datum		t_values[3];
-		bool		t_isnull[3] = {0};
-		union
-		{
-			alignas(int32) varlena hdr;
-			/* this is to make the union big enough for a chunk: */
-			char		data[TOAST_MAX_CHUNK_SIZE + VARHDRSZ];
-		}			chunk_data;
-		int32		chunk_size;
+		int			i;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -303,12 +316,9 @@ toast_save_datum(Relation rel, Datum value,
 		/*
 		 * Build a tuple and store it
 		 */
-		t_values[0] = ObjectIdGetDatum(toast_pointer.va_valueid);
 		t_values[1] = Int32GetDatum(chunk_seq++);
 		SET_VARSIZE(&chunk_data, chunk_size + VARHDRSZ);
 		memcpy(VARDATA(&chunk_data), data_p, chunk_size);
-		t_values[2] = PointerGetDatum(&chunk_data);
-
 		toasttup = heap_form_tuple(toasttupDesc, t_values, t_isnull);
 
 		heap_insert(toastrel, toasttup, mycid, options, NULL);
@@ -324,7 +334,7 @@ toast_save_datum(Relation rel, Datum value,
 		 * Note also that there had better not be any user-created index on
 		 * the TOAST table, since we don't bother to update anything else.
 		 */
-		for (int i = 0; i < num_indexes; i++)
+		for (i = 0; i < num_indexes; i++)
 		{
 			/* Only index relations marked as ready can be updated */
 			if (toastidxs[i]->rd_index->indisready)
@@ -359,7 +369,7 @@ toast_save_datum(Relation rel, Datum value,
 	/*
 	 * Create the TOAST pointer value that we'll return
 	 */
-	result = (varlena *) palloc(TOAST_POINTER_SIZE);
+	result = (struct varlena *) palloc(TOAST_POINTER_SIZE);
 	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK);
 	memcpy(VARDATA_EXTERNAL(result), &toast_pointer, sizeof(toast_pointer));
 
@@ -375,8 +385,8 @@ toast_save_datum(Relation rel, Datum value,
 void
 toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 {
-	varlena    *attr = (varlena *) DatumGetPointer(value);
-	varatt_external toast_pointer;
+	struct varlena *attr = (struct varlena *) DatumGetPointer(value);
+	struct varatt_external toast_pointer;
 	Relation	toastrel;
 	Relation   *toastidxs;
 	ScanKeyData toastkey;
@@ -384,6 +394,7 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	HeapTuple	toasttup;
 	int			num_indexes;
 	int			validIndex;
+	SnapshotData SnapshotToast;
 
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		return;
@@ -415,8 +426,9 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	 * sequence or not, but since we've already locked the index we might as
 	 * well use systable_beginscan_ordered.)
 	 */
+	init_toast_snapshot(&SnapshotToast);
 	toastscan = systable_beginscan_ordered(toastrel, toastidxs[validIndex],
-										   get_toast_snapshot(), 1, &toastkey);
+										   &SnapshotToast, 1, &toastkey);
 	while ((toasttup = systable_getnext_ordered(toastscan, ForwardScanDirection)) != NULL)
 	{
 		/*
@@ -568,7 +580,7 @@ toast_open_indexes(Relation toastrel,
 	*num_indexes = list_length(indexlist);
 
 	/* Open all the index relations */
-	*toastidxs = palloc_array(Relation, *num_indexes);
+	*toastidxs = (Relation *) palloc(*num_indexes * sizeof(Relation));
 	foreach(lc, indexlist)
 		(*toastidxs)[i++] = index_open(lfirst_oid(lc), lock);
 
@@ -620,28 +632,42 @@ toast_close_indexes(Relation *toastidxs, int num_indexes, LOCKMODE lock)
 }
 
 /* ----------
- * get_toast_snapshot
+ * init_toast_snapshot
  *
- *	Return the TOAST snapshot. Detoasting *must* happen in the same
- *	transaction that originally fetched the toast pointer.
+ *	Initialize an appropriate TOAST snapshot.  We must use an MVCC snapshot
+ *	to initialize the TOAST snapshot; since we don't know which one to use,
+ *	just use the oldest one.  This is safe: at worst, we will get a "snapshot
+ *	too old" error that might have been avoided otherwise.
  */
-Snapshot
-get_toast_snapshot(void)
+void
+init_toast_snapshot(Snapshot toast_snapshot)
 {
+	Snapshot	snapshot = GetOldestSnapshot();
+
 	/*
-	 * We cannot directly check that detoasting happens in the same
-	 * transaction that originally fetched the toast pointer, but at least
-	 * check that the session has some active snapshots. It might not if, for
-	 * example, a procedure fetches a toasted value into a local variable,
-	 * commits, and then tries to detoast the value. Such coding is unsafe,
-	 * because once we commit there is nothing to prevent the toast data from
-	 * being deleted. (This is not very much protection, because in many
-	 * scenarios the procedure would have already created a new transaction
-	 * snapshot, preventing us from detecting the problem. But it's better
-	 * than nothing.)
+	 * GetOldestSnapshot returns NULL if the session has no active snapshots.
+	 * We can get that if, for example, a procedure fetches a toasted value
+	 * into a local variable, commits, and then tries to detoast the value.
+	 * Such coding is unsafe, because once we commit there is nothing to
+	 * prevent the toast data from being deleted.  Detoasting *must* happen in
+	 * the same transaction that originally fetched the toast pointer.  Hence,
+	 * rather than trying to band-aid over the problem, throw an error.  (This
+	 * is not very much protection, because in many scenarios the procedure
+	 * would have already created a new transaction snapshot, preventing us
+	 * from detecting the problem.  But it's better than nothing, and for sure
+	 * we shouldn't expend code on masking the problem more.)
 	 */
-	if (!HaveRegisteredOrActiveSnapshot())
+	if (snapshot == NULL)
 		elog(ERROR, "cannot fetch toast data without an active snapshot");
 
-	return &SnapshotToastData;
+	/*
+	 * Catalog snapshots can be returned by GetOldestSnapshot() even if not
+	 * registered or active. That easily hides bugs around not having a
+	 * snapshot set up - most of the time there is a valid catalog snapshot.
+	 * So additionally insist that the current snapshot is registered or
+	 * active.
+	 */
+	Assert(HaveRegisteredOrActiveSnapshot());
+
+	InitToastSnapshot(*toast_snapshot, snapshot->lsn, snapshot->whenTaken);
 }

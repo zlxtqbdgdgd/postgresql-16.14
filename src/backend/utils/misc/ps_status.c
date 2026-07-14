@@ -7,7 +7,7 @@
  *
  * src/backend/utils/misc/ps_status.c
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  * various details abducted from various places
  *--------------------------------------------------------------------
  */
@@ -19,11 +19,13 @@
 #include <crt_externs.h>
 #endif
 
+#include "libpq/libpq.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
-#if !defined(WIN32)
+#if !defined(WIN32) || defined(_MSC_VER)
 extern char **environ;
 #endif
 
@@ -99,17 +101,6 @@ static void flush_ps_display(void);
 /* save the original argv[] location here */
 static int	save_argc;
 static char **save_argv;
-
-/*
- * Valgrind seems not to consider the global "environ" variable as a valid
- * root pointer; so when we allocate a new environment array, it claims that
- * data is leaked.  To fix that, keep our own statically-allocated copy of the
- * pointer.  (Oddly, this doesn't seem to be a problem for "argv".)
- */
-#if defined(PS_USE_CLOBBER_ARGV) && defined(USE_VALGRIND)
-extern char **ps_status_new_environ;
-char	  **ps_status_new_environ;
-#endif
 
 
 /*
@@ -217,11 +208,6 @@ save_ps_display_args(int argc, char **argv)
 		}
 		new_environ[i] = NULL;
 		environ = new_environ;
-
-		/* See notes about Valgrind above. */
-#ifdef USE_VALGRIND
-		ps_status_new_environ = new_environ;
-#endif
 	}
 
 	/*
@@ -234,8 +220,7 @@ save_ps_display_args(int argc, char **argv)
 	 * into the argv array, and will get horribly confused when it is
 	 * re-called to analyze a subprocess' argument string if the argv storage
 	 * has been clobbered meanwhile.  Other platforms have other dependencies
-	 * on argv[]. (We use custom pg_getopt_start/next() functions nowadays
-	 * that don't do that, but those other dependencies might still exist.)
+	 * on argv[].
 	 */
 	{
 		char	  **new_argv;

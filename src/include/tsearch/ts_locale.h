@@ -3,7 +3,7 @@
  * ts_locale.h
  *		locale compatibility layer for tsearch
  *
- * Copyright (c) 1998-2026, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2023, PostgreSQL Global Development Group
  *
  * src/include/tsearch/ts_locale.h
  *
@@ -56,7 +56,7 @@ ts_copychar_cstr(void *dest, const void *src)
 #define COPYCHAR ts_copychar_cstr
 
 #define GENERATE_T_ISCLASS_DECL(character_class) \
-extern int	t_is##character_class##_with_len(const char *ptr, int mblen); \
+extern int	t_is##character_class##_with_len(const char *ptr, int len); \
 extern int	t_is##character_class##_cstr(const char *ptr); \
 extern int	t_is##character_class##_unbounded(const char *ptr); \
 \
@@ -65,6 +65,12 @@ extern int	t_is##character_class(const char *ptr);
 
 GENERATE_T_ISCLASS_DECL(alnum);
 GENERATE_T_ISCLASS_DECL(alpha);
+GENERATE_T_ISCLASS_DECL(digit);
+GENERATE_T_ISCLASS_DECL(print);
+GENERATE_T_ISCLASS_DECL(space);
+
+extern char *lowerstr(const char *str);
+extern char *lowerstr_with_len(const char *str, int len);
 
 extern bool tsearch_readline_begin(tsearch_readline_state *stp,
 								   const char *filename);

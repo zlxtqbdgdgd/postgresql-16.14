@@ -3,7 +3,7 @@
  * pquery.c
  *	  POSTGRES process query command code
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,6 @@
 
 #include "access/xact.h"
 #include "commands/prepare.h"
-#include "executor/executor.h"
 #include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -74,7 +73,7 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 				QueryEnvironment *queryEnv,
 				int instrument_options)
 {
-	QueryDesc  *qd = palloc_object(QueryDesc);
+	QueryDesc  *qd = (QueryDesc *) palloc(sizeof(QueryDesc));
 
 	qd->operation = plannedstmt->commandType;	/* operation */
 	qd->plannedstmt = plannedstmt;	/* plan */
@@ -86,13 +85,12 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 	qd->params = params;		/* parameter values passed into query */
 	qd->queryEnv = queryEnv;
 	qd->instrument_options = instrument_options;	/* instrumentation wanted? */
-	qd->query_instr_options = 0;
 
 	/* null these fields until set by ExecutorStart */
 	qd->tupDesc = NULL;
 	qd->estate = NULL;
 	qd->planstate = NULL;
-	qd->query_instr = NULL;
+	qd->totaltime = NULL;
 
 	/* not yet executed */
 	qd->already_executed = false;
@@ -159,29 +157,34 @@ ProcessQuery(PlannedStmt *plan,
 	/*
 	 * Run the plan to completion.
 	 */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
 
 	/*
 	 * Build command completion status data, if caller wants one.
 	 */
 	if (qc)
 	{
-		CommandTag	tag;
-
-		if (queryDesc->operation == CMD_SELECT)
-			tag = CMDTAG_SELECT;
-		else if (queryDesc->operation == CMD_INSERT)
-			tag = CMDTAG_INSERT;
-		else if (queryDesc->operation == CMD_UPDATE)
-			tag = CMDTAG_UPDATE;
-		else if (queryDesc->operation == CMD_DELETE)
-			tag = CMDTAG_DELETE;
-		else if (queryDesc->operation == CMD_MERGE)
-			tag = CMDTAG_MERGE;
-		else
-			tag = CMDTAG_UNKNOWN;
-
-		SetQueryCompletion(qc, tag, queryDesc->estate->es_processed);
+		switch (queryDesc->operation)
+		{
+			case CMD_SELECT:
+				SetQueryCompletion(qc, CMDTAG_SELECT, queryDesc->estate->es_processed);
+				break;
+			case CMD_INSERT:
+				SetQueryCompletion(qc, CMDTAG_INSERT, queryDesc->estate->es_processed);
+				break;
+			case CMD_UPDATE:
+				SetQueryCompletion(qc, CMDTAG_UPDATE, queryDesc->estate->es_processed);
+				break;
+			case CMD_DELETE:
+				SetQueryCompletion(qc, CMDTAG_DELETE, queryDesc->estate->es_processed);
+				break;
+			case CMD_MERGE:
+				SetQueryCompletion(qc, CMDTAG_MERGE, queryDesc->estate->es_processed);
+				break;
+			default:
+				SetQueryCompletion(qc, CMDTAG_UNKNOWN, queryDesc->estate->es_processed);
+				break;
+		}
 	}
 
 	/*
@@ -667,6 +670,8 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
  * isTopLevel: true if query is being executed at backend "top level"
  * (that is, directly from a client command message)
  *
+ * run_once: ignored, present only to avoid an API break in stable branches.
+ *
  * dest: where to send output of primary (canSetTag) query
  *
  * altdest: where to send output of non-primary queries
@@ -678,7 +683,7 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
  * suspended due to exhaustion of the count parameter.
  */
 bool
-PortalRun(Portal portal, long count, bool isTopLevel,
+PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 		  DestReceiver *dest, DestReceiver *altdest,
 		  QueryCompletion *qc)
 {
@@ -914,7 +919,8 @@ PortalRunSelect(Portal portal,
 		else
 		{
 			PushActiveSnapshot(queryDesc->snapshot);
-			ExecutorRun(queryDesc, direction, (uint64) count);
+			ExecutorRun(queryDesc, direction, (uint64) count,
+						false);
 			nprocessed = queryDesc->estate->es_processed;
 			PopActiveSnapshot();
 		}
@@ -953,7 +959,8 @@ PortalRunSelect(Portal portal,
 		else
 		{
 			PushActiveSnapshot(queryDesc->snapshot);
-			ExecutorRun(queryDesc, direction, (uint64) count);
+			ExecutorRun(queryDesc, direction, (uint64) count,
+						false);
 			nprocessed = queryDesc->estate->es_processed;
 			PopActiveSnapshot();
 		}
@@ -1159,11 +1166,10 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 	MemoryContextSwitchTo(portal->portalContext);
 
 	/*
-	 * Some utility commands (e.g., VACUUM, WAIT FOR) pop the ActiveSnapshot
-	 * stack from under us, so don't complain if it's now empty.  Otherwise,
-	 * our snapshot should be the top one; pop it.  Note that this could be a
-	 * different snapshot from the one we made above; see
-	 * EnsurePortalSnapshotExists.
+	 * Some utility commands (e.g., VACUUM) pop the ActiveSnapshot stack from
+	 * under us, so don't complain if it's now empty.  Otherwise, our snapshot
+	 * should be the top one; pop it.  Note that this could be a different
+	 * snapshot from the one we made above; see EnsurePortalSnapshotExists.
 	 */
 	if (portal->portalSnapshot != NULL && ActiveSnapshotSet())
 	{
@@ -1740,8 +1746,7 @@ PlannedStmtRequiresSnapshot(PlannedStmt *pstmt)
 		IsA(utilityStmt, ListenStmt) ||
 		IsA(utilityStmt, NotifyStmt) ||
 		IsA(utilityStmt, UnlistenStmt) ||
-		IsA(utilityStmt, CheckPointStmt) ||
-		IsA(utilityStmt, WaitStmt))
+		IsA(utilityStmt, CheckPointStmt))
 		return false;
 
 	return true;

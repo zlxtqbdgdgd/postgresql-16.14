@@ -8,7 +8,7 @@
  * do nothing if it's enabled. You should avoid accessing the target files
  * directly but if you do, make sure you honor the --dry-run mode!
  *
- * Portions Copyright (c) 2013-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -309,9 +309,9 @@ remove_target_symlink(const char *path)
  *
  * We do this once, for the whole data directory, for performance reasons.  At
  * the end of pg_rewind's run, the kernel is likely to already have flushed
- * most dirty buffers to disk.  Additionally sync_pgdata uses a two-pass
- * approach when fsync is specified (only initiating writeback in the first
- * pass), which often reduces the overall amount of IO noticeably.
+ * most dirty buffers to disk.  Additionally fsync_pgdata uses a two-pass
+ * approach (only initiating writeback in the first pass), which often reduces
+ * the overall amount of IO noticeably.
  */
 void
 sync_target_dir(void)
@@ -319,7 +319,7 @@ sync_target_dir(void)
 	if (!do_sync || dry_run)
 		return;
 
-	sync_pgdata(datadir_target, PG_VERSION_NUM, sync_method, true);
+	fsync_pgdata(datadir_target, PG_VERSION_NUM);
 }
 
 
@@ -475,7 +475,7 @@ recurse_dir(const char *datadir, const char *parentpath,
 			 * to process all the tablespaces.  We also follow a symlink if
 			 * it's for pg_wal.  Symlinks elsewhere are ignored.
 			 */
-			if ((parentpath && strcmp(parentpath, PG_TBLSPC_DIR) == 0) ||
+			if ((parentpath && strcmp(parentpath, "pg_tblspc") == 0) ||
 				strcmp(path, "pg_wal") == 0)
 				recurse_dir(datadir, path, callback);
 		}

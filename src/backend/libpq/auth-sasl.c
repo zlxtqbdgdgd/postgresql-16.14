@@ -3,7 +3,7 @@
  * auth-sasl.c
  *	  Routines to handle authentication via SASL
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,14 @@
 #include "libpq/sasl.h"
 
 /*
+ * Maximum accepted size of SASL messages.
+ *
+ * The messages that the server or libpq generate are much smaller than this,
+ * but have some headroom.
+ */
+#define PG_MAX_SASL_MESSAGE_LENGTH	1024
+
+/*
  * Perform a SASL exchange with a libpq client, using a specific mechanism
  * implementation.
  *
@@ -29,12 +37,6 @@
  * shadowed passwords, a NULL pointer here means that an entry could not
  * be found for the role (or the user does not exist), and the mechanism
  * should fail the authentication exchange.
- *
- * Some SASL mechanisms (e.g. OAUTHBEARER) define special exchanges for
- * parameter discovery. These exchanges will always result in STATUS_ERROR,
- * since we can't let the connection continue, but we shouldn't consider them to
- * be failed authentication attempts. *abandoned will be set to true in this
- * case.
  *
  * Mechanisms must take care not to reveal to the client that a user entry
  * does not exist; ideally, the external failure mode is identical to that
@@ -48,7 +50,7 @@
  */
 int
 CheckSASLAuth(const pg_be_sasl_mech *mech, Port *port, char *shadow_pass,
-			  const char **logdetail, bool *abandoned)
+			  const char **logdetail)
 {
 	StringInfoData sasl_mechs;
 	int			mtype;
@@ -85,7 +87,7 @@ CheckSASLAuth(const pg_be_sasl_mech *mech, Port *port, char *shadow_pass,
 	{
 		pq_startmsgread();
 		mtype = pq_getbyte();
-		if (mtype != PqMsg_SASLResponse)
+		if (mtype != 'p')
 		{
 			/* Only log error if client didn't disconnect. */
 			if (mtype != EOF)
@@ -101,7 +103,7 @@ CheckSASLAuth(const pg_be_sasl_mech *mech, Port *port, char *shadow_pass,
 
 		/* Get the actual SASL message */
 		initStringInfo(&buf);
-		if (pq_getmessage(&buf, mech->max_message_length))
+		if (pq_getmessage(&buf, PG_MAX_SASL_MESSAGE_LENGTH))
 		{
 			/* EOF - pq_getmessage already logged error */
 			pfree(buf.data);
@@ -173,7 +175,7 @@ CheckSASLAuth(const pg_be_sasl_mech *mech, Port *port, char *shadow_pass,
 			 * PG_SASL_EXCHANGE_FAILURE with some output is forbidden by SASL.
 			 * Make sure here that the mechanism used got that right.
 			 */
-			if (result == PG_SASL_EXCHANGE_FAILURE || result == PG_SASL_EXCHANGE_ABANDONED)
+			if (result == PG_SASL_EXCHANGE_FAILURE)
 				elog(ERROR, "output message found after SASL exchange failure");
 
 			/*
@@ -189,20 +191,6 @@ CheckSASLAuth(const pg_be_sasl_mech *mech, Port *port, char *shadow_pass,
 			pfree(output);
 		}
 	} while (result == PG_SASL_EXCHANGE_CONTINUE);
-
-	if (result == PG_SASL_EXCHANGE_ABANDONED)
-	{
-		if (!abandoned)
-		{
-			/*
-			 * Programmer error: caller needs to track the abandoned state for
-			 * this mechanism.
-			 */
-			elog(ERROR, "SASL exchange was abandoned, but CheckSASLAuth isn't tracking it");
-		}
-
-		*abandoned = true;
-	}
 
 	/* Oops, Something bad happened */
 	if (result != PG_SASL_EXCHANGE_SUCCESS)

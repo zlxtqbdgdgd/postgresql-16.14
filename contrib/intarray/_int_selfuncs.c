@@ -3,7 +3,7 @@
  * _int_selfuncs.c
  *	  Functions for selectivity estimation of intarray operators
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,9 +21,10 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 PG_FUNCTION_INFO_V1(_int_overlap_sel);
 PG_FUNCTION_INFO_V1(_int_contains_sel);
@@ -151,10 +152,7 @@ _int_matchsel(PG_FUNCTION_ARGS)
 	 * query_int.
 	 */
 	if (vardata.vartype != INT4ARRAYOID)
-	{
-		ReleaseVariableStats(vardata);
 		PG_RETURN_FLOAT8(DEFAULT_EQ_SEL);
-	}
 
 	/*
 	 * Can't do anything useful if the something is not a constant, either.
@@ -225,8 +223,8 @@ _int_matchsel(PG_FUNCTION_ARGS)
 			 */
 			if (sslot.nnumbers == sslot.nvalues + 3)
 			{
-				/* Grab the minimal MCE frequency. */
-				minfreq = sslot.numbers[sslot.nvalues];
+				/* Grab the lowest frequency. */
+				minfreq = sslot.numbers[sslot.nnumbers - (sslot.nnumbers - sslot.nvalues)];
 
 				mcelems = sslot.values;
 				mcefreqs = sslot.numbers;
@@ -284,11 +282,8 @@ int_query_opr_selec(ITEM *item, Datum *mcelems, float4 *mcefreqs,
 		else
 		{
 			/*
-			 * The element is not in MCELEM.  Estimate its frequency as half
-			 * that of the least-frequent MCE.  (We know it cannot be more
-			 * than minfreq, and it could be a great deal less.  Half seems
-			 * like a good compromise.)  For probably-historical reasons,
-			 * clamp to not more than DEFAULT_EQ_SEL.
+			 * The element is not in MCELEM.  Punt, but assume that the
+			 * selectivity cannot be more than minfreq / 2.
 			 */
 			selec = Min(DEFAULT_EQ_SEL, minfreq / 2);
 		}
@@ -343,7 +338,7 @@ int_query_opr_selec(ITEM *item, Datum *mcelems, float4 *mcefreqs,
 static int
 compare_val_int4(const void *a, const void *b)
 {
-	int32		key = *(const int32 *) a;
+	int32		key = *(int32 *) a;
 	int32		value = DatumGetInt32(*(const Datum *) b);
 
 	if (key < value)

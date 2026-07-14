@@ -469,14 +469,6 @@ CREATE USER MAPPING FOR public SERVER fdtest
   OPTIONS (server 'localhost');  -- fail, can't specify server here
 CREATE USER MAPPING FOR public SERVER fdtest OPTIONS (user :'USER');
 
--- OAuth options are not allowed in either context
-ALTER SERVER fdtest OPTIONS (ADD oauth_issuer 'https://example.com');
-ALTER SERVER fdtest OPTIONS (ADD oauth_client_id 'myID');
-ALTER USER MAPPING FOR public SERVER fdtest
-	OPTIONS (ADD oauth_issuer 'https://example.com');
-ALTER USER MAPPING FOR public SERVER fdtest
-	OPTIONS (ADD oauth_client_id 'myID');
-
 GRANT USAGE ON FOREIGN SERVER fdtest TO regress_dblink_user;
 GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO regress_dblink_user;
 
@@ -634,10 +626,6 @@ FROM dblink_fetch('myconn','error_cursor', 1) AS t(i int);
 -- of shenanigans on the connection.
 SHOW datestyle;
 SHOW intervalstyle;
-
--- Check that adding use_scram_passthrough option on an foreign data wrapper is
--- not allowed
-ALTER FOREIGN DATA WRAPPER dblink_fdw OPTIONS(add use_scram_passthrough 'true');
 
 -- Clean up GUC-setting tests
 SELECT dblink_disconnect('myconn');

@@ -17,7 +17,7 @@
  * single task e.g. command progress reporting, throttling, or
  * communication with the client.
  *
- * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * src/include/backup/basebackup_sink.h
  *
@@ -287,8 +287,7 @@ extern bbsink *bbsink_copystream_new(bool send_to_client);
 extern bbsink *bbsink_gzip_new(bbsink *next, pg_compress_specification *);
 extern bbsink *bbsink_lz4_new(bbsink *next, pg_compress_specification *);
 extern bbsink *bbsink_zstd_new(bbsink *next, pg_compress_specification *);
-extern bbsink *bbsink_progress_new(bbsink *next, bool estimate_backup_size,
-								   bool incremental);
+extern bbsink *bbsink_progress_new(bbsink *next, bool estimate_backup_size);
 extern bbsink *bbsink_server_new(bbsink *next, char *pathname);
 extern bbsink *bbsink_throttle_new(bbsink *next, uint32 maxrate);
 
@@ -297,5 +296,6 @@ extern void basebackup_progress_wait_checkpoint(void);
 extern void basebackup_progress_estimate_backup_size(void);
 extern void basebackup_progress_wait_wal_archive(bbsink_state *);
 extern void basebackup_progress_transfer_wal(void);
+extern void basebackup_progress_done(void);
 
 #endif

@@ -4,7 +4,7 @@
  *	  vacuum for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,12 +20,12 @@
 #include "access/spgxlog.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
+#include "catalog/storage_xlog.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
-#include "storage/read_stream.h"
 #include "utils/snapmgr.h"
 
 
@@ -61,7 +61,7 @@ typedef struct spgBulkDeleteState
  * ensures that scans of the list don't miss items added during the scan.
  */
 static void
-spgAddPendingTID(spgBulkDeleteState *bds, const ItemPointerData *tid)
+spgAddPendingTID(spgBulkDeleteState *bds, ItemPointer tid)
 {
 	spgVacPendingItem *pitem;
 	spgVacPendingItem **listLink;
@@ -76,7 +76,7 @@ spgAddPendingTID(spgBulkDeleteState *bds, const ItemPointerData *tid)
 		listLink = &pitem->next;
 	}
 	/* not there, so append new entry */
-	pitem = palloc_object(spgVacPendingItem);
+	pitem = (spgVacPendingItem *) palloc(sizeof(spgVacPendingItem));
 	pitem->tid = *tid;
 	pitem->done = false;
 	pitem->next = NULL;
@@ -381,14 +381,14 @@ vacuumLeafPage(spgBulkDeleteState *bds, Relation index, Buffer buffer,
 
 		STORE_STATE(&bds->spgstate, xlrec.stateSrc);
 
-		XLogRegisterData(&xlrec, SizeOfSpgxlogVacuumLeaf);
+		XLogRegisterData((char *) &xlrec, SizeOfSpgxlogVacuumLeaf);
 		/* sizeof(xlrec) should be a multiple of sizeof(OffsetNumber) */
-		XLogRegisterData(toDead, sizeof(OffsetNumber) * xlrec.nDead);
-		XLogRegisterData(toPlaceholder, sizeof(OffsetNumber) * xlrec.nPlaceholder);
-		XLogRegisterData(moveSrc, sizeof(OffsetNumber) * xlrec.nMove);
-		XLogRegisterData(moveDest, sizeof(OffsetNumber) * xlrec.nMove);
-		XLogRegisterData(chainSrc, sizeof(OffsetNumber) * xlrec.nChain);
-		XLogRegisterData(chainDest, sizeof(OffsetNumber) * xlrec.nChain);
+		XLogRegisterData((char *) toDead, sizeof(OffsetNumber) * xlrec.nDead);
+		XLogRegisterData((char *) toPlaceholder, sizeof(OffsetNumber) * xlrec.nPlaceholder);
+		XLogRegisterData((char *) moveSrc, sizeof(OffsetNumber) * xlrec.nMove);
+		XLogRegisterData((char *) moveDest, sizeof(OffsetNumber) * xlrec.nMove);
+		XLogRegisterData((char *) chainSrc, sizeof(OffsetNumber) * xlrec.nChain);
+		XLogRegisterData((char *) chainDest, sizeof(OffsetNumber) * xlrec.nChain);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
 
@@ -466,9 +466,9 @@ vacuumLeafRoot(spgBulkDeleteState *bds, Relation index, Buffer buffer)
 		/* Prepare WAL record */
 		STORE_STATE(&bds->spgstate, xlrec.stateSrc);
 
-		XLogRegisterData(&xlrec, SizeOfSpgxlogVacuumRoot);
+		XLogRegisterData((char *) &xlrec, SizeOfSpgxlogVacuumRoot);
 		/* sizeof(xlrec) should be a multiple of sizeof(OffsetNumber) */
-		XLogRegisterData(toDelete,
+		XLogRegisterData((char *) toDelete,
 						 sizeof(OffsetNumber) * xlrec.nDelete);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
@@ -536,7 +536,7 @@ vacuumRedirectAndPlaceholder(Relation index, Relation heaprel, Buffer buffer)
 		 */
 		if (dt->tupstate == SPGIST_REDIRECT &&
 			(!TransactionIdIsValid(dt->xid) ||
-			 GlobalVisTestIsRemovableXid(vistest, dt->xid, true)))
+			 GlobalVisTestIsRemovableXid(vistest, dt->xid)))
 		{
 			dt->tupstate = SPGIST_PLACEHOLDER;
 			Assert(opaque->nRedirection > 0);
@@ -601,8 +601,8 @@ vacuumRedirectAndPlaceholder(Relation index, Relation heaprel, Buffer buffer)
 
 		XLogBeginInsert();
 
-		XLogRegisterData(&xlrec, SizeOfSpgxlogVacuumRedirect);
-		XLogRegisterData(itemToPlaceholder,
+		XLogRegisterData((char *) &xlrec, SizeOfSpgxlogVacuumRedirect);
+		XLogRegisterData((char *) itemToPlaceholder,
 						 sizeof(OffsetNumber) * xlrec.nToPlaceholder);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
@@ -619,14 +619,19 @@ vacuumRedirectAndPlaceholder(Relation index, Relation heaprel, Buffer buffer)
  * Process one page during a bulkdelete scan
  */
 static void
-spgvacuumpage(spgBulkDeleteState *bds, Buffer buffer)
+spgvacuumpage(spgBulkDeleteState *bds, BlockNumber blkno)
 {
 	Relation	index = bds->info->index;
-	BlockNumber blkno = BufferGetBlockNumber(buffer);
+	Buffer		buffer;
 	Page		page;
 
+	/* call vacuum_delay_point while not holding any buffer lock */
+	vacuum_delay_point();
+
+	buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
+								RBM_NORMAL, bds->info->strategy);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	page = BufferGetPage(buffer);
+	page = (Page) BufferGetPage(buffer);
 
 	if (PageIsNew(page))
 	{
@@ -700,14 +705,14 @@ spgprocesspending(spgBulkDeleteState *bds)
 			continue;			/* ignore already-done items */
 
 		/* call vacuum_delay_point while not holding any buffer lock */
-		vacuum_delay_point(false);
+		vacuum_delay_point();
 
 		/* examine the referenced page */
 		blkno = ItemPointerGetBlockNumber(&pitem->tid);
 		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, bds->info->strategy);
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buffer);
+		page = (Page) BufferGetPage(buffer);
 
 		if (PageIsNew(page) || SpGistPageIsDeleted(page))
 		{
@@ -801,9 +806,8 @@ spgvacuumscan(spgBulkDeleteState *bds)
 {
 	Relation	index = bds->info->index;
 	bool		needLock;
-	BlockNumber num_pages;
-	BlockRangeReadStreamPrivate p;
-	ReadStream *stream = NULL;
+	BlockNumber num_pages,
+				blkno;
 
 	/* Finish setting up spgBulkDeleteState */
 	initSpGistState(&bds->spgstate, index);
@@ -821,21 +825,6 @@ spgvacuumscan(spgBulkDeleteState *bds)
 
 	/* We can skip locking for new or temp relations */
 	needLock = !RELATION_IS_LOCAL(index);
-	p.current_blocknum = SPGIST_METAPAGE_BLKNO + 1;
-
-	/*
-	 * It is safe to use batchmode as block_range_read_stream_cb takes no
-	 * locks.
-	 */
-	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
-										READ_STREAM_FULL |
-										READ_STREAM_USE_BATCHING,
-										bds->info->strategy,
-										index,
-										MAIN_FORKNUM,
-										block_range_read_stream_cb,
-										&p,
-										0);
 
 	/*
 	 * The outer loop iterates over all index pages except the metapage, in
@@ -845,6 +834,7 @@ spgvacuumscan(spgBulkDeleteState *bds)
 	 * delete some deletable tuples.  See more extensive comments about this
 	 * in btvacuumscan().
 	 */
+	blkno = SPGIST_METAPAGE_BLKNO + 1;
 	for (;;)
 	{
 		/* Get the current relation length */
@@ -855,40 +845,17 @@ spgvacuumscan(spgBulkDeleteState *bds)
 			UnlockRelationForExtension(index, ExclusiveLock);
 
 		/* Quit if we've scanned the whole relation */
-		if (p.current_blocknum >= num_pages)
+		if (blkno >= num_pages)
 			break;
-
-		p.last_exclusive = num_pages;
-
 		/* Iterate over pages, then loop back to recheck length */
-		while (true)
+		for (; blkno < num_pages; blkno++)
 		{
-			Buffer		buf;
-
-			/* call vacuum_delay_point while not holding any buffer lock */
-			vacuum_delay_point(false);
-
-			buf = read_stream_next_buffer(stream, NULL);
-
-			if (!BufferIsValid(buf))
-				break;
-
-			spgvacuumpage(bds, buf);
-
+			spgvacuumpage(bds, blkno);
 			/* empty the pending-list after each page */
 			if (bds->pendingList != NULL)
 				spgprocesspending(bds);
 		}
-
-		/*
-		 * We have to reset the read stream to use it again. After returning
-		 * InvalidBuffer, the read stream API won't invoke our callback again
-		 * until the stream has been reset.
-		 */
-		read_stream_reset(stream);
 	}
-
-	read_stream_end(stream);
 
 	/* Propagate local lastUsedPages cache to metablock */
 	SpGistUpdateMetaPage(index);
@@ -954,7 +921,7 @@ spgbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	/* allocate stats if first time through, else re-use existing struct */
 	if (stats == NULL)
-		stats = palloc0_object(IndexBulkDeleteResult);
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 	bds.info = info;
 	bds.stats = stats;
 	bds.callback = callback;
@@ -994,7 +961,7 @@ spgvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	 */
 	if (stats == NULL)
 	{
-		stats = palloc0_object(IndexBulkDeleteResult);
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 		bds.info = info;
 		bds.stats = stats;
 		bds.callback = dummy_callback;

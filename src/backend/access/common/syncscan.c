@@ -36,7 +36,7 @@
  *		ss_report_location	- update current scan location
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -50,7 +50,6 @@
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
-#include "storage/subsystems.h"
 #include "utils/rel.h"
 
 
@@ -112,14 +111,6 @@ typedef struct ss_scan_locations_t
 #define SizeOfScanLocations(N) \
 	(offsetof(ss_scan_locations_t, items) + (N) * sizeof(ss_lru_item_t))
 
-static void SyncScanShmemRequest(void *arg);
-static void SyncScanShmemInit(void *arg);
-
-const ShmemCallbacks SyncScanShmemCallbacks = {
-	.request_fn = SyncScanShmemRequest,
-	.init_fn = SyncScanShmemInit,
-};
-
 /* Pointer to struct in shared memory */
 static ss_scan_locations_t *scan_locations;
 
@@ -129,47 +120,58 @@ static BlockNumber ss_search(RelFileLocator relfilelocator,
 
 
 /*
- * SyncScanShmemRequest --- register this module's shared memory
+ * SyncScanShmemSize --- report amount of shared memory space needed
  */
-static void
-SyncScanShmemRequest(void *arg)
+Size
+SyncScanShmemSize(void)
 {
-	ShmemRequestStruct(.name = "Sync Scan Locations List",
-					   .size = SizeOfScanLocations(SYNC_SCAN_NELEM),
-					   .ptr = (void **) &scan_locations,
-		);
+	return SizeOfScanLocations(SYNC_SCAN_NELEM);
 }
 
 /*
  * SyncScanShmemInit --- initialize this module's shared memory
  */
-static void
-SyncScanShmemInit(void *arg)
+void
+SyncScanShmemInit(void)
 {
 	int			i;
+	bool		found;
 
-	scan_locations->head = &scan_locations->items[0];
-	scan_locations->tail = &scan_locations->items[SYNC_SCAN_NELEM - 1];
+	scan_locations = (ss_scan_locations_t *)
+		ShmemInitStruct("Sync Scan Locations List",
+						SizeOfScanLocations(SYNC_SCAN_NELEM),
+						&found);
 
-	for (i = 0; i < SYNC_SCAN_NELEM; i++)
+	if (!IsUnderPostmaster)
 	{
-		ss_lru_item_t *item = &scan_locations->items[i];
+		/* Initialize shared memory area */
+		Assert(!found);
 
-		/*
-		 * Initialize all slots with invalid values. As scans are started,
-		 * these invalid entries will fall off the LRU list and get replaced
-		 * with real entries.
-		 */
-		item->location.relfilelocator.spcOid = InvalidOid;
-		item->location.relfilelocator.dbOid = InvalidOid;
-		item->location.relfilelocator.relNumber = InvalidRelFileNumber;
-		item->location.location = InvalidBlockNumber;
+		scan_locations->head = &scan_locations->items[0];
+		scan_locations->tail = &scan_locations->items[SYNC_SCAN_NELEM - 1];
 
-		item->prev = (i > 0) ?
-			(&scan_locations->items[i - 1]) : NULL;
-		item->next = (i < SYNC_SCAN_NELEM - 1) ?
-			(&scan_locations->items[i + 1]) : NULL;
+		for (i = 0; i < SYNC_SCAN_NELEM; i++)
+		{
+			ss_lru_item_t *item = &scan_locations->items[i];
+
+			/*
+			 * Initialize all slots with invalid values. As scans are started,
+			 * these invalid entries will fall off the LRU list and get
+			 * replaced with real entries.
+			 */
+			item->location.relfilelocator.spcOid = InvalidOid;
+			item->location.relfilelocator.dbOid = InvalidOid;
+			item->location.relfilelocator.relNumber = InvalidRelFileNumber;
+			item->location.location = InvalidBlockNumber;
+
+			item->prev = (i > 0) ?
+				(&scan_locations->items[i - 1]) : NULL;
+			item->next = (i < SYNC_SCAN_NELEM - 1) ?
+				(&scan_locations->items[i + 1]) : NULL;
+		}
 	}
+	else
+		Assert(found);
 }
 
 /*

@@ -3,7 +3,7 @@
  * pgfnames.c
  *	  directory handling functions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -49,7 +49,7 @@ pgfnames(const char *path)
 		return NULL;
 	}
 
-	filenames = palloc_array(char *, fnsize);
+	filenames = (char **) palloc(fnsize * sizeof(char *));
 
 	while (errno = 0, (file = readdir(dir)) != NULL)
 	{
@@ -58,7 +58,8 @@ pgfnames(const char *path)
 			if (numnames + 1 >= fnsize)
 			{
 				fnsize *= 2;
-				filenames = repalloc_array(filenames, char *, fnsize);
+				filenames = (char **) repalloc(filenames,
+											   fnsize * sizeof(char *));
 			}
 			filenames[numnames++] = pstrdup(file->d_name);
 		}

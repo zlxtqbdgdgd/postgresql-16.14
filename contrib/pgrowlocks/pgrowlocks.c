@@ -37,16 +37,12 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
-#include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "pgrowlocks",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pgrowlocks);
 
@@ -115,7 +111,7 @@ pgrowlocks(PG_FUNCTION_ARGS)
 					   RelationGetRelationName(rel));
 
 	/* Scan the relation */
-	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 	hscan = (HeapScanDesc) scan;
 
 	attinmeta = TupleDescGetAttInMetadata(rsinfo->setDesc);
@@ -142,8 +138,8 @@ pgrowlocks(PG_FUNCTION_ARGS)
 		 */
 		if (htsu == TM_BeingModified)
 		{
-			values[Atnum_tid] = DatumGetCString(DirectFunctionCall1(tidout,
-																	PointerGetDatum(&tuple->t_self)));
+			values[Atnum_tid] = (char *) DirectFunctionCall1(tidout,
+															 PointerGetDatum(&tuple->t_self));
 
 			values[Atnum_xmax] = palloc(NCHARS * sizeof(char));
 			snprintf(values[Atnum_xmax], NCHARS, "%u", xmax);
@@ -204,10 +200,10 @@ pgrowlocks(PG_FUNCTION_ARGS)
 								snprintf(buf, NCHARS, "For No Key Update");
 								break;
 							case MultiXactStatusForShare:
-								snprintf(buf, NCHARS, "For Share");
+								snprintf(buf, NCHARS, "Share");
 								break;
 							case MultiXactStatusForKeyShare:
-								snprintf(buf, NCHARS, "For Key Share");
+								snprintf(buf, NCHARS, "Key Share");
 								break;
 						}
 						strcat(values[Atnum_modes], buf);

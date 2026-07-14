@@ -6,19 +6,6 @@
 
 static struct variable *allvariables = NULL;
 
-/* this probably belongs in util.c, but for now it's only needed here */
-static char *
-loc_nstrdup(const char *in, size_t len)
-{
-	char	   *out;
-
-	out = loc_alloc(len + 1);
-	memcpy(out, in, len);
-	out[len] = '\0';
-
-	return out;
-}
-
 struct variable *
 new_variable(const char *name, struct ECPGtype *type, int brace_level)
 {
@@ -34,34 +21,22 @@ new_variable(const char *name, struct ECPGtype *type, int brace_level)
 	return p;
 }
 
-/*
- * Perform lookup of a field within a struct
- *
- * 'name' is the entire C variable name
- * 'str' points just before the next field name to parse
- * 'members' and 'brace_level' describe the struct we are looking into
- *
- * Returns NULL if field is not found.
- *
- * This recurses if needed to handle sub-fields.
- */
 static struct variable *
-find_struct_member(const char *name, const char *str,
-				   struct ECPGstruct_member *members, int brace_level)
+find_struct_member(char *name, char *str, struct ECPGstruct_member *members, int brace_level)
 {
-	/* ++ here skips over the '.', or the '>' of '->' */
-	const char *next = strpbrk(++str, ".-["),
+	char	   *next = strpbrk(++str, ".-["),
 			   *end,
-			   *field;
+				c = '\0';
 
 	if (next != NULL)
-		field = loc_nstrdup(str, next - str);
-	else
-		field = str;
+	{
+		c = *next;
+		*next = '\0';
+	}
 
 	for (; members; members = members->next)
 	{
-		if (strcmp(members->name, field) == 0)
+		if (strcmp(members->name, str) == 0)
 		{
 			if (next == NULL)
 			{
@@ -79,13 +54,14 @@ find_struct_member(const char *name, const char *str,
 			}
 			else
 			{
-				if (*next == '[')
+				*next = c;
+				if (c == '[')
 				{
 					int			count;
 
 					/*
-					 * We don't care about what's inside the array brackets so
-					 * just scan to find the matching right bracket.
+					 * We don't care about what's inside the array braces so
+					 * just eat up the character
 					 */
 					for (count = 1, end = next + 1; count; end++)
 					{
@@ -146,35 +122,26 @@ find_struct_member(const char *name, const char *str,
 	return NULL;
 }
 
-/*
- * Do struct lookup when we have found var.field, var->field, or var[n].field
- *
- * 'name' is the entire C variable name
- * 'next' points at the character after the base name
- * 'end' points at the character after the subscript, if there was a
- * subscript, else it's the same as 'next'.
- *
- * This is used only at the first level of field reference; sub-fields will
- * be handled by internal recursion in find_struct_member.
- */
 static struct variable *
-find_struct(const char *name, const char *next, const char *end)
+find_struct(char *name, char *next, char *end)
 {
-	char	   *prefix;
 	struct variable *p;
+	char		c = *next;
 
 	/* first get the mother structure entry */
-	prefix = loc_nstrdup(name, next - name);
-	p = find_variable(prefix);
+	*next = '\0';
+	p = find_variable(name);
 
-	if (*next == '-')
+	if (c == '-')
 	{
-		/* We have var->field */
 		if (p->type->type != ECPGt_array)
-			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer", prefix);
+			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer", name);
 
 		if (p->type->u.element->type != ECPGt_struct && p->type->u.element->type != ECPGt_union)
-			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", prefix);
+			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", name);
+
+		/* restore the name, we will need it later */
+		*next = c;
 
 		return find_struct_member(name, ++end, p->type->u.element->u.members, p->brace_level);
 	}
@@ -182,29 +149,32 @@ find_struct(const char *name, const char *next, const char *end)
 	{
 		if (next == end)
 		{
-			/* We have var.field */
 			if (p->type->type != ECPGt_struct && p->type->type != ECPGt_union)
-				mmfatal(PARSE_ERROR, "variable \"%s\" is neither a structure nor a union", prefix);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is neither a structure nor a union", name);
+
+			/* restore the name, we will need it later */
+			*next = c;
 
 			return find_struct_member(name, end, p->type->u.members, p->brace_level);
 		}
 		else
 		{
-			/* We have var[n].field */
 			if (p->type->type != ECPGt_array)
-				mmfatal(PARSE_ERROR, "variable \"%s\" is not an array", prefix);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is not an array", name);
 
 			if (p->type->u.element->type != ECPGt_struct && p->type->u.element->type != ECPGt_union)
-				mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", prefix);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", name);
+
+			/* restore the name, we will need it later */
+			*next = c;
 
 			return find_struct_member(name, end, p->type->u.element->u.members, p->brace_level);
 		}
 	}
 }
 
-/* Look up a variable given its base name */
 static struct variable *
-find_simple(const char *name)
+find_simple(char *name)
 {
 	struct variable *p;
 
@@ -217,24 +187,12 @@ find_simple(const char *name)
 	return NULL;
 }
 
-/*
- * Build a "struct variable" for a C variable reference.
- *
- * The given "name" string is a CVARIABLE per pgc.l, so it can include not
- * only a base variable name but also ".field", "->field", or "[subscript]"
- * decoration.  We don't need to understand that fully, because we always
- * duplicate the whole string into the name field of the result variable
- * and emit it literally to the output file; the C compiler will make sense
- * of it later.  What we do need to do here is identify the type of the
- * target field or array element so that we can attach a correct ECPGtype
- * struct to the result.
- *
- * Note that this function will end the program in case of an unknown variable.
- */
+/* Note that this function will end the program in case of an unknown */
+/* variable */
 struct variable *
-find_variable(const char *name)
+find_variable(char *name)
 {
-	const char *next,
+	char	   *next,
 			   *end;
 	struct variable *p;
 	int			count;
@@ -242,12 +200,11 @@ find_variable(const char *name)
 	next = strpbrk(name, ".[-");
 	if (next)
 	{
-		/* Deal with field/subscript decoration */
 		if (*next == '[')
 		{
 			/*
-			 * We don't care about what's inside the array brackets so just
-			 * scan to find the matching right bracket.
+			 * We don't care about what's inside the array braces so just eat
+			 * up the characters
 			 */
 			for (count = 1, end = next + 1; count; end++)
 			{
@@ -259,33 +216,22 @@ find_variable(const char *name)
 					case ']':
 						count--;
 						break;
-					case '\0':
-						mmfatal(PARSE_ERROR, "unmatched bracket in variable \"%s\"", name);
-						break;
 					default:
 						break;
 				}
 			}
 			if (*end == '.')
-			{
-				/* We have var[n].field */
 				p = find_struct(name, next, end);
-			}
 			else
 			{
-				/*
-				 * Note: this part assumes we must just have var[n] without
-				 * any further decoration, which fails to handle cases such as
-				 * var[n]->field.  For now, that's okay because
-				 * pointer-to-pointer variables are rejected elsewhere.
-				 */
-				char	   *prefix = loc_nstrdup(name, next - name);
+				char		c = *next;
 
-				p = find_simple(prefix);
+				*next = '\0';
+				p = find_simple(name);
 				if (p == NULL)
-					mmfatal(PARSE_ERROR, "variable \"%s\" is not declared", prefix);
-				if (p->type->type != ECPGt_array)
-					mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer", prefix);
+					mmfatal(PARSE_ERROR, "variable \"%s\" is not declared", name);
+
+				*next = c;
 				switch (p->type->u.element->type)
 				{
 					case ECPGt_array:
@@ -299,10 +245,7 @@ find_variable(const char *name)
 			}
 		}
 		else
-		{
-			/* Must be var.field or var->field */
 			p = find_struct(name, next, next);
-		}
 	}
 	else
 		p = find_simple(name);
@@ -332,12 +275,7 @@ remove_typedefs(int brace_level)
 				types = next;
 
 			if (p->type->type_enum == ECPGt_struct || p->type->type_enum == ECPGt_union)
-				ECPGfree_struct_member(p->struct_member_list);
-			free(p->type->type_storage);
-			free(p->type->type_str);
-			free(p->type->type_dimension);
-			free(p->type->type_index);
-			free(p->type->type_sizeof);
+				free(p->struct_member_list);
 			free(p->type);
 			free(p->name);
 			free(p);
@@ -379,7 +317,6 @@ remove_variables(int brace_level)
 							prevvar->next = nextvar;
 						else
 							ptr->argsinsert = nextvar;
-						free(varptr);
 					}
 					else
 						prevvar = varptr;
@@ -395,7 +332,6 @@ remove_variables(int brace_level)
 							prevvar->next = nextvar;
 						else
 							ptr->argsresult = nextvar;
-						free(varptr);
 					}
 					else
 						prevvar = varptr;
@@ -430,28 +366,13 @@ struct arguments *argsresult = NULL;
 void
 reset_variables(void)
 {
-	struct arguments *p,
-			   *next;
-
-	for (p = argsinsert; p; p = next)
-	{
-		next = p->next;
-		free(p);
-	}
 	argsinsert = NULL;
-	for (p = argsresult; p; p = next)
-	{
-		next = p->next;
-		free(p);
-	}
 	argsresult = NULL;
 }
 
-/*
- * Insert a new variable into our request list.
+/* Insert a new variable into our request list.
  * Note: The list is dumped from the end,
- * so we have to add new entries at the beginning
- */
+ * so we have to add new entries at the beginning */
 void
 add_variable_to_head(struct arguments **list, struct variable *var, struct variable *ind)
 {
@@ -504,14 +425,12 @@ remove_variable_from_list(struct arguments **list, struct variable *var)
 			prev->next = p->next;
 		else
 			*list = p->next;
-		free(p);
 	}
 }
 
-/*
- * Dump out a list of all the variable on this list.
- * This is a recursive function that works from the end of the list and
- * deletes the list as we go on.
+/* Dump out a list of all the variable on this list.
+   This is a recursive function that works from the end of the list and
+   deletes the list as we go on.
  */
 void
 dump_variables(struct arguments *list, int mode)
@@ -593,10 +512,7 @@ get_typedef(const char *name, bool noerror)
 }
 
 void
-adjust_array(enum ECPGttype type_enum,
-			 const char **dimension, const char **length,
-			 const char *type_dimension, const char *type_index,
-			 int pointer_len, bool type_definition)
+adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *type_dimension, char *type_index, int pointer_len, bool type_definition)
 {
 	if (atoi(type_index) >= 0)
 	{
@@ -639,7 +555,7 @@ adjust_array(enum ECPGttype type_enum,
 			if (pointer_len)
 			{
 				*length = *dimension;
-				*dimension = "0";
+				*dimension = mm_strdup("0");
 			}
 
 			if (atoi(*length) >= 0)
@@ -650,13 +566,13 @@ adjust_array(enum ECPGttype type_enum,
 		case ECPGt_bytea:
 			/* pointer has to get dimension 0 */
 			if (pointer_len)
-				*dimension = "0";
+				*dimension = mm_strdup("0");
 
 			/* one index is the string length */
 			if (atoi(*length) < 0)
 			{
 				*length = *dimension;
-				*dimension = "-1";
+				*dimension = mm_strdup("-1");
 			}
 
 			break;
@@ -666,13 +582,13 @@ adjust_array(enum ECPGttype type_enum,
 			/* char ** */
 			if (pointer_len == 2)
 			{
-				*length = *dimension = "0";
+				*length = *dimension = mm_strdup("0");
 				break;
 			}
 
 			/* pointer has to get length 0 */
 			if (pointer_len == 1)
-				*length = "0";
+				*length = mm_strdup("0");
 
 			/* one index is the string length */
 			if (atoi(*length) < 0)
@@ -687,13 +603,13 @@ adjust_array(enum ECPGttype type_enum,
 					 * do not change this for typedefs since it will be
 					 * changed later on when the variable is defined
 					 */
-					*length = "1";
+					*length = mm_strdup("1");
 				else if (strcmp(*dimension, "0") == 0)
-					*length = "-1";
+					*length = mm_strdup("-1");
 				else
 					*length = *dimension;
 
-				*dimension = "-1";
+				*dimension = mm_strdup("-1");
 			}
 			break;
 		default:
@@ -701,7 +617,7 @@ adjust_array(enum ECPGttype type_enum,
 			if (pointer_len)
 			{
 				*length = *dimension;
-				*dimension = "0";
+				*dimension = mm_strdup("0");
 			}
 
 			if (atoi(*length) >= 0)

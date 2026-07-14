@@ -8,6 +8,7 @@
 
 #include <limits.h>
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -17,10 +18,12 @@
 #include "plpy_main.h"
 #include "plpy_planobject.h"
 #include "plpy_plpymodule.h"
+#include "plpy_procedure.h"
 #include "plpy_resultobject.h"
 #include "plpy_spi.h"
-#include "plpy_util.h"
+#include "plpython.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 static PyObject *PLy_spi_execute_query(char *query, long limit);
 static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
@@ -28,8 +31,7 @@ static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
 static void PLy_spi_exception_set(PyObject *excclass, ErrorData *edata);
 
 
-/*
- * prepare(query="select * from foo")
+/* prepare(query="select * from foo")
  * prepare(query="select * from foo where bar = $1", params=["text"])
  * prepare(query="select * from foo where bar = $1", params=["text"], limit=5)
  */
@@ -66,8 +68,9 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	nargs = list ? PySequence_Length(list) : 0;
 
 	plan->nargs = nargs;
-	plan->types = nargs ? palloc0_array(Oid, nargs) : NULL;
-	plan->args = nargs ? palloc0_array(PLyObToDatum, nargs) : NULL;
+	plan->types = nargs ? palloc0(sizeof(Oid) * nargs) : NULL;
+	plan->values = nargs ? palloc0(sizeof(Datum) * nargs) : NULL;
+	plan->args = nargs ? palloc0(sizeof(PLyObToDatum) * nargs) : NULL;
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -87,11 +90,6 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			int32		typmod;
 
 			optr = PySequence_GetItem(list, i);
-
-			/* PySequence_GetItem() can return NULL, with an exception set */
-			if (optr == NULL)
-				PLy_elog(ERROR, "could not get element %d from sequence", i);
-
 			if (PyUnicode_Check(optr))
 				sptr = PLyUnicode_AsString(optr);
 			else
@@ -149,8 +147,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	return (PyObject *) plan;
 }
 
-/*
- * execute(query="select * from foo", limit=5)
+/* execute(query="select * from foo", limit=5)
  * execute(plan=plan, values=(foo, bar), limit=5)
  */
 PyObject *
@@ -255,11 +252,6 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 			PyObject   *elem;
 
 			elem = PySequence_GetItem(list, j);
-
-			/* PySequence_GetItem() can return NULL, with an exception set */
-			if (elem == NULL)
-				PLy_elog(ERROR, "could not get element %d from sequence", j);
-
 			PG_TRY(2);
 			{
 				bool		isnull;

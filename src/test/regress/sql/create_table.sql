@@ -30,12 +30,6 @@ CREATE TEMP TABLE pg_temp.doubly_temp (a int primary key);		-- also OK
 CREATE TEMP TABLE public.temp_to_perm (a int primary key);		-- not OK
 DROP TABLE unlogged1, public.unlogged2;
 
-CREATE UNLOGGED TABLE unlogged1 (a int) PARTITION BY RANGE (a); -- fail
-CREATE TABLE unlogged1 (a int) PARTITION BY RANGE (a); -- ok
-ALTER TABLE unlogged1 SET LOGGED; -- fails
-ALTER TABLE unlogged1 SET UNLOGGED; -- fails
-DROP TABLE unlogged1;
-
 CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
 CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
 CREATE TABLE IF NOT EXISTS as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
@@ -105,13 +99,6 @@ SAVEPOINT q; DROP TABLE remember_node_subid; ROLLBACK TO q;
 COMMIT;
 DROP TABLE remember_node_subid;
 
--- generated NOT NULL constraint names must not collide with explicitly named constraints
-CREATE TABLE two_not_null_constraints (
-   col integer NOT NULL,
-   CONSTRAINT two_not_null_constraints_col_not_null CHECK (col IS NOT NULL)
-);
-DROP TABLE two_not_null_constraints;
-
 --
 -- Partitioned tables
 --
@@ -126,6 +113,12 @@ CREATE TABLE partitioned (
 	a1 int,
 	a2 int
 ) PARTITION BY LIST (a1, a2);	-- fail
+
+-- unsupported constraint type for partitioned tables
+CREATE TABLE partitioned (
+	a int,
+	EXCLUDE USING gist (a WITH &&)
+) PARTITION BY RANGE (a);
 
 -- prevent using prohibited expressions in the key
 CREATE FUNCTION retset (a int) RETURNS SETOF int AS $$ SELECT 1; $$ LANGUAGE SQL IMMUTABLE;
@@ -547,11 +540,11 @@ CREATE TABLE part_b PARTITION OF parted (
 	CONSTRAINT check_b CHECK (b >= 0)
 ) FOR VALUES IN ('b');
 -- conislocal should be false for any merged constraints, true otherwise
-SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY conislocal, coninhcount;
 
 -- Once check_b is added to the parent, it should be made non-local for part_b
 ALTER TABLE parted ADD CONSTRAINT check_b CHECK (b >= 0);
-SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
 
 -- Neither check_a nor check_b are droppable from part_b
 ALTER TABLE part_b DROP CONSTRAINT check_a;
@@ -561,7 +554,7 @@ ALTER TABLE part_b DROP CONSTRAINT check_b;
 -- traditional inheritance where they will be left behind, because they would
 -- be local constraints.
 ALTER TABLE parted DROP CONSTRAINT check_a, DROP CONSTRAINT check_b;
-SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
 
 -- specify PARTITION BY for a partition
 CREATE TABLE fail_part_col_not_found PARTITION OF parted FOR VALUES IN ('c') PARTITION BY RANGE (c);

@@ -4,7 +4,7 @@
  *	  Utility routines for the Postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,15 +20,14 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
-#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
+#include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
-#include "utils/rel.h"
 #include "utils/typcache.h"
-#include "lib/qunique.h"
 
 
 /*
@@ -38,61 +37,54 @@
 Datum
 ginhandler(PG_FUNCTION_ARGS)
 {
-	static const IndexAmRoutine amroutine = {
-		.type = T_IndexAmRoutine,
-		.amstrategies = 0,
-		.amsupport = GINNProcs,
-		.amoptsprocnum = GIN_OPTIONS_PROC,
-		.amcanorder = false,
-		.amcanorderbyop = false,
-		.amcanhash = false,
-		.amconsistentequality = false,
-		.amconsistentordering = false,
-		.amcanbackward = false,
-		.amcanunique = false,
-		.amcanmulticol = true,
-		.amoptionalkey = true,
-		.amsearcharray = false,
-		.amsearchnulls = false,
-		.amstorage = true,
-		.amclusterable = false,
-		.ampredlocks = true,
-		.amcanparallel = false,
-		.amcanbuildparallel = true,
-		.amcaninclude = false,
-		.amusemaintenanceworkmem = true,
-		.amsummarizing = false,
-		.amparallelvacuumoptions =
-		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP,
-		.amkeytype = InvalidOid,
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
-		.ambuild = ginbuild,
-		.ambuildempty = ginbuildempty,
-		.aminsert = gininsert,
-		.aminsertcleanup = NULL,
-		.ambulkdelete = ginbulkdelete,
-		.amvacuumcleanup = ginvacuumcleanup,
-		.amcanreturn = NULL,
-		.amcostestimate = gincostestimate,
-		.amgettreeheight = NULL,
-		.amoptions = ginoptions,
-		.amproperty = NULL,
-		.ambuildphasename = ginbuildphasename,
-		.amvalidate = ginvalidate,
-		.amadjustmembers = ginadjustmembers,
-		.ambeginscan = ginbeginscan,
-		.amrescan = ginrescan,
-		.amgettuple = NULL,
-		.amgetbitmap = gingetbitmap,
-		.amendscan = ginendscan,
-		.ammarkpos = NULL,
-		.amrestrpos = NULL,
-		.amestimateparallelscan = NULL,
-		.aminitparallelscan = NULL,
-		.amparallelrescan = NULL,
-	};
+	amroutine->amstrategies = 0;
+	amroutine->amsupport = GINNProcs;
+	amroutine->amoptsprocnum = GIN_OPTIONS_PROC;
+	amroutine->amcanorder = false;
+	amroutine->amcanorderbyop = false;
+	amroutine->amcanbackward = false;
+	amroutine->amcanunique = false;
+	amroutine->amcanmulticol = true;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = false;
+	amroutine->amsearchnulls = false;
+	amroutine->amstorage = true;
+	amroutine->amclusterable = false;
+	amroutine->ampredlocks = true;
+	amroutine->amcanparallel = false;
+	amroutine->amcaninclude = false;
+	amroutine->amusemaintenanceworkmem = true;
+	amroutine->amsummarizing = false;
+	amroutine->amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP;
+	amroutine->amkeytype = InvalidOid;
 
-	PG_RETURN_POINTER(&amroutine);
+	amroutine->ambuild = ginbuild;
+	amroutine->ambuildempty = ginbuildempty;
+	amroutine->aminsert = gininsert;
+	amroutine->ambulkdelete = ginbulkdelete;
+	amroutine->amvacuumcleanup = ginvacuumcleanup;
+	amroutine->amcanreturn = NULL;
+	amroutine->amcostestimate = gincostestimate;
+	amroutine->amoptions = ginoptions;
+	amroutine->amproperty = NULL;
+	amroutine->ambuildphasename = NULL;
+	amroutine->amvalidate = ginvalidate;
+	amroutine->amadjustmembers = ginadjustmembers;
+	amroutine->ambeginscan = ginbeginscan;
+	amroutine->amrescan = ginrescan;
+	amroutine->amgettuple = NULL;
+	amroutine->amgetbitmap = gingetbitmap;
+	amroutine->amendscan = ginendscan;
+	amroutine->ammarkpos = NULL;
+	amroutine->amrestrpos = NULL;
+	amroutine->amestimateparallelscan = NULL;
+	amroutine->aminitparallelscan = NULL;
+	amroutine->amparallelrescan = NULL;
+
+	PG_RETURN_POINTER(amroutine);
 }
 
 /*
@@ -130,7 +122,6 @@ initGinState(GinState *state, Relation index)
 							   attr->attndims);
 			TupleDescInitEntryCollation(state->tupdesc[i], (AttrNumber) 2,
 										attr->attcollation);
-			TupleDescFinalize(state->tupdesc[i]);
 		}
 
 		/*
@@ -390,9 +381,56 @@ GinInitMetabuffer(Buffer b)
 }
 
 /*
- * Support for sorting key datums and detecting duplicates in
- * ginExtractEntries
+ * Compare two keys of the same index column
  */
+int
+ginCompareEntries(GinState *ginstate, OffsetNumber attnum,
+				  Datum a, GinNullCategory categorya,
+				  Datum b, GinNullCategory categoryb)
+{
+	/* if not of same null category, sort by that first */
+	if (categorya != categoryb)
+		return (categorya < categoryb) ? -1 : 1;
+
+	/* all null items in same category are equal */
+	if (categorya != GIN_CAT_NORM_KEY)
+		return 0;
+
+	/* both not null, so safe to call the compareFn */
+	return DatumGetInt32(FunctionCall2Coll(&ginstate->compareFn[attnum - 1],
+										   ginstate->supportCollation[attnum - 1],
+										   a, b));
+}
+
+/*
+ * Compare two keys of possibly different index columns
+ */
+int
+ginCompareAttEntries(GinState *ginstate,
+					 OffsetNumber attnuma, Datum a, GinNullCategory categorya,
+					 OffsetNumber attnumb, Datum b, GinNullCategory categoryb)
+{
+	/* attribute number is the first sort key */
+	if (attnuma != attnumb)
+		return (attnuma < attnumb) ? -1 : 1;
+
+	return ginCompareEntries(ginstate, attnuma, a, categorya, b, categoryb);
+}
+
+
+/*
+ * Support for sorting key datums in ginExtractEntries
+ *
+ * Note: we only have to worry about null and not-null keys here;
+ * ginExtractEntries never generates more than one placeholder null,
+ * so it doesn't have to sort those.
+ */
+typedef struct
+{
+	Datum		datum;
+	bool		isnull;
+} keyEntryData;
+
 typedef struct
 {
 	FmgrInfo   *cmpDatumFunc;
@@ -403,14 +441,24 @@ typedef struct
 static int
 cmpEntries(const void *a, const void *b, void *arg)
 {
-	const Datum *aa = (const Datum *) a;
-	const Datum *bb = (const Datum *) b;
+	const keyEntryData *aa = (const keyEntryData *) a;
+	const keyEntryData *bb = (const keyEntryData *) b;
 	cmpEntriesArg *data = (cmpEntriesArg *) arg;
 	int			res;
 
-	res = DatumGetInt32(FunctionCall2Coll(data->cmpDatumFunc,
-										  data->collation,
-										  *aa, *bb));
+	if (aa->isnull)
+	{
+		if (bb->isnull)
+			res = 0;			/* NULL "=" NULL */
+		else
+			res = 1;			/* NULL ">" not-NULL */
+	}
+	else if (bb->isnull)
+		res = -1;				/* not-NULL "<" NULL */
+	else
+		res = DatumGetInt32(FunctionCall2Coll(data->cmpDatumFunc,
+											  data->collation,
+											  aa->datum, bb->datum));
 
 	/*
 	 * Detect if we have any duplicates.  If there are equal keys, qsort must
@@ -423,14 +471,6 @@ cmpEntries(const void *a, const void *b, void *arg)
 	return res;
 }
 
-#define ST_SORT qsort_arg_entries
-#define ST_ELEMENT_TYPE Datum
-#define ST_COMPARE_ARG_TYPE cmpEntriesArg
-#define ST_COMPARE(a, b, arg) cmpEntries(a, b, arg)
-#define ST_SCOPE static
-#define ST_DEFINE
-#define ST_DECLARE
-#include "lib/sort_template.h"
 
 /*
  * Extract the index key values from an indexable item
@@ -441,13 +481,11 @@ cmpEntries(const void *a, const void *b, void *arg)
 Datum *
 ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 				  Datum value, bool isNull,
-				  int32 *nentries_p, GinNullCategory **categories_p)
+				  int32 *nentries, GinNullCategory **categories)
 {
 	Datum	   *entries;
 	bool	   *nullFlags;
-	GinNullCategory *categories;
-	bool		hasNull;
-	int32		nentries;
+	int32		i;
 
 	/*
 	 * We don't call the extractValueFn on a null item.  Instead generate a
@@ -455,60 +493,42 @@ ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 	 */
 	if (isNull)
 	{
-		*nentries_p = 1;
-		entries = palloc_object(Datum);
+		*nentries = 1;
+		entries = (Datum *) palloc(sizeof(Datum));
 		entries[0] = (Datum) 0;
-		*categories_p = palloc_object(GinNullCategory);
-		(*categories_p)[0] = GIN_CAT_NULL_ITEM;
+		*categories = (GinNullCategory *) palloc(sizeof(GinNullCategory));
+		(*categories)[0] = GIN_CAT_NULL_ITEM;
 		return entries;
 	}
 
 	/* OK, call the opclass's extractValueFn */
 	nullFlags = NULL;			/* in case extractValue doesn't set it */
-	nentries = 0;
 	entries = (Datum *)
 		DatumGetPointer(FunctionCall3Coll(&ginstate->extractValueFn[attnum - 1],
 										  ginstate->supportCollation[attnum - 1],
 										  value,
-										  PointerGetDatum(&nentries),
+										  PointerGetDatum(nentries),
 										  PointerGetDatum(&nullFlags)));
 
 	/*
 	 * Generate a placeholder if the item contained no keys.
 	 */
-	if (entries == NULL || nentries <= 0)
+	if (entries == NULL || *nentries <= 0)
 	{
-		*nentries_p = 1;
-		entries = palloc_object(Datum);
+		*nentries = 1;
+		entries = (Datum *) palloc(sizeof(Datum));
 		entries[0] = (Datum) 0;
-		*categories_p = palloc_object(GinNullCategory);
-		(*categories_p)[0] = GIN_CAT_EMPTY_ITEM;
+		*categories = (GinNullCategory *) palloc(sizeof(GinNullCategory));
+		(*categories)[0] = GIN_CAT_EMPTY_ITEM;
 		return entries;
 	}
 
 	/*
-	 * Scan the items for any NULLs.  All NULLs are considered equal, so we
-	 * just need to check and remember if there are any.  We remove them from
-	 * the array here, and after deduplication, put back one NULL entry to
-	 * represent them all.
+	 * If the extractValueFn didn't create a nullFlags array, create one,
+	 * assuming that everything's non-null.
 	 */
-	hasNull = false;
-	if (nullFlags)
-	{
-		int32		numNonNulls = 0;
-
-		for (int32 i = 0; i < nentries; i++)
-		{
-			if (nullFlags[i])
-				hasNull = true;
-			else
-			{
-				entries[numNonNulls] = entries[i];
-				numNonNulls++;
-			}
-		}
-		nentries = numNonNulls;
-	}
+	if (nullFlags == NULL)
+		nullFlags = (bool *) palloc0(*nentries * sizeof(bool));
 
 	/*
 	 * If there's more than one key, sort and unique-ify.
@@ -517,39 +537,63 @@ ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 	 * pretty bad too.  For small numbers of keys it'd likely be better to use
 	 * a simple insertion sort.
 	 */
-	if (nentries > 1)
+	if (*nentries > 1)
 	{
+		keyEntryData *keydata;
 		cmpEntriesArg arg;
+
+		keydata = (keyEntryData *) palloc(*nentries * sizeof(keyEntryData));
+		for (i = 0; i < *nentries; i++)
+		{
+			keydata[i].datum = entries[i];
+			keydata[i].isnull = nullFlags[i];
+		}
 
 		arg.cmpDatumFunc = &ginstate->compareFn[attnum - 1];
 		arg.collation = ginstate->supportCollation[attnum - 1];
 		arg.haveDups = false;
-
-		qsort_arg_entries(entries, nentries, &arg);
+		qsort_arg(keydata, *nentries, sizeof(keyEntryData),
+				  cmpEntries, &arg);
 
 		if (arg.haveDups)
-			nentries = qunique_arg(entries, nentries, sizeof(Datum), cmpEntries, &arg);
+		{
+			/* there are duplicates, must get rid of 'em */
+			int32		j;
+
+			entries[0] = keydata[0].datum;
+			nullFlags[0] = keydata[0].isnull;
+			j = 1;
+			for (i = 1; i < *nentries; i++)
+			{
+				if (cmpEntries(&keydata[i - 1], &keydata[i], &arg) != 0)
+				{
+					entries[j] = keydata[i].datum;
+					nullFlags[j] = keydata[i].isnull;
+					j++;
+				}
+			}
+			*nentries = j;
+		}
+		else
+		{
+			/* easy, no duplicates */
+			for (i = 0; i < *nentries; i++)
+			{
+				entries[i] = keydata[i].datum;
+				nullFlags[i] = keydata[i].isnull;
+			}
+		}
+
+		pfree(keydata);
 	}
 
 	/*
-	 * Create GinNullCategory representation.
+	 * Create GinNullCategory representation from nullFlags.
 	 */
-	{
-		/* palloc0 sets all entries to GIN_CAT_NORM_KEY */
-		StaticAssertDecl(GIN_CAT_NORM_KEY == 0, "Assuming GIN_CAT_NORM_KEY == 0");
-		categories = palloc0_array(GinNullCategory, nentries + (hasNull ? 1 : 0));
-	}
+	*categories = (GinNullCategory *) palloc0(*nentries * sizeof(GinNullCategory));
+	for (i = 0; i < *nentries; i++)
+		(*categories)[i] = (nullFlags[i] ? GIN_CAT_NULL_KEY : GIN_CAT_NORM_KEY);
 
-	/* Put back a NULL entry, if there were any */
-	if (hasNull)
-	{
-		entries[nentries] = (Datum) 0;
-		categories[nentries] = GIN_CAT_NULL_KEY;
-		nentries++;
-	}
-
-	*nentries_p = nentries;
-	*categories_p = categories;
 	return entries;
 }
 
@@ -643,39 +687,14 @@ ginUpdateStats(Relation index, const GinStatsData *stats, bool is_build)
 		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
 
 		XLogBeginInsert();
-		XLogRegisterData(&data, sizeof(ginxlogUpdateMeta));
+		XLogRegisterData((char *) &data, sizeof(ginxlogUpdateMeta));
 		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT | REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE);
 		PageSetLSN(metapage, recptr);
 	}
 
-	END_CRIT_SECTION();
-
 	UnlockReleaseBuffer(metabuffer);
-}
 
-/*
- *	ginbuildphasename() -- Return name of index build phase.
- */
-char *
-ginbuildphasename(int64 phasenum)
-{
-	switch (phasenum)
-	{
-		case PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE:
-			return "initializing";
-		case PROGRESS_GIN_PHASE_INDEXBUILD_TABLESCAN:
-			return "scanning table";
-		case PROGRESS_GIN_PHASE_PERFORMSORT_1:
-			return "sorting tuples (workers)";
-		case PROGRESS_GIN_PHASE_MERGE_1:
-			return "merging tuples (workers)";
-		case PROGRESS_GIN_PHASE_PERFORMSORT_2:
-			return "sorting tuples";
-		case PROGRESS_GIN_PHASE_MERGE_2:
-			return "merging tuples";
-		default:
-			return NULL;
-	}
+	END_CRIT_SECTION();
 }

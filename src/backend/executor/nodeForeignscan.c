@@ -3,7 +3,7 @@
  * nodeForeignscan.c
  *	  Routines to support scans of foreign tables
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,6 +25,7 @@
 #include "executor/executor.h"
 #include "executor/nodeForeignscan.h"
 #include "foreign/fdwapi.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 static TupleTableSlot *ForeignNext(ForeignScanState *node);
@@ -191,7 +192,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 
 		scan_tupdesc = ExecTypeFromTL(node->fdw_scan_tlist);
 		ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
-							  &TTSOpsHeapTuple, 0);
+							  &TTSOpsHeapTuple);
 		/* Node's targetlist will contain Vars with varno = INDEX_VAR */
 		tlistvarno = INDEX_VAR;
 	}
@@ -202,7 +203,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 		/* don't trust FDWs to return tuples fulfilling NOT NULL constraints */
 		scan_tupdesc = CreateTupleDescCopy(RelationGetDescr(currentRelation));
 		ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
-							  &TTSOpsHeapTuple, 0);
+							  &TTSOpsHeapTuple);
 		/* Node's targetlist will contain Vars with varno = scanrelid */
 		tlistvarno = scanrelid;
 	}
@@ -311,6 +312,14 @@ ExecEndForeignScan(ForeignScanState *node)
 	/* Shut down any outer plan. */
 	if (outerPlanState(node))
 		ExecEndNode(outerPlanState(node));
+
+	/* Free the exprcontext */
+	ExecFreeExprContext(&node->ss.ps);
+
+	/* clean out the tuple table */
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

@@ -13,6 +13,9 @@
 #ifndef CHAR_BIT
 #include <limits.h>
 #endif
+#ifdef LOCALE_T_IN_XLOCALE
+#include <xlocale.h>
+#endif
 
 enum COMPAT_MODE
 {
@@ -52,7 +55,7 @@ struct ECPGgeneric_bytea
 struct ECPGtype_information_cache
 {
 	struct ECPGtype_information_cache *next;
-	Oid			oid;
+	int			oid;
 	enum ARRAY_TYPE isarray;
 };
 
@@ -77,7 +80,7 @@ struct statement
 	locale_t	oldlocale;
 #else
 	char	   *oldlocale;
-#ifdef WIN32
+#ifdef HAVE__CONFIGTHREADLOCALE
 	int			oldthreadlocale;
 #endif
 #endif
@@ -166,7 +169,9 @@ bool		ecpg_get_data(const PGresult *, int, int, int, enum ECPGttype type,
 						  enum ECPGttype, char *, char *, long, long, long,
 						  enum ARRAY_TYPE, enum COMPAT_MODE, bool);
 
+#ifdef ENABLE_THREAD_SAFETY
 void		ecpg_pthreads_init(void);
+#endif
 struct connection *ecpg_get_connection(const char *connection_name);
 char	   *ecpg_alloc(long size, int lineno);
 char	   *ecpg_auto_alloc(long size, int lineno);
@@ -175,7 +180,7 @@ void		ecpg_free(void *ptr);
 bool		ecpg_init(const struct connection *con,
 					  const char *connection_name,
 					  const int lineno);
-char	   *ecpg_strdup(const char *string, int lineno, bool *alloc_failed);
+char	   *ecpg_strdup(const char *string, int lineno);
 const char *ecpg_type_name(enum ECPGttype typ);
 int			ecpg_dynamic_type(Oid type);
 int			sqlda_dynamic_type(Oid type, enum COMPAT_MODE compat);
@@ -214,11 +219,11 @@ void		ecpg_raise(int line, int code, const char *sqlstate, const char *str);
 void		ecpg_raise_backend(int line, PGresult *result, PGconn *conn, int compat);
 char	   *ecpg_prepared(const char *name, struct connection *con);
 bool		ecpg_deallocate_all_conn(int lineno, enum COMPAT_MODE c, struct connection *con);
-void		ecpg_log(const char *format, ...) pg_attribute_printf(1, 2);
+void		ecpg_log(const char *format,...) pg_attribute_printf(1, 2);
 bool		ecpg_auto_prepare(int lineno, const char *connection_name,
 							  const int compat, char **name, const char *query);
 bool		ecpg_register_prepared_stmt(struct statement *stmt);
-void		ecpg_init_sqlca(struct sqlca_t *sqlca_p);
+void		ecpg_init_sqlca(struct sqlca_t *sqlca);
 
 struct sqlda_compat *ecpg_build_compat_sqlda(int line, PGresult *res, int row,
 											 enum COMPAT_MODE compat);
@@ -239,10 +244,8 @@ extern char *ecpg_gettext(const char *msgid) pg_attribute_format_arg(1);
 #define ecpg_gettext(x) (x)
 #endif
 
-/*
- * SQLSTATE values generated or processed by ecpglib (intentionally
- * not exported -- users should refer to the codes directly)
- */
+/* SQLSTATE values generated or processed by ecpglib (intentionally
+ * not exported -- users should refer to the codes directly) */
 
 #define ECPG_SQLSTATE_NO_DATA				"02000"
 #define ECPG_SQLSTATE_USING_CLAUSE_DOES_NOT_MATCH_PARAMETERS	"07001"

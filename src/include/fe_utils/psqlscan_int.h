@@ -34,7 +34,7 @@
  * same flex version, or if they don't use the same flex options.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fe_utils/psqlscan_int.h
@@ -51,8 +51,14 @@
  * validity checking; in actual use, this file should always be included
  * from the body of a flex file, where these symbols are already defined.
  */
+#ifndef YY_TYPEDEF_YY_BUFFER_STATE
+#define YY_TYPEDEF_YY_BUFFER_STATE
 typedef struct yy_buffer_state *YY_BUFFER_STATE;
+#endif
+#ifndef YY_TYPEDEF_YY_SCANNER_T
+#define YY_TYPEDEF_YY_SCANNER_T
 typedef void *yyscan_t;
+#endif
 
 /*
  * We use a stack of flex buffers to handle substitution of psql variables.
@@ -98,10 +104,6 @@ typedef struct PsqlScanStateData
 	const char *curline;		/* actual flex input string for cur buf */
 	const char *refline;		/* original data for cur buffer */
 
-	/* status for psql_scan_get_location() */
-	int			cur_line_no;	/* current line#, or 0 if no yylex done */
-	const char *cur_line_ptr;	/* points into cur_line_no'th line in scanbuf */
-
 	/*
 	 * All this state lives across successive input lines, until explicitly
 	 * reset by psql_scan_reset.  start_state is adopted by yylex() on entry,
@@ -117,12 +119,9 @@ typedef struct PsqlScanStateData
 	 * State to track boundaries of BEGIN ... END blocks in function
 	 * definitions, so that semicolons do not send query too early.
 	 */
+	int			identifier_count;	/* identifiers since start of statement */
+	char		identifiers[4]; /* records the first few identifiers */
 	int			begin_depth;	/* depth of begin/end pairs */
-	int			init_idents_count;	/* # identifiers since start of statement */
-	char		init_idents[4]; /* records the first few identifiers */
-	int			sub_idents_count;	/* # identifiers since start of a CREATE
-									 * SCHEMA element */
-	char		sub_idents[4];	/* records the first few of those identifiers */
 
 	/*
 	 * Callback functions provided by the program making use of the lexer,

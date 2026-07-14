@@ -5,7 +5,7 @@
  * Basically this is stuff that is useful in both pg_dump and pg_dumpall.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/dumputils.c
@@ -16,8 +16,6 @@
 
 #include <ctype.h>
 
-#include "common/file_perm.h"
-#include "common/logging.h"
 #include "dumputils.h"
 #include "fe_utils/string_utils.h"
 
@@ -160,7 +158,7 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 	 * Besides, a false mismatch will just cause the output to be a little
 	 * more verbose than it really needed to be.
 	 */
-	grantitems = pg_malloc_array(char *, naclitems);
+	grantitems = (char **) pg_malloc(naclitems * sizeof(char *));
 	for (i = 0; i < naclitems; i++)
 	{
 		bool		found = false;
@@ -176,7 +174,7 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 		if (!found)
 			grantitems[ngrantitems++] = aclitems[i];
 	}
-	revokeitems = pg_malloc_array(char *, nbaseitems);
+	revokeitems = (char **) pg_malloc(nbaseitems * sizeof(char *));
 	for (i = 0; i < nbaseitems; i++)
 	{
 		bool		found = false;
@@ -343,8 +341,8 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 
 	free(aclitems);
 	free(baseitems);
-	pg_free(grantitems);
-	pg_free(revokeitems);
+	free(grantitems);
+	free(revokeitems);
 
 	return ok;
 }
@@ -503,16 +501,12 @@ do { \
 				CONVERT_PRIV('d', "DELETE");
 				CONVERT_PRIV('t', "TRIGGER");
 				CONVERT_PRIV('D', "TRUNCATE");
-				CONVERT_PRIV('m', "MAINTAIN");
 			}
 		}
 
 		/* UPDATE */
 		CONVERT_PRIV('w', "UPDATE");
 	}
-	else if (strcmp(type, "PROPERTY GRAPH") == 0 ||
-			 strcmp(type, "PROPERTY GRAPHS") == 0)
-		CONVERT_PRIV('r', "SELECT");
 	else if (strcmp(type, "FUNCTION") == 0 ||
 			 strcmp(type, "FUNCTIONS") == 0)
 		CONVERT_PRIV('X', "EXECUTE");
@@ -549,8 +543,7 @@ do { \
 		CONVERT_PRIV('s', "SET");
 		CONVERT_PRIV('A', "ALTER SYSTEM");
 	}
-	else if (strcmp(type, "LARGE OBJECT") == 0 ||
-			 strcmp(type, "LARGE OBJECTS") == 0)
+	else if (strcmp(type, "LARGE OBJECT") == 0)
 	{
 		CONVERT_PRIV('r', "SELECT");
 		CONVERT_PRIV('w', "UPDATE");
@@ -727,13 +720,12 @@ emitShSecLabels(PGconn *conn, PGresult *res, PQExpBuffer buffer,
  * currently known to guc.c, so that it'd be unsafe for extensions to declare
  * GUC_LIST_QUOTE variables anyway.  Lacking a solution for that, it doesn't
  * seem worth the work to do more than have this list, which must be kept in
- * sync with the variables actually marked GUC_LIST_QUOTE in guc_parameters.dat.
+ * sync with the variables actually marked GUC_LIST_QUOTE in guc_tables.c.
  */
 bool
 variable_is_guc_list_quote(const char *name)
 {
 	if (pg_strcasecmp(name, "local_preload_libraries") == 0 ||
-		pg_strcasecmp(name, "oauth_validator_libraries") == 0 ||
 		pg_strcasecmp(name, "search_path") == 0 ||
 		pg_strcasecmp(name, "session_preload_libraries") == 0 ||
 		pg_strcasecmp(name, "shared_preload_libraries") == 0 ||
@@ -777,15 +769,15 @@ SplitGUCList(char *rawstring, char separator,
 	 * overestimate of the number of pointers we could need.  Allow one for
 	 * list terminator.
 	 */
-	*namelist = nextptr =
-		pg_malloc_array(char *, (strlen(rawstring) / 2 + 2));
+	*namelist = nextptr = (char **)
+		pg_malloc((strlen(rawstring) / 2 + 2) * sizeof(char *));
 	*nextptr = NULL;
 
 	while (isspace((unsigned char) *nextp))
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
-		return true;			/* empty string represents empty list */
+		return true;			/* allow empty string */
 
 	/* At the top of the loop, we are at start of a new identifier. */
 	do
@@ -897,7 +889,6 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 	 * elements as string literals.  (The elements may be double-quoted as-is,
 	 * but we can't just feed them to the SQL parser; it would do the wrong
 	 * thing with elements that are zero-length or longer than NAMEDATALEN.)
-	 * Also, we need a special case for empty lists.
 	 *
 	 * Variables that are not so marked should just be emitted as simple
 	 * string literals.  If the variable is not known to
@@ -913,9 +904,6 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 		/* this shouldn't fail really */
 		if (SplitGUCList(pos, ',', &namelist))
 		{
-			/* Special case: represent an empty list as NULL */
-			if (*namelist == NULL)
-				appendPQExpBufferStr(buf, "NULL");
 			for (nameptr = namelist; *nameptr; nameptr++)
 			{
 				if (nameptr != namelist)
@@ -931,40 +919,6 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 	appendPQExpBufferStr(buf, ";\n");
 
 	pg_free(mine);
-}
-
-/*
- * create_or_open_dir
- *
- * This will create a new directory with the given dirname. If there is
- * already an empty directory with that name, then use it.
- */
-void
-create_or_open_dir(const char *dirname)
-{
-	int			ret;
-
-	switch ((ret = pg_check_dir(dirname)))
-	{
-		case -1:
-			/* opendir failed but not with ENOENT */
-			pg_fatal("could not open directory \"%s\": %m", dirname);
-			break;
-		case 0:
-			/* directory does not exist */
-			if (mkdir(dirname, pg_dir_create_mode) < 0)
-				pg_fatal("could not create directory \"%s\": %m", dirname);
-			break;
-		case 1:
-			/* exists and is empty, fix perms */
-			if (chmod(dirname, pg_dir_create_mode) != 0)
-				pg_fatal("could not change permissions of directory \"%s\": %m",
-						 dirname);
-			break;
-		default:
-			/* exists and is not empty */
-			pg_fatal("directory \"%s\" is not empty", dirname);
-	}
 }
 
 /*

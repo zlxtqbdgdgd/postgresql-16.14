@@ -20,13 +20,6 @@ for i in range(count):
 return t
 $$ LANGUAGE plpython3u;
 
-CREATE FUNCTION test_setof_as_set(count integer, content text) RETURNS SETOF text AS $$
-s = set()
-for i in range(count):
-	s.add(content * (i + 1) if content is not None else None)
-return s
-$$ LANGUAGE plpython3u;
-
 CREATE FUNCTION test_setof_as_iterator(count integer, content text) RETURNS SETOF text AS $$
 class producer:
 	def __init__ (self, icount, icontent):
@@ -62,11 +55,6 @@ SELECT test_setof_as_tuple(0, 'tuple');
 SELECT test_setof_as_tuple(1, 'tuple');
 SELECT test_setof_as_tuple(2, 'tuple');
 SELECT test_setof_as_tuple(2, null);
-
-SELECT * FROM test_setof_as_set(0, 'set') ORDER BY 1;
-SELECT * FROM test_setof_as_set(1, 'set') ORDER BY 1;
-SELECT * FROM test_setof_as_set(2, 'set') ORDER BY 1;
-SELECT * FROM test_setof_as_set(2, null) ORDER BY 1;
 
 SELECT test_setof_as_iterator(0, 'list');
 SELECT test_setof_as_iterator(1, 'list');
@@ -107,20 +95,3 @@ $$ LANGUAGE plpython3u;
 
 SELECT get_user_records2();
 SELECT * FROM get_user_records2();
-
--- Test partial execution of a set-returning function
-SELECT get_user_records2() LIMIT 2;
-SELECT * FROM get_user_records2() LIMIT 2;
-
--- A set-returning function that is invalidated mid-iteration must run to
--- completion using its original definition (bug #19480).
-CREATE OR REPLACE FUNCTION self_invalidating_srf(x int) RETURNS SETOF int AS $$
-for i in range(3):
-    if i == 1:
-        plpy.execute("CREATE OR REPLACE FUNCTION self_invalidating_srf(x int) "
-                     "RETURNS SETOF int LANGUAGE plpython3u AS 'return [-1]'")
-    yield x + i
-$$ LANGUAGE plpython3u;
-
-SELECT self_invalidating_srf(10); -- expect 10,11,12 (original definition)
-SELECT self_invalidating_srf(10); -- expect -1 (replacement now in effect)

@@ -3,7 +3,7 @@
  * compress_zstd.c
  *	 Routines for archivers to write a Zstd compressed data stream.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,8 +15,8 @@
 #include "postgres_fe.h"
 #include <unistd.h>
 
-#include "compress_zstd.h"
 #include "pg_backup_utils.h"
+#include "compress_zstd.h"
 
 #ifndef USE_ZSTD
 
@@ -98,22 +98,24 @@ _ZstdWriteCommon(ArchiveHandle *AH, CompressorState *cs, bool flush)
 	ZSTD_outBuffer *output = &zstdcs->output;
 
 	/* Loop while there's any input or until flushed */
-	while (input->pos < input->size || flush)
+	while (input->pos != input->size || flush)
 	{
 		size_t		res;
 
+		output->pos = 0;
 		res = ZSTD_compressStream2(zstdcs->cstream, output,
 								   input, flush ? ZSTD_e_end : ZSTD_e_continue);
 
 		if (ZSTD_isError(res))
 			pg_fatal("could not compress data: %s", ZSTD_getErrorName(res));
 
-		/* Dump output buffer if full, or if we're told to flush */
-		if (output->pos >= output->size || flush)
-		{
+		/*
+		 * Extra paranoia: avoid zero-length chunks, since a zero length chunk
+		 * is the EOF marker in the custom format. This should never happen
+		 * but...
+		 */
+		if (output->pos > 0)
 			cs->writeF(AH, output->dst, output->pos);
-			output->pos = 0;
-		}
 
 		if (res == 0)
 			break;				/* End of frame or all input consumed */
@@ -141,7 +143,6 @@ EndCompressorZstd(ArchiveHandle *AH, CompressorState *cs)
 	/* output buffer may be allocated in either mode */
 	pg_free(zstdcs->output.dst);
 	pg_free(zstdcs);
-	cs->private_data = NULL;
 }
 
 static void
@@ -219,7 +220,7 @@ InitCompressorZstd(CompressorState *cs,
 
 	cs->compression_spec = compression_spec;
 
-	zstdcs = pg_malloc0_object(ZstdCompressorState);
+	zstdcs = (ZstdCompressorState *) pg_malloc0(sizeof(*zstdcs));
 	cs->private_data = zstdcs;
 
 	/* We expect that exactly one of readF/writeF is specified */
@@ -287,7 +288,7 @@ Zstd_read_internal(void *ptr, size_t size, CompressFileHandle *CFH, bool exit_on
 	output->dst = ptr;
 	output->pos = 0;
 
-	while (output->pos < output->size)
+	for (;;)
 	{
 		Assert(input->pos <= input->size);
 		Assert(input->size <= input_allocated_size);
@@ -341,6 +342,9 @@ Zstd_read_internal(void *ptr, size_t size, CompressFileHandle *CFH, bool exit_on
 			if (res == 0)
 				break;			/* End of frame */
 		}
+
+		if (output->pos == output->size)
+			break;				/* We read all the data that fits */
 	}
 
 	return output->pos;
@@ -362,31 +366,26 @@ Zstd_write(const void *ptr, size_t size, CompressFileHandle *CFH)
 	if (zstdcs->cstream == NULL)
 	{
 		zstdcs->output.size = ZSTD_CStreamOutSize();
-		zstdcs->output.dst = pg_malloc(zstdcs->output.size);
-		zstdcs->output.pos = 0;
+		zstdcs->output.dst = pg_malloc0(zstdcs->output.size);
 		zstdcs->cstream = _ZstdCStreamParams(CFH->compression_spec);
 		if (zstdcs->cstream == NULL)
 			pg_fatal("could not initialize compression library");
 	}
 
 	/* Consume all input, to be flushed later */
-	while (input->pos < input->size)
+	while (input->pos != input->size)
 	{
+		output->pos = 0;
 		res = ZSTD_compressStream2(zstdcs->cstream, output, input, ZSTD_e_continue);
 		if (ZSTD_isError(res))
 			pg_fatal("could not write to file: %s", ZSTD_getErrorName(res));
 
-		/* Dump output buffer if full */
-		if (output->pos >= output->size)
+		errno = 0;
+		cnt = fwrite(output->dst, 1, output->pos, zstdcs->fp);
+		if (cnt != output->pos)
 		{
-			errno = 0;
-			cnt = fwrite(output->dst, 1, output->pos, zstdcs->fp);
-			if (cnt != output->pos)
-			{
-				errno = (errno) ? errno : ENOSPC;
-				pg_fatal("could not write to file: %m");
-			}
-			output->pos = 0;
+			errno = (errno) ? errno : ENOSPC;
+			pg_fatal("could not write to file: %m");
 		}
 	}
 }
@@ -448,6 +447,7 @@ Zstd_close(CompressFileHandle *CFH)
 		/* Loop until the compression buffers are fully consumed */
 		for (;;)
 		{
+			output->pos = 0;
 			res = ZSTD_compressStream2(zstdcs->cstream, output, input, ZSTD_e_end);
 			if (ZSTD_isError(res))
 			{
@@ -465,7 +465,6 @@ Zstd_close(CompressFileHandle *CFH)
 				success = false;
 				break;
 			}
-			output->pos = 0;
 
 			if (res == 0)
 				break;			/* End of frame */
@@ -523,30 +522,14 @@ Zstd_open(const char *path, int fd, const char *mode,
 	}
 
 	if (fd >= 0)
-	{
-		int			dup_fd = dup(fd);
-
-		if (dup_fd < 0)
-		{
-			pg_free(zstdcs);
-			return false;
-		}
-		fp = fdopen(dup_fd, mode);
-		if (fp == NULL)
-		{
-			close(dup_fd);
-			pg_free(zstdcs);
-			return false;
-		}
-	}
+		fp = fdopen(dup(fd), mode);
 	else
-	{
 		fp = fopen(path, mode);
-		if (fp == NULL)
-		{
-			pg_free(zstdcs);
-			return false;
-		}
+
+	if (fp == NULL)
+	{
+		pg_free(zstdcs);
+		return false;
 	}
 
 	zstdcs->fp = fp;

@@ -2,13 +2,9 @@
 
 #include "fmgr.h"
 #include "hstore/hstore.h"
-#include "miscadmin.h"
 #include "plperl.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "hstore_plperl",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /* Linkage to functions in hstore module */
 typedef HStore *(*hstoreUpgrade_t) (Datum orig);
@@ -22,13 +18,6 @@ static hstoreCheckKeyLen_t hstoreCheckKeyLen_p;
 typedef size_t (*hstoreCheckValLen_t) (size_t len);
 static hstoreCheckValLen_t hstoreCheckValLen_p;
 
-/* Static asserts verify that typedefs above match original declarations */
-StaticAssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
-StaticAssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
-StaticAssertVariableIsOfType(&hstorePairs, hstorePairs_t);
-StaticAssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
-StaticAssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
-
 
 /*
  * Module initialize function: fetch function pointers for cross-module calls.
@@ -36,18 +25,24 @@ StaticAssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
 void
 _PG_init(void)
 {
+	/* Asserts verify that typedefs above match original declarations */
+	AssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
 	hstoreUpgrade_p = (hstoreUpgrade_t)
 		load_external_function("$libdir/hstore", "hstoreUpgrade",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
 	hstoreUniquePairs_p = (hstoreUniquePairs_t)
 		load_external_function("$libdir/hstore", "hstoreUniquePairs",
 							   true, NULL);
+	AssertVariableIsOfType(&hstorePairs, hstorePairs_t);
 	hstorePairs_p = (hstorePairs_t)
 		load_external_function("$libdir/hstore", "hstorePairs",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
 	hstoreCheckKeyLen_p = (hstoreCheckKeyLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckKeyLen",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
 	hstoreCheckValLen_p = (hstoreCheckValLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckValLen",
 							   true, NULL);
@@ -112,15 +107,7 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 
 	/* Dereference references recursively. */
 	while (SvROK(in))
-	{
-		/*
-		 * It's possible for circular references to make this an infinite
-		 * loop.  Checking for such a situation seems like much more trouble
-		 * than it's worth, but let's provide a way to break out of the loop.
-		 */
-		CHECK_FOR_INTERRUPTS();
 		in = SvRV(in);
-	}
 
 	/* Now we must have a hash. */
 	if (SvTYPE(in) != SVt_PVHV)

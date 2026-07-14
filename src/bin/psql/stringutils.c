@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * src/bin/psql/stringutils.c
  */
@@ -70,7 +70,7 @@ strtokx(const char *s,
 
 	if (s)
 	{
-		pg_free(storage);
+		free(storage);
 
 		/*
 		 * We may need extra space to insert delimiter nulls for adjacent
@@ -93,7 +93,7 @@ strtokx(const char *s,
 	if (*start == '\0')
 	{
 		/* technically we don't need to free here, but we're nice */
-		pg_free(storage);
+		free(storage);
 		storage = NULL;
 		string = NULL;
 		return NULL;
@@ -334,7 +334,7 @@ quote_if_needed(const char *source, const char *entails_quote,
 
 	if (!need_quotes)
 	{
-		pg_free(ret);
+		free(ret);
 		ret = NULL;
 	}
 

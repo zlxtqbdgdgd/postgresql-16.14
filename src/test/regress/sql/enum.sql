@@ -23,9 +23,6 @@ SELECT * FROM pg_input_error_info('mauve', 'rainbow');
 SELECT * FROM pg_input_error_info(repeat('too_long', 32), 'rainbow');
 \x
 
--- check for duplicate enum entries
-CREATE TYPE dup_enum AS ENUM ('foo','bar','foo');
-
 --
 -- adding new values
 --
@@ -326,13 +323,14 @@ ALTER TYPE bogus RENAME TO bogon;
 select enum_range(null::bogon);
 ROLLBACK;
 
--- we must allow this usage to support pg_dump in binary upgrade mode
+-- ideally, we'd allow this usage; but it requires keeping track of whether
+-- the enum type was created in the current transaction, which is expensive
 BEGIN;
 CREATE TYPE bogus AS ENUM('good');
 ALTER TYPE bogus RENAME TO bogon;
 ALTER TYPE bogon ADD VALUE 'bad';
 ALTER TYPE bogon ADD VALUE 'ugly';
-select enum_range(null::bogon);
+select enum_range(null::bogon);  -- fails
 ROLLBACK;
 
 --

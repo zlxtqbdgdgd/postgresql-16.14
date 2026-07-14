@@ -57,7 +57,7 @@
  * calls in portal and cursor manipulations.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/dest.h
@@ -95,8 +95,7 @@ typedef enum
 	DestCopyOut,				/* results sent to COPY TO code */
 	DestSQLFunction,			/* results sent to SQL-language func mgr */
 	DestTransientRel,			/* results sent to transient relation */
-	DestTupleQueue,				/* results sent to tuple queue */
-	DestExplainSerialize,		/* results are serialized and discarded */
+	DestTupleQueue				/* results sent to tuple queue */
 } CommandDest;
 
 /* ----------------
@@ -136,8 +135,6 @@ extern PGDLLIMPORT DestReceiver *None_Receiver; /* permanent receiver for
 
 extern void BeginCommand(CommandTag commandTag, CommandDest dest);
 extern DestReceiver *CreateDestReceiver(CommandDest dest);
-extern void EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
-							   bool force_undecorated_output, bool noblock);
 extern void EndCommand(const QueryCompletion *qc, CommandDest dest,
 					   bool force_undecorated_output);
 extern void EndReplicationCommand(const char *commandTag);

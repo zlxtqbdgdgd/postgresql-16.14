@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * s_lock.c
- *	   Implementation of spinlocks.
+ *	   Hardware-dependent implementation of spinlocks.
  *
  * When waiting for a contended spinlock we loop tightly for awhile, then
  * delay using pg_usleep() and try again.  Preferably, "awhile" should be a
@@ -36,7 +36,7 @@
  * the probability of unintended failure) than to fix the total time
  * spent.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -51,6 +51,7 @@
 #include <unistd.h>
 
 #include "common/pg_prng.h"
+#include "port/atomics.h"
 #include "storage/s_lock.h"
 #include "utils/wait_event.h"
 
@@ -60,14 +61,8 @@
 #define MIN_DELAY_USEC		1000L
 #define MAX_DELAY_USEC		1000000L
 
-#ifdef S_LOCK_TEST
-/*
- * These are needed by pgstat_report_wait_start in the standalone compile of
- * s_lock_test.
- */
-static uint32 local_my_wait_event_info;
-uint32	   *my_wait_event_info = &local_my_wait_event_info;
-#endif
+
+slock_t		dummy_spinlock;
 
 static int	spins_per_delay = DEFAULT_SPINS_PER_DELAY;
 
@@ -115,7 +110,12 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 void
 s_unlock(volatile slock_t *lock)
 {
+#ifdef TAS_ACTIVE_WORD
+	/* HP's PA-RISC */
+	*TAS_ACTIVE_WORD(lock) = -1;
+#else
 	*lock = 0;
+#endif
 }
 #endif
 
@@ -262,11 +262,23 @@ main()
 		return 1;
 	}
 
+	if (!S_LOCK_FREE(&test_lock.lock))
+	{
+		printf("S_LOCK_TEST: failed, lock not initialized\n");
+		return 1;
+	}
+
 	S_LOCK(&test_lock.lock);
 
 	if (test_lock.pad1 != 0x44 || test_lock.pad2 != 0x44)
 	{
 		printf("S_LOCK_TEST: failed, declared datatype is wrong size\n");
+		return 1;
+	}
+
+	if (S_LOCK_FREE(&test_lock.lock))
+	{
+		printf("S_LOCK_TEST: failed, lock not locked\n");
 		return 1;
 	}
 
@@ -278,11 +290,23 @@ main()
 		return 1;
 	}
 
+	if (!S_LOCK_FREE(&test_lock.lock))
+	{
+		printf("S_LOCK_TEST: failed, lock not unlocked\n");
+		return 1;
+	}
+
 	S_LOCK(&test_lock.lock);
 
 	if (test_lock.pad1 != 0x44 || test_lock.pad2 != 0x44)
 	{
 		printf("S_LOCK_TEST: failed, declared datatype is wrong size\n");
+		return 1;
+	}
+
+	if (S_LOCK_FREE(&test_lock.lock))
+	{
+		printf("S_LOCK_TEST: failed, lock not re-locked\n");
 		return 1;
 	}
 

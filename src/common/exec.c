@@ -4,7 +4,7 @@
  *		Functions for finding and validating executable files
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,12 +42,9 @@
 #endif
 #endif
 
-#include "common/string.h"
-
 /* Inhibit mingw CRT's auto-globbing of command line arguments */
 #if defined(WIN32) && !defined(_MSC_VER)
-extern int	_CRT_glob;
-int			_CRT_glob = 0;		/* 0 turns off globbing; 1 turns it on */
+extern int	_CRT_glob = 0;		/* 0 turns off globbing; 1 turns it on */
 #endif
 
 /*
@@ -286,6 +283,25 @@ pg_realpath(const char *fname)
 
 #ifndef WIN32
 	path = realpath(fname, NULL);
+	if (path == NULL && errno == EINVAL)
+	{
+		/*
+		 * Cope with old-POSIX systems that require a user-provided buffer.
+		 * Assume MAXPGPATH is enough room on all such systems.
+		 */
+		char	   *buf = malloc(MAXPGPATH);
+
+		if (buf == NULL)
+			return NULL;		/* assume errno is set */
+		path = realpath(fname, buf);
+		if (path == NULL)		/* don't leak memory */
+		{
+			int			save_errno = errno;
+
+			free(buf);
+			errno = save_errno;
+		}
+	}
 #else							/* WIN32 */
 
 	/*
@@ -312,7 +328,7 @@ find_other_exec(const char *argv0, const char *target,
 				const char *versionstr, char *retpath)
 {
 	char		cmd[MAXPGPATH];
-	char	   *line;
+	char		line[MAXPGPATH];
 
 	if (find_my_exec(argv0, retpath) < 0)
 		return -1;
@@ -330,56 +346,46 @@ find_other_exec(const char *argv0, const char *target,
 
 	snprintf(cmd, sizeof(cmd), "\"%s\" -V", retpath);
 
-	if ((line = pipe_read_line(cmd)) == NULL)
+	if (!pipe_read_line(cmd, line, sizeof(line)))
 		return -1;
 
 	if (strcmp(line, versionstr) != 0)
-	{
-		pfree(line);
 		return -2;
-	}
 
-	pfree(line);
 	return 0;
 }
 
 
 /*
- * Execute a command in a pipe and read the first line from it. The returned
- * string is palloc'd (malloc'd in frontend code), the caller is responsible
- * for freeing.
+ * Execute a command in a pipe and read the first line from it.
  */
 char *
-pipe_read_line(char *cmd)
+pipe_read_line(char *cmd, char *line, int maxsize)
 {
-	FILE	   *pipe_cmd;
-	char	   *line;
+	FILE	   *pgver;
 
 	fflush(NULL);
 
 	errno = 0;
-	if ((pipe_cmd = popen(cmd, "r")) == NULL)
+	if ((pgver = popen(cmd, "r")) == NULL)
 	{
-		log_error(errcode(ERRCODE_SYSTEM_ERROR),
-				  _("could not execute command \"%s\": %m"), cmd);
+		perror("popen failure");
 		return NULL;
 	}
 
-	/* Make sure popen() didn't change errno */
 	errno = 0;
-	line = pg_get_line(pipe_cmd, NULL);
-
-	if (line == NULL)
+	if (fgets(line, maxsize, pgver) == NULL)
 	{
-		if (ferror(pipe_cmd))
-			log_error(errcode_for_file_access(),
-					  _("could not read from command \"%s\": %m"), cmd);
+		if (feof(pgver))
+			fprintf(stderr, "no data was returned by command \"%s\"\n", cmd);
 		else
-			log_error(errcode(ERRCODE_NO_DATA),
-					  _("no data was returned by command \"%s\""), cmd);
+			perror("fgets failure");
+		pclose(pgver);			/* no error checking */
+		return NULL;
 	}
 
-	(void) pclose_check(pipe_cmd);
+	if (pclose_check(pgver))
+		return NULL;
 
 	return line;
 }

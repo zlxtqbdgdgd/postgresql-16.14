@@ -1,8 +1,8 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 # Test partial-column publication of tables
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -14,7 +14,7 @@ $node_publisher->start;
 
 # create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init;
+$node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->append_conf('postgresql.conf',
 	qq(max_logical_replication_workers = 6));
 $node_subscriber->start;
@@ -1202,14 +1202,13 @@ $result = $node_publisher->safe_psql(
 is( $result, qq(t
 t), 'check the number of columns in the old tuple');
 
-# TEST: Dropped columns are not considered for the column list, and generated
-# columns are not replicated if they are not explicitly included in the column
-# list. So, the publication having a column list except for those columns and a
-# publication without any column list (aka all columns as part of the columns
+# TEST: Generated and dropped columns are not considered for the column list.
+# So, the publication having a column list except for those columns and a
+# publication without any column (aka all columns as part of the columns
 # list) are considered to have the same column list.
 $node_publisher->safe_psql(
 	'postgres', qq(
-	CREATE TABLE test_mix_4 (a int PRIMARY KEY, b int, c int, d int GENERATED ALWAYS AS (a + 1) STORED, e int GENERATED ALWAYS AS (a + 2) VIRTUAL);
+	CREATE TABLE test_mix_4 (a int PRIMARY KEY, b int, c int, d int GENERATED ALWAYS AS (a + 1) STORED);
 	ALTER TABLE test_mix_4 DROP COLUMN c;
 
 	CREATE PUBLICATION pub_mix_7 FOR TABLE test_mix_4 (a, b);
@@ -1272,9 +1271,8 @@ my ($cmdret, $stdout, $stderr) = $node_subscriber->psql(
 	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub_mix_1, pub_mix_2;
 ));
 
-like(
-	$stderr,
-	qr/cannot use different column lists for table "public.test_mix_1" in different publications/,
+ok( $stderr =~
+	  qr/cannot use different column lists for table "public.test_mix_1" in different publications/,
 	'different column lists detected');
 
 # TEST: If the column list is changed after creating the subscription, we

@@ -1,7 +1,7 @@
 /*
  * test_escape.c Test escape functions
  *
- * Copyright (c) 2022-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_escape/test_escape.c
@@ -192,7 +192,7 @@ test_gb18030_page_multiple(pe_test_config *tc)
 	testname = createPQExpBuffer();
 	appendPQExpBuffer(testname, ">repeat(%c, %zu)", input[0], input_len - 1);
 	escapify(testname, input + input_len - 1, 1);
-	appendPQExpBufferStr(testname, "< - GB18030 - PQescapeLiteral");
+	appendPQExpBuffer(testname, "< - GB18030 - PQescapeLiteral");
 
 	/* test itself */
 	PQsetClientEncoding(tc->conn, "GB18030");
@@ -219,6 +219,7 @@ test_gb18030_json(pe_test_config *tc)
 	JsonLexContext *lex;
 	JsonSemAction sem = {0};	/* no callbacks */
 	JsonParseErrorType json_error;
+	char	   *error_str;
 
 	/* prepare input like test_one_vector_escape() does */
 	raw_buf = createPQExpBuffer();
@@ -229,19 +230,21 @@ test_gb18030_json(pe_test_config *tc)
 
 	/* name to describe the test */
 	testname = createPQExpBuffer();
-	appendPQExpBufferChar(testname, '>');
+	appendPQExpBuffer(testname, ">");
 	escapify(testname, input, input_len);
-	appendPQExpBufferStr(testname, "< - GB18030 - pg_parse_json");
+	appendPQExpBuffer(testname, "< - GB18030 - pg_parse_json");
 
 	/* test itself */
-	lex = makeJsonLexContextCstringLen(NULL, raw_buf->data, input_len,
+	lex = makeJsonLexContextCstringLen(raw_buf->data, input_len,
 									   PG_GB18030, false);
 	json_error = pg_parse_json(lex, &sem);
+	error_str = psprintf("JsonParseErrorType %d", json_error);
 	report_result(tc, json_error == JSON_UNICODE_ESCAPE_FORMAT,
 				  testname->data, "",
-				  "diagnosed", json_errdetail(json_error, lex));
+				  "diagnosed", error_str);
 
-	freeJsonLexContext(lex);
+	pfree(error_str);
+	pfree(lex);
 	destroyPQExpBuffer(testname);
 	destroyPQExpBuffer(raw_buf);
 }
@@ -257,7 +260,8 @@ escape_literal(PGconn *conn, PQExpBuffer target,
 	escaped = PQescapeLiteral(conn, unescaped, unescaped_len);
 	if (!escaped)
 	{
-		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
+		appendPQExpBuffer(escape_err, "%s",
+						  PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -280,7 +284,8 @@ escape_identifier(PGconn *conn, PQExpBuffer target,
 	escaped = PQescapeIdentifier(conn, unescaped, unescaped_len);
 	if (!escaped)
 	{
-		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
+		appendPQExpBuffer(escape_err, "%s",
+						  PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -312,7 +317,8 @@ escape_string_conn(PGconn *conn, PQExpBuffer target,
 
 	if (error)
 	{
-		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
+		appendPQExpBuffer(escape_err, "%s",
+						  PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -526,6 +532,8 @@ static pe_test_vector pe_test_vectors[] =
 	TV("gbk", "\x80\""),
 	TV("gbk", "\x80\\"),
 
+	TV("mule_internal", "\\\x9c';\0;"),
+
 	TV("sql_ascii", "1\xC0'"),
 
 	/*
@@ -605,7 +613,7 @@ test_psql_parse(pe_test_config *tc, PQExpBuffer testname,
 						  "#\t\t %d: scan_result: %s prompt: %u, query_buf: ",
 						  matches, scan_res_s(scan_result), prompt_status);
 		escapify(details, query_buf->data, query_buf->len);
-		appendPQExpBufferChar(details, '\n');
+		appendPQExpBuffer(details, "\n");
 
 		matches++;
 	}
@@ -657,7 +665,7 @@ test_one_vector_escape(pe_test_config *tc, const pe_test_vector *tv, const pe_te
 	}
 
 	/* name to describe the test */
-	appendPQExpBufferChar(testname, '>');
+	appendPQExpBuffer(testname, ">");
 	escapify(testname, tv->escape, tv->escape_len);
 	appendPQExpBuffer(testname, "< - %s - %s",
 					  tv->client_encoding, ef->name);
@@ -666,7 +674,7 @@ test_one_vector_escape(pe_test_config *tc, const pe_test_vector *tv, const pe_te
 	appendPQExpBuffer(details, "#\t input: %zd bytes: ",
 					  tv->escape_len);
 	escapify(details, tv->escape, tv->escape_len);
-	appendPQExpBufferChar(details, '\n');
+	appendPQExpBufferStr(details, "\n");
 	appendPQExpBuffer(details, "#\t encoding: %s\n",
 					  tv->client_encoding);
 

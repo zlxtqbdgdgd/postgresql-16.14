@@ -2,7 +2,7 @@
  * decode.h
  *	   PostgreSQL WAL to logical transformation
  *
- * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -22,7 +22,6 @@ typedef struct XLogRecordBuffer
 } XLogRecordBuffer;
 
 extern void xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
-extern void xlog2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 extern void heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 extern void heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 extern void xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -31,9 +30,5 @@ extern void logicalmsg_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf
 
 extern void LogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
 										 XLogReaderState *record);
-
-/* in commands/repack_worker.c */
-extern bool change_useless_for_repack(XLogRecordBuffer *buf);
-
 
 #endif

@@ -3,7 +3,7 @@
  * async.c
  *	  Asynchronous notification: NOTIFY, LISTEN, UNLISTEN
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -13,16 +13,19 @@
  */
 
 /*-------------------------------------------------------------------------
- * Async Notification Model as of v19:
+ * Async Notification Model as of 9.0:
  *
- * 1. Multiple backends on same machine.  Multiple backends may be listening
- *	  on each of several channels.
+ * 1. Multiple backends on same machine. Multiple backends listening on
+ *	  several channels. (Channels are also called "conditions" in other
+ *	  parts of the code.)
  *
  * 2. There is one central queue in disk-based storage (directory pg_notify/),
  *	  with actively-used pages mapped into shared memory by the slru.c module.
  *	  All notification messages are placed in the queue and later read out
- *	  by listening backends.  The single queue allows us to guarantee that
- *	  notifications are received in commit order.
+ *	  by listening backends.
+ *
+ *	  There is no central knowledge of which backend listens on which channel;
+ *	  every backend has its own list of interesting channels.
  *
  *	  Although there is only one queue, notifications are treated as being
  *	  database-local; this is done by including the sender's database OID
@@ -59,17 +62,22 @@
  *	  page number and the offset in that page. This is done before marking the
  *	  transaction as committed in clog. If we run into problems writing the
  *	  notifications, we can still call elog(ERROR, ...) and the transaction
- *	  will roll back safely.
+ *	  will roll back.
  *
  *	  Once we have put all of the notifications into the queue, we return to
  *	  CommitTransaction() which will then do the actual transaction commit.
  *
  *	  After commit we are called another time (AtCommit_Notify()). Here we
- *	  make any required updates to the effective listen state (see below).
+ *	  make any actual updates to the effective listen state (listenChannels).
  *	  Then we signal any backends that may be interested in our messages
  *	  (including our own backend, if listening).  This is done by
- *	  SignalBackends(), which sends a PROCSIG_NOTIFY_INTERRUPT signal to
- *	  each relevant backend, as described below.
+ *	  SignalBackends(), which scans the list of listening backends and sends a
+ *	  PROCSIG_NOTIFY_INTERRUPT signal to every listening backend (we don't
+ *	  know which backend is listening on which channel so we must signal them
+ *	  all).  We can exclude backends that are already up to date, though, and
+ *	  we can also exclude backends that are in other databases (unless they
+ *	  are way behind and should be kicked to make them advance their
+ *	  pointers).
  *
  *	  Finally, after we are out of the transaction altogether and about to go
  *	  idle, we scan the queue for messages that need to be sent to our
@@ -95,52 +103,12 @@
  *	  until we reach either a notification from an uncommitted transaction or
  *	  the head pointer's position.
  *
- * 6. To limit disk space consumption, the tail pointer needs to be advanced
- *	  so that old pages can be truncated. This is relatively expensive
- *	  (notably, it requires an exclusive lock), so we don't want to do it
- *	  often. We make sending backends do this work if they advanced the queue
- *	  head into a new page, but only once every QUEUE_CLEANUP_DELAY pages.
- *
- * 7. So far we have not discussed how backends change their listening state,
- *	  nor how notification senders know which backends to awaken.  To handle
- *	  the latter, we maintain a global channel table (implemented as a dynamic
- *	  shared hash table, or dshash) that maps channel names to the set of
- *	  backends listening on each channel.  This table is created lazily on the
- *	  first LISTEN command and grows dynamically as needed.  There is also a
- *	  local channel table (a plain dynahash table) in each listening backend,
- *	  tracking which channels that backend is listening to.  The local table
- *	  serves to reduce the number of accesses needed to the shared table.
- *
- *	  If the current transaction has executed any LISTEN/UNLISTEN actions,
- *	  PreCommit_Notify() prepares to commit those.  For LISTEN, it
- *	  pre-allocates entries in both the per-backend localChannelTable and the
- *	  shared globalChannelTable, marking new shared entries removeOnAbort.
- *	  It also records the final per-channel intent in pendingListenActions,
- *	  so post-commit/abort processing can apply that in a single step.
- *	  Since all these allocations happen before committing to clog, we can
- *	  safely abort the transaction on failure.
- *
- *	  After commit, AtCommit_Notify() runs through pendingListenActions and
- *	  applies the final per-channel listen/unlisten state.  This happens
- *	  before sending signals.
- *
- *	  SignalBackends() consults the shared global channel table to identify
- *	  listeners for the channels that the current transaction sent
- *	  notification(s) to.  Each selected backend is marked as having a wakeup
- *	  pending to avoid duplicate signals, and a PROCSIG_NOTIFY_INTERRUPT
- *	  signal is sent to it.
- *
- * 8. While writing notifications, PreCommit_Notify() records the queue head
- *	  position both before and after the write.  Because all writers serialize
- *	  on a cluster-wide heavyweight lock, no other backend can insert entries
- *	  between these two points.  SignalBackends() uses this fact to directly
- *	  advance the queue pointer for any backend that is still positioned at
- *	  the old head, or within the range written, but is not interested in any
- *	  of our notifications.  This avoids unnecessary wakeups for idle
- *	  listeners that have nothing to read.  Backends that are not interested
- *	  in our notifications, but cannot be directly advanced, are signaled only
- *	  if they are far behind the current queue head; that is to ensure that
- *	  we can advance the queue tail without undue delay.
+ * 6. To avoid SLRU wraparound and limit disk space consumption, the tail
+ *	  pointer needs to be advanced so that old pages can be truncated.
+ *	  This is relatively expensive (notably, it requires an exclusive lock),
+ *	  so we don't want to do it often.  We make sending backends do this work
+ *	  if they advanced the queue head into a new page, but only once every
+ *	  QUEUE_CLEANUP_DELAY pages.
  *
  * An application that listens on the same channel it notifies will get
  * NOTIFY messages for its own NOTIFYs.  These can be ignored, if not useful,
@@ -149,10 +117,10 @@
  * frontend during startup.)  The above design guarantees that notifies from
  * other backends will never be missed by ignoring self-notifies.
  *
- * The amount of shared memory used for notify management (notify_buffers)
+ * The amount of shared memory used for notify management (NUM_NOTIFY_BUFFERS)
  * can be varied without affecting anything but performance.  The maximum
  * amount of notification data that can be queued at one time is determined
- * by the max_notify_queue_pages GUC.
+ * by slru.c's wraparound limit; see QUEUE_MAX_PAGE below.
  *-------------------------------------------------------------------------
  */
 
@@ -170,20 +138,17 @@
 #include "commands/async.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
-#include "lib/dshash.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
-#include "storage/dsm_registry.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/procsignal.h"
-#include "storage/subsystems.h"
+#include "storage/sinval.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
-#include "utils/dsa.h"
-#include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/snapmgr.h"
@@ -231,7 +196,7 @@ typedef struct AsyncQueueEntry
  */
 typedef struct QueuePosition
 {
-	int64		page;			/* SLRU page number */
+	int			page;			/* SLRU page number */
 	int			offset;			/* byte offset within page */
 } QueuePosition;
 
@@ -262,21 +227,15 @@ typedef struct QueuePosition
 	 (x).page != (y).page ? (x) : \
 	 (x).offset > (y).offset ? (x) : (y))
 
-/* returns true if x comes before y in queue order */
-#define QUEUE_POS_PRECEDES(x,y) \
-	(asyncQueuePagePrecedes((x).page, (y).page) || \
-	 ((x).page == (y).page && (x).offset < (y).offset))
-
 /*
  * Parameter determining how often we try to advance the tail pointer:
  * we do that after every QUEUE_CLEANUP_DELAY pages of NOTIFY data.  This is
- * also the distance by which a backend that's not interested in our
- * notifications needs to be behind before we'll decide we need to wake it
- * up so it can advance its pointer.
+ * also the distance by which a backend in another database needs to be
+ * behind before we'll decide we need to wake it up to advance its pointer.
  *
  * Resist the temptation to make this really large.  While that would save
  * work in some places, it would add cost in others.  In particular, this
- * should likely be less than notify_buffers, to ensure that backends
+ * should likely be less than NUM_NOTIFY_BUFFERS, to ensure that backends
  * catch up before the pages they'll need to read fall out of SLRU cache.
  */
 #define QUEUE_CLEANUP_DELAY 4
@@ -288,10 +247,8 @@ typedef struct QueueBackendStatus
 {
 	int32		pid;			/* either a PID or InvalidPid */
 	Oid			dboid;			/* backend's database OID, or InvalidOid */
-	ProcNumber	nextListener;	/* id of next listener, or INVALID_PROC_NUMBER */
+	BackendId	nextListener;	/* id of next listener, or InvalidBackendId */
 	QueuePosition pos;			/* backend has read queue up to here */
-	bool		wakeupPending;	/* signal sent to backend, not yet processed */
-	bool		isAdvancing;	/* backend is advancing its position */
 } QueueBackendStatus;
 
 /*
@@ -306,26 +263,22 @@ typedef struct QueueBackendStatus
  * (since no other backend will inspect it).
  *
  * When holding NotifyQueueLock in EXCLUSIVE mode, backends can inspect the
- * entries of other backends and also change the head pointer. They can
- * also advance other backends' queue positions, unless the other backend
- * has isAdvancing set (i.e., is in process of doing that itself).
+ * entries of other backends and also change the head pointer. When holding
+ * both NotifyQueueLock and NotifyQueueTailLock in EXCLUSIVE mode, backends
+ * can change the tail pointers.
  *
- * When holding both NotifyQueueLock and NotifyQueueTailLock in EXCLUSIVE
- * mode, backends can change the tail pointers.
- *
- * SLRU buffer pool is divided in banks and bank wise SLRU lock is used as
- * the control lock for the pg_notify SLRU buffers.
+ * NotifySLRULock is used as the control lock for the pg_notify SLRU buffers.
  * In order to avoid deadlocks, whenever we need multiple locks, we first get
- * NotifyQueueTailLock, then NotifyQueueLock, then SLRU bank lock, and lastly
- * globalChannelTable partition locks.
+ * NotifyQueueTailLock, then NotifyQueueLock, and lastly NotifySLRULock.
  *
  * Each backend uses the backend[] array entry with index equal to its
- * ProcNumber.  We rely on this to make SendProcSignal fast.
+ * BackendId (which can range from 1 to MaxBackends).  We rely on this to make
+ * SendProcSignal fast.
  *
  * The backend[] array entries for actively-listening backends are threaded
  * together using firstListener and the nextListener links, so that we can
  * scan them without having to iterate over inactive entries.  We keep this
- * list in order by ProcNumber so that the scan is cache-friendly when there
+ * list in order by BackendId so that the scan is cache-friendly when there
  * are many active entries.
  */
 typedef struct AsyncQueueControl
@@ -333,27 +286,15 @@ typedef struct AsyncQueueControl
 	QueuePosition head;			/* head points to the next free location */
 	QueuePosition tail;			/* tail must be <= the queue position of every
 								 * listening backend */
-	int64		stopPage;		/* oldest unrecycled page; must be <=
+	int			stopPage;		/* oldest unrecycled page; must be <=
 								 * tail.page */
-	ProcNumber	firstListener;	/* id of first listener, or
-								 * INVALID_PROC_NUMBER */
+	BackendId	firstListener;	/* id of first listener, or InvalidBackendId */
 	TimestampTz lastQueueFillWarn;	/* time of last queue-full msg */
-	dsa_handle	globalChannelTableDSA;	/* global channel table's DSA handle */
-	dshash_table_handle globalChannelTableDSH;	/* and its dshash handle */
-	/* Array with room for MaxBackends entries: */
 	QueueBackendStatus backend[FLEXIBLE_ARRAY_MEMBER];
+	/* backend[0] is not used; used entries are from [1] to [MaxBackends] */
 } AsyncQueueControl;
 
 static AsyncQueueControl *asyncQueueControl;
-
-static void AsyncShmemRequest(void *arg);
-static void AsyncShmemInit(void *arg);
-
-const ShmemCallbacks AsyncShmemCallbacks = {
-	.request_fn = AsyncShmemRequest,
-	.init_fn = AsyncShmemInit,
-};
-
 
 #define QUEUE_HEAD					(asyncQueueControl->head)
 #define QUEUE_TAIL					(asyncQueueControl->tail)
@@ -363,72 +304,43 @@ const ShmemCallbacks AsyncShmemCallbacks = {
 #define QUEUE_BACKEND_DBOID(i)		(asyncQueueControl->backend[i].dboid)
 #define QUEUE_NEXT_LISTENER(i)		(asyncQueueControl->backend[i].nextListener)
 #define QUEUE_BACKEND_POS(i)		(asyncQueueControl->backend[i].pos)
-#define QUEUE_BACKEND_WAKEUP_PENDING(i)	(asyncQueueControl->backend[i].wakeupPending)
-#define QUEUE_BACKEND_IS_ADVANCING(i)	(asyncQueueControl->backend[i].isAdvancing)
 
 /*
  * The SLRU buffer area through which we access the notification queue
  */
-static inline bool asyncQueuePagePrecedes(int64 p, int64 q);
-static int	asyncQueueErrdetailForIoError(const void *opaque_data);
+static SlruCtlData NotifyCtlData;
 
-static SlruDesc NotifySlruDesc;
-
-
-#define NotifyCtl					(&NotifySlruDesc)
+#define NotifyCtl					(&NotifyCtlData)
 #define QUEUE_PAGESIZE				BLCKSZ
-
 #define QUEUE_FULL_WARN_INTERVAL	5000	/* warn at most once every 5s */
 
 /*
- * Global channel table definitions
+ * Use segments 0000 through FFFF.  Each contains SLRU_PAGES_PER_SEGMENT pages
+ * which gives us the pages from 0 to SLRU_PAGES_PER_SEGMENT * 0x10000 - 1.
+ * We could use as many segments as SlruScanDirectory() allows, but this gives
+ * us so much space already that it doesn't seem worth the trouble.
  *
- * This hash table maps (database OID, channel name) keys to arrays of
- * ProcNumbers representing the backends listening or about to listen
- * on each channel.  The removeOnAbort flags allow us to create hash table
- * entries pre-commit and not have to assume that creating them post-commit
- * will succeed.
+ * The most data we can have in the queue at a time is QUEUE_MAX_PAGE/2
+ * pages, because more than that would confuse slru.c into thinking there
+ * was a wraparound condition.  With the default BLCKSZ this means there
+ * can be up to 8GB of queued-and-not-read data.
+ *
+ * Note: it's possible to redefine QUEUE_MAX_PAGE with a smaller multiple of
+ * SLRU_PAGES_PER_SEGMENT, for easier testing of queue-full behaviour.
  */
-#define INITIAL_LISTENERS_ARRAY_SIZE 4
-
-typedef struct GlobalChannelKey
-{
-	Oid			dboid;
-	char		channel[NAMEDATALEN];
-} GlobalChannelKey;
-
-typedef struct ListenerEntry
-{
-	ProcNumber	procNo;			/* listener's ProcNumber */
-	bool		removeOnAbort;	/* remove entry if current xact aborts */
-} ListenerEntry;
-
-typedef struct GlobalChannelEntry
-{
-	GlobalChannelKey key;		/* hash key */
-	dsa_pointer listenersArray; /* DSA pointer to ListenerEntry array */
-	int			numListeners;	/* Number of listeners currently stored */
-	int			allocatedListeners; /* Allocated size of array */
-} GlobalChannelEntry;
-
-static dshash_table *globalChannelTable = NULL;
-static dsa_area *globalChannelDSA = NULL;
+#define QUEUE_MAX_PAGE			(SLRU_PAGES_PER_SEGMENT * 0x10000 - 1)
 
 /*
- * localChannelTable caches the channel names this backend is listening on
- * (including those we have staged to be listened on, but not yet committed).
- * Used by IsListeningOn() for fast lookups when reading notifications.
+ * listenChannels identifies the channels we are actually listening to
+ * (ie, have committed a LISTEN on).  It is a simple list of channel names,
+ * allocated in TopMemoryContext.
  */
-static HTAB *localChannelTable = NULL;
-
-/* We test this condition to detect that we're not listening at all */
-#define LocalChannelTableIsEmpty() \
-	(localChannelTable == NULL || hash_get_num_entries(localChannelTable) == 0)
+static List *listenChannels = NIL;	/* list of C strings */
 
 /*
  * State for pending LISTEN/UNLISTEN actions consists of an ordered list of
  * all actions requested in the current transaction.  As explained above,
- * we don't actually change listen state until we reach transaction commit.
+ * we don't actually change listenChannels until we reach transaction commit.
  *
  * The list is kept in CurTransactionContext.  In subtransactions, each
  * subtransaction has its own list in its own CurTransactionContext, but
@@ -439,7 +351,7 @@ typedef enum
 {
 	LISTEN_LISTEN,
 	LISTEN_UNLISTEN,
-	LISTEN_UNLISTEN_ALL,
+	LISTEN_UNLISTEN_ALL
 } ListenActionKind;
 
 typedef struct
@@ -456,28 +368,6 @@ typedef struct ActionList
 } ActionList;
 
 static ActionList *pendingActions = NULL;
-
-/*
- * Hash table recording the final listen/unlisten intent per channel for
- * the current transaction.  Key is channel name, value is PENDING_LISTEN or
- * PENDING_UNLISTEN.  This keeps critical commit/abort processing to one step
- * per channel instead of replaying every action.  This is built from the
- * pendingActions list by PreCommit_Notify, then used by AtCommit_Notify or
- * AtAbort_Notify.
- */
-typedef enum
-{
-	PENDING_LISTEN,
-	PENDING_UNLISTEN,
-} PendingListenAction;
-
-typedef struct PendingListenEntry
-{
-	char		channel[NAMEDATALEN];	/* hash key */
-	PendingListenAction action; /* which action should we perform? */
-} PendingListenEntry;
-
-static HTAB *pendingListenActions = NULL;
 
 /*
  * State for outbound notifies consists of a list of all channels+payloads
@@ -519,28 +409,17 @@ typedef struct NotificationList
 	int			nestingLevel;	/* current transaction nesting depth */
 	List	   *events;			/* list of Notification structs */
 	HTAB	   *hashtab;		/* hash of NotificationHash structs, or NULL */
-	List	   *uniqueChannelNames; /* unique channel names being notified */
-	HTAB	   *uniqueChannelHash;	/* hash of unique channel names, or NULL */
 	struct NotificationList *upper; /* details for upper transaction levels */
 } NotificationList;
 
 #define MIN_HASHABLE_NOTIFIES 16	/* threshold to build hashtab */
 
-struct NotificationHash
+typedef struct NotificationHash
 {
 	Notification *event;		/* => the actual Notification struct */
-};
+} NotificationHash;
 
 static NotificationList *pendingNotifies = NULL;
-
-/*
- * Hash entry in NotificationList.uniqueChannelHash or localChannelTable
- * (both just carry the channel name, with no payload).
- */
-typedef struct ChannelName
-{
-	char		channel[NAMEDATALEN];	/* hash key */
-} ChannelName;
 
 /*
  * Inbound notifications are initially processed by HandleNotifyInterrupt(),
@@ -557,55 +436,25 @@ static bool unlistenExitRegistered = false;
 /* True if we're currently registered as a listener in asyncQueueControl */
 static bool amRegisteredListener = false;
 
-/*
- * Queue head positions for direct advancement.
- * These are captured during PreCommit_Notify while holding the heavyweight
- * lock on database 0, ensuring no other backend can insert notifications
- * between them.  SignalBackends uses these to advance idle backends.
- */
-static QueuePosition queueHeadBeforeWrite;
-static QueuePosition queueHeadAfterWrite;
-
-/*
- * Workspace arrays for SignalBackends.  These are preallocated in
- * PreCommit_Notify to avoid needing memory allocation after committing to
- * clog.
- */
-static int32 *signalPids = NULL;
-static ProcNumber *signalProcnos = NULL;
-
 /* have we advanced to a page that's a multiple of QUEUE_CLEANUP_DELAY? */
 static bool tryAdvanceTail = false;
 
-/* GUC parameters */
+/* GUC parameter */
 bool		Trace_notify = false;
 
-/* For 8 KB pages this gives 8 GB of disk space */
-int			max_notify_queue_pages = 1048576;
-
 /* local function prototypes */
-static inline int64 asyncQueuePageDiff(int64 p, int64 q);
-static inline void GlobalChannelKeyInit(GlobalChannelKey *key, Oid dboid,
-										const char *channel);
-static dshash_hash globalChannelTableHash(const void *key, size_t size,
-										  void *arg);
-static void initGlobalChannelTable(void);
-static void initLocalChannelTable(void);
+static int	asyncQueuePageDiff(int p, int q);
+static bool asyncQueuePagePrecedes(int p, int q);
 static void queue_listen(ListenActionKind action, const char *channel);
 static void Async_UnlistenOnExit(int code, Datum arg);
-static void BecomeRegisteredListener(void);
-static void PrepareTableEntriesForListen(const char *channel);
-static void PrepareTableEntriesForUnlisten(const char *channel);
-static void PrepareTableEntriesForUnlistenAll(void);
-static void RemoveListenerFromChannel(GlobalChannelEntry **entry_ptr,
-									  ListenerEntry *listeners,
-									  int idx);
-static void ApplyPendingListenActions(bool isCommit);
-static void CleanupListenersOnExit(void);
+static void Exec_ListenPreCommit(void);
+static void Exec_ListenCommit(const char *channel);
+static void Exec_UnlistenCommit(const char *channel);
+static void Exec_UnlistenAllCommit(void);
 static bool IsListeningOn(const char *channel);
 static void asyncQueueUnregister(void);
 static bool asyncQueueIsFull(void);
-static bool asyncQueueAdvance(QueuePosition *position, int entryLength);
+static bool asyncQueueAdvance(volatile QueuePosition *position, int entryLength);
 static void asyncQueueNotificationToEntry(Notification *n, AsyncQueueEntry *qe);
 static ListCell *asyncQueueAddEntries(ListCell *nextNotify);
 static double asyncQueueUsage(void);
@@ -623,232 +472,113 @@ static uint32 notification_hash(const void *key, Size keysize);
 static int	notification_match(const void *key1, const void *key2, Size keysize);
 static void ClearPendingActionsAndNotifies(void);
 
+/*
+ * Compute the difference between two queue page numbers (i.e., p - q),
+ * accounting for wraparound.
+ */
 static int
-asyncQueueErrdetailForIoError(const void *opaque_data)
+asyncQueuePageDiff(int p, int q)
 {
-	const QueuePosition *position = opaque_data;
+	int			diff;
 
-	return errdetail("Could not access async queue at page %" PRId64 ", offset %d.",
-					 position->page, position->offset);
+	/*
+	 * We have to compare modulo (QUEUE_MAX_PAGE+1)/2.  Both inputs should be
+	 * in the range 0..QUEUE_MAX_PAGE.
+	 */
+	Assert(p >= 0 && p <= QUEUE_MAX_PAGE);
+	Assert(q >= 0 && q <= QUEUE_MAX_PAGE);
+
+	diff = p - q;
+	if (diff >= ((QUEUE_MAX_PAGE + 1) / 2))
+		diff -= QUEUE_MAX_PAGE + 1;
+	else if (diff < -((QUEUE_MAX_PAGE + 1) / 2))
+		diff += QUEUE_MAX_PAGE + 1;
+	return diff;
 }
 
 /*
- * Compute the difference between two queue page numbers.
- * Previously this function accounted for a wraparound.
+ * Is p < q, accounting for wraparound?
+ *
+ * Since asyncQueueIsFull() blocks creation of a page that could precede any
+ * extant page, we need not assess entries within a page.
  */
-static inline int64
-asyncQueuePageDiff(int64 p, int64 q)
+static bool
+asyncQueuePagePrecedes(int p, int q)
 {
-	return p - q;
+	return asyncQueuePageDiff(p, q) < 0;
 }
 
 /*
- * Determines whether p precedes q.
- * Previously this function accounted for a wraparound.
+ * Report space needed for our shared memory area
  */
-static inline bool
-asyncQueuePagePrecedes(int64 p, int64 q)
-{
-	return p < q;
-}
-
-/*
- * GlobalChannelKeyInit
- *		Prepare a global channel table key for hashing.
- */
-static inline void
-GlobalChannelKeyInit(GlobalChannelKey *key, Oid dboid, const char *channel)
-{
-	memset(key, 0, sizeof(GlobalChannelKey));
-	key->dboid = dboid;
-	strlcpy(key->channel, channel, NAMEDATALEN);
-}
-
-/*
- * globalChannelTableHash
- *		Hash function for global channel table keys.
- */
-static dshash_hash
-globalChannelTableHash(const void *key, size_t size, void *arg)
-{
-	const GlobalChannelKey *k = (const GlobalChannelKey *) key;
-	dshash_hash h;
-
-	h = DatumGetUInt32(hash_uint32(k->dboid));
-	h ^= DatumGetUInt32(hash_any((const unsigned char *) k->channel,
-								 strnlen(k->channel, NAMEDATALEN)));
-
-	return h;
-}
-
-/* parameters for the global channel table */
-static const dshash_parameters globalChannelTableDSHParams = {
-	sizeof(GlobalChannelKey),
-	sizeof(GlobalChannelEntry),
-	dshash_memcmp,
-	globalChannelTableHash,
-	dshash_memcpy,
-	LWTRANCHE_NOTIFY_CHANNEL_HASH
-};
-
-/*
- * initGlobalChannelTable
- *		Lazy initialization of the global channel table.
- */
-static void
-initGlobalChannelTable(void)
-{
-	MemoryContext oldcontext;
-
-	/* Quick exit if we already did this */
-	if (asyncQueueControl->globalChannelTableDSH != DSHASH_HANDLE_INVALID &&
-		globalChannelTable != NULL)
-		return;
-
-	/* Otherwise, use a lock to ensure only one process creates the table */
-	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
-
-	/* Be sure any local memory allocated by DSA routines is persistent */
-	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
-	if (asyncQueueControl->globalChannelTableDSH == DSHASH_HANDLE_INVALID)
-	{
-		/* Initialize dynamic shared hash table for global channels */
-		globalChannelDSA = dsa_create(LWTRANCHE_NOTIFY_CHANNEL_HASH);
-		dsa_pin(globalChannelDSA);
-		dsa_pin_mapping(globalChannelDSA);
-		globalChannelTable = dshash_create(globalChannelDSA,
-										   &globalChannelTableDSHParams,
-										   NULL);
-
-		/* Store handles in shared memory for other backends to use */
-		asyncQueueControl->globalChannelTableDSA = dsa_get_handle(globalChannelDSA);
-		asyncQueueControl->globalChannelTableDSH =
-			dshash_get_hash_table_handle(globalChannelTable);
-	}
-	else if (!globalChannelTable)
-	{
-		/* Attach to existing dynamic shared hash table */
-		globalChannelDSA = dsa_attach(asyncQueueControl->globalChannelTableDSA);
-		dsa_pin_mapping(globalChannelDSA);
-		globalChannelTable = dshash_attach(globalChannelDSA,
-										   &globalChannelTableDSHParams,
-										   asyncQueueControl->globalChannelTableDSH,
-										   NULL);
-	}
-
-	MemoryContextSwitchTo(oldcontext);
-	LWLockRelease(NotifyQueueLock);
-}
-
-/*
- * initLocalChannelTable
- *		Lazy initialization of the local channel table.
- *		Once created, this table lasts for the life of the session.
- */
-static void
-initLocalChannelTable(void)
-{
-	HASHCTL		hash_ctl;
-
-	/* Quick exit if we already did this */
-	if (localChannelTable != NULL)
-		return;
-
-	/* Initialize local hash table for this backend's listened channels */
-	hash_ctl.keysize = NAMEDATALEN;
-	hash_ctl.entrysize = sizeof(ChannelName);
-
-	localChannelTable =
-		hash_create("Local Listen Channels",
-					64,
-					&hash_ctl,
-					HASH_ELEM | HASH_STRINGS);
-}
-
-/*
- * initPendingListenActions
- *		Lazy initialization of the pending listen actions hash table.
- *		This is allocated in CurTransactionContext during PreCommit_Notify,
- *		and destroyed at transaction end.
- */
-static void
-initPendingListenActions(void)
-{
-	HASHCTL		hash_ctl;
-
-	if (pendingListenActions != NULL)
-		return;
-
-	hash_ctl.keysize = NAMEDATALEN;
-	hash_ctl.entrysize = sizeof(PendingListenEntry);
-	hash_ctl.hcxt = CurTransactionContext;
-
-	pendingListenActions =
-		hash_create("Pending Listen Actions",
-					list_length(pendingActions->actions),
-					&hash_ctl,
-					HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-}
-
-/*
- * Register our shared memory needs
- */
-static void
-AsyncShmemRequest(void *arg)
+Size
+AsyncShmemSize(void)
 {
 	Size		size;
 
-	size = mul_size(MaxBackends, sizeof(QueueBackendStatus));
+	/* This had better match AsyncShmemInit */
+	size = mul_size(MaxBackends + 1, sizeof(QueueBackendStatus));
 	size = add_size(size, offsetof(AsyncQueueControl, backend));
 
-	ShmemRequestStruct(.name = "Async Queue Control",
-					   .size = size,
-					   .ptr = (void **) &asyncQueueControl,
-		);
+	size = add_size(size, SimpleLruShmemSize(NUM_NOTIFY_BUFFERS, 0));
 
-	SimpleLruRequest(.desc = &NotifySlruDesc,
-					 .name = "notify",
-					 .Dir = "pg_notify",
-
-	/* long segment names are used in order to avoid wraparound */
-					 .long_segment_names = true,
-
-					 .nslots = notify_buffers,
-
-					 .sync_handler = SYNC_HANDLER_NONE,
-					 .PagePrecedes = asyncQueuePagePrecedes,
-					 .errdetail_for_io_error = asyncQueueErrdetailForIoError,
-
-					 .buffer_tranche_id = LWTRANCHE_NOTIFY_BUFFER,
-					 .bank_tranche_id = LWTRANCHE_NOTIFY_SLRU,
-		);
+	return size;
 }
 
-static void
-AsyncShmemInit(void *arg)
+/*
+ * Initialize our shared memory area
+ */
+void
+AsyncShmemInit(void)
 {
-	SET_QUEUE_POS(QUEUE_HEAD, 0, 0);
-	SET_QUEUE_POS(QUEUE_TAIL, 0, 0);
-	QUEUE_STOP_PAGE = 0;
-	QUEUE_FIRST_LISTENER = INVALID_PROC_NUMBER;
-	asyncQueueControl->lastQueueFillWarn = 0;
-	asyncQueueControl->globalChannelTableDSA = DSA_HANDLE_INVALID;
-	asyncQueueControl->globalChannelTableDSH = DSHASH_HANDLE_INVALID;
-	for (int i = 0; i < MaxBackends; i++)
+	bool		found;
+	Size		size;
+
+	/*
+	 * Create or attach to the AsyncQueueControl structure.
+	 *
+	 * The used entries in the backend[] array run from 1 to MaxBackends; the
+	 * zero'th entry is unused but must be allocated.
+	 */
+	size = mul_size(MaxBackends + 1, sizeof(QueueBackendStatus));
+	size = add_size(size, offsetof(AsyncQueueControl, backend));
+
+	asyncQueueControl = (AsyncQueueControl *)
+		ShmemInitStruct("Async Queue Control", size, &found);
+
+	if (!found)
 	{
-		QUEUE_BACKEND_PID(i) = InvalidPid;
-		QUEUE_BACKEND_DBOID(i) = InvalidOid;
-		QUEUE_NEXT_LISTENER(i) = INVALID_PROC_NUMBER;
-		SET_QUEUE_POS(QUEUE_BACKEND_POS(i), 0, 0);
-		QUEUE_BACKEND_WAKEUP_PENDING(i) = false;
-		QUEUE_BACKEND_IS_ADVANCING(i) = false;
+		/* First time through, so initialize it */
+		SET_QUEUE_POS(QUEUE_HEAD, 0, 0);
+		SET_QUEUE_POS(QUEUE_TAIL, 0, 0);
+		QUEUE_STOP_PAGE = 0;
+		QUEUE_FIRST_LISTENER = InvalidBackendId;
+		asyncQueueControl->lastQueueFillWarn = 0;
+		/* zero'th entry won't be used, but let's initialize it anyway */
+		for (int i = 0; i <= MaxBackends; i++)
+		{
+			QUEUE_BACKEND_PID(i) = InvalidPid;
+			QUEUE_BACKEND_DBOID(i) = InvalidOid;
+			QUEUE_NEXT_LISTENER(i) = InvalidBackendId;
+			SET_QUEUE_POS(QUEUE_BACKEND_POS(i), 0, 0);
+		}
 	}
 
 	/*
-	 * During start or reboot, clean out the pg_notify directory.
+	 * Set up SLRU management of the pg_notify data.
 	 */
-	(void) SlruScanDirectory(NotifyCtl, SlruScanDirCbDeleteAll, NULL);
+	NotifyCtl->PagePrecedes = asyncQueuePagePrecedes;
+	SimpleLruInit(NotifyCtl, "Notify", NUM_NOTIFY_BUFFERS, 0,
+				  NotifySLRULock, "pg_notify", LWTRANCHE_NOTIFY_BUFFER,
+				  SYNC_HANDLER_NONE);
+
+	if (!found)
+	{
+		/*
+		 * During start or reboot, clean out the pg_notify directory.
+		 */
+		(void) SlruScanDirectory(NotifyCtl, SlruScanDirCbDeleteAll, NULL);
+	}
 }
 
 
@@ -960,9 +690,6 @@ Async_Notify(const char *channel, const char *payload)
 		notifies->events = list_make1(n);
 		/* We certainly don't need a hashtable yet */
 		notifies->hashtab = NULL;
-		/* We won't build uniqueChannelNames/Hash till later, either */
-		notifies->uniqueChannelNames = NIL;
-		notifies->uniqueChannelHash = NULL;
 		notifies->upper = pendingNotifies;
 		pendingNotifies = notifies;
 	}
@@ -989,8 +716,8 @@ Async_Notify(const char *channel, const char *payload)
  *		Common code for listen, unlisten, unlisten all commands.
  *
  *		Adds the request to the list of pending actions.
- *		Actual update of localChannelTable and globalChannelTable happens during
- *		PreCommit_Notify, with staged changes committed in AtCommit_Notify.
+ *		Actual update of the listenChannels list happens during transaction
+ *		commit.
  */
 static void
 queue_listen(ListenActionKind action, const char *channel)
@@ -1000,9 +727,10 @@ queue_listen(ListenActionKind action, const char *channel)
 	int			my_level = GetCurrentTransactionNestLevel();
 
 	/*
-	 * Unlike Async_Notify, we don't try to collapse out duplicates here. We
-	 * keep the ordered list to preserve interactions like UNLISTEN ALL; the
-	 * final per-channel intent is computed during PreCommit_Notify.
+	 * Unlike Async_Notify, we don't try to collapse out duplicates. It would
+	 * be too complicated to ensure we get the right interactions of
+	 * conflicting LISTEN/UNLISTEN/UNLISTEN_ALL, and it's unlikely that there
+	 * would be any performance benefit anyway in sane applications.
 	 */
 	oldcontext = MemoryContextSwitchTo(CurTransactionContext);
 
@@ -1088,49 +816,30 @@ Async_UnlistenAll(void)
  * SQL function: return a set of the channel names this backend is actively
  * listening to.
  *
- * Note: this coding relies on the fact that the localChannelTable cannot
+ * Note: this coding relies on the fact that the listenChannels list cannot
  * change within a transaction.
  */
 Datum
 pg_listening_channels(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
-	HASH_SEQ_STATUS *status;
 
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
 	{
 		/* create a function context for cross-call persistence */
 		funcctx = SRF_FIRSTCALL_INIT();
-
-		/* Initialize hash table iteration if we have any channels */
-		if (localChannelTable != NULL)
-		{
-			MemoryContext oldcontext;
-
-			oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-			status = (HASH_SEQ_STATUS *) palloc(sizeof(HASH_SEQ_STATUS));
-			hash_seq_init(status, localChannelTable);
-			funcctx->user_fctx = status;
-			MemoryContextSwitchTo(oldcontext);
-		}
-		else
-		{
-			funcctx->user_fctx = NULL;
-		}
 	}
 
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
-	status = (HASH_SEQ_STATUS *) funcctx->user_fctx;
 
-	if (status != NULL)
+	if (funcctx->call_cntr < list_length(listenChannels))
 	{
-		ChannelName *entry;
+		char	   *channel = (char *) list_nth(listenChannels,
+												funcctx->call_cntr);
 
-		entry = (ChannelName *) hash_seq_search(status);
-		if (entry != NULL)
-			SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(entry->channel));
+		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(channel));
 	}
 
 	SRF_RETURN_DONE(funcctx);
@@ -1146,7 +855,7 @@ pg_listening_channels(PG_FUNCTION_ARGS)
 static void
 Async_UnlistenOnExit(int code, Datum arg)
 {
-	CleanupListenersOnExit();
+	Exec_UnlistenAllCommit();
 	asyncQueueUnregister();
 }
 
@@ -1193,16 +902,8 @@ PreCommit_Notify(void)
 		elog(DEBUG1, "PreCommit_Notify");
 
 	/* Preflight for any pending listen/unlisten actions */
-	initGlobalChannelTable();
-
 	if (pendingActions != NULL)
 	{
-		/* Ensure we have a local channel table */
-		initLocalChannelTable();
-		/* Create pendingListenActions hash table for this transaction */
-		initPendingListenActions();
-
-		/* Stage all the actions this transaction wants to perform */
 		foreach(p, pendingActions->actions)
 		{
 			ListenAction *actrec = (ListenAction *) lfirst(p);
@@ -1210,14 +911,13 @@ PreCommit_Notify(void)
 			switch (actrec->action)
 			{
 				case LISTEN_LISTEN:
-					BecomeRegisteredListener();
-					PrepareTableEntriesForListen(actrec->channel);
+					Exec_ListenPreCommit();
 					break;
 				case LISTEN_UNLISTEN:
-					PrepareTableEntriesForUnlisten(actrec->channel);
+					/* there is no Exec_UnlistenPreCommit() */
 					break;
 				case LISTEN_UNLISTEN_ALL:
-					PrepareTableEntriesForUnlistenAll();
+					/* there is no Exec_UnlistenAllPreCommit() */
 					break;
 			}
 		}
@@ -1227,60 +927,6 @@ PreCommit_Notify(void)
 	if (pendingNotifies)
 	{
 		ListCell   *nextNotify;
-		bool		firstIteration = true;
-
-		/*
-		 * Build list of unique channel names being notified for use by
-		 * SignalBackends().
-		 *
-		 * If uniqueChannelHash is available, use it to efficiently get the
-		 * unique channels.  Otherwise, fall back to the O(N^2) approach.
-		 */
-		pendingNotifies->uniqueChannelNames = NIL;
-		if (pendingNotifies->uniqueChannelHash != NULL)
-		{
-			HASH_SEQ_STATUS status;
-			ChannelName *channelEntry;
-
-			hash_seq_init(&status, pendingNotifies->uniqueChannelHash);
-			while ((channelEntry = (ChannelName *) hash_seq_search(&status)) != NULL)
-				pendingNotifies->uniqueChannelNames =
-					lappend(pendingNotifies->uniqueChannelNames,
-							channelEntry->channel);
-		}
-		else
-		{
-			/* O(N^2) approach is better for small number of notifications */
-			foreach_ptr(Notification, n, pendingNotifies->events)
-			{
-				char	   *channel = n->data;
-				bool		found = false;
-
-				/* Name present in list? */
-				foreach_ptr(char, oldchan, pendingNotifies->uniqueChannelNames)
-				{
-					if (strcmp(oldchan, channel) == 0)
-					{
-						found = true;
-						break;
-					}
-				}
-				/* Add if not already in list */
-				if (!found)
-					pendingNotifies->uniqueChannelNames =
-						lappend(pendingNotifies->uniqueChannelNames,
-								channel);
-			}
-		}
-
-		/* Preallocate workspace that will be needed by SignalBackends() */
-		if (signalPids == NULL)
-			signalPids = MemoryContextAlloc(TopMemoryContext,
-											MaxBackends * sizeof(int32));
-
-		if (signalProcnos == NULL)
-			signalProcnos = MemoryContextAlloc(TopMemoryContext,
-											   MaxBackends * sizeof(ProcNumber));
 
 		/*
 		 * Make sure that we have an XID assigned to the current transaction.
@@ -1309,23 +955,6 @@ PreCommit_Notify(void)
 		LockSharedObject(DatabaseRelationId, InvalidOid, 0,
 						 AccessExclusiveLock);
 
-		/*
-		 * For the direct advancement optimization in SignalBackends(), we
-		 * need to ensure that no other backend can insert queue entries
-		 * between queueHeadBeforeWrite and queueHeadAfterWrite.  The
-		 * heavyweight lock above provides this guarantee, since it serializes
-		 * all writers.
-		 *
-		 * Note: if the heavyweight lock were ever removed for scalability
-		 * reasons, we could achieve the same guarantee by holding
-		 * NotifyQueueLock in EXCLUSIVE mode across all our insertions, rather
-		 * than releasing and reacquiring it for each page as we do below.
-		 */
-
-		/* Initialize values to a safe default in case list is empty */
-		SET_QUEUE_POS(queueHeadBeforeWrite, 0, 0);
-		SET_QUEUE_POS(queueHeadAfterWrite, 0, 0);
-
 		/* Now push the notifications into the queue */
 		nextNotify = list_head(pendingNotifies->events);
 		while (nextNotify != NULL)
@@ -1343,18 +972,12 @@ PreCommit_Notify(void)
 			 * point in time we can still roll the transaction back.
 			 */
 			LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
-			if (firstIteration)
-			{
-				queueHeadBeforeWrite = QUEUE_HEAD;
-				firstIteration = false;
-			}
 			asyncQueueFillWarning();
 			if (asyncQueueIsFull())
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("too many notifications in the NOTIFY queue")));
 			nextNotify = asyncQueueAddEntries(nextNotify);
-			queueHeadAfterWrite = QUEUE_HEAD;
 			LWLockRelease(NotifyQueueLock);
 		}
 
@@ -1367,7 +990,7 @@ PreCommit_Notify(void)
  *
  *		This is called at transaction commit, after committing to clog.
  *
- *		Apply pending listen/unlisten changes and clear transaction-local state.
+ *		Update listenChannels and clear transaction-local state.
  *
  *		If we issued any notifications in the transaction, send signals to
  *		listening backends (possibly including ourselves) to process them.
@@ -1377,6 +1000,8 @@ PreCommit_Notify(void)
 void
 AtCommit_Notify(void)
 {
+	ListCell   *p;
+
 	/*
 	 * Allow transactions that have not executed LISTEN/UNLISTEN/NOTIFY to
 	 * return as soon as possible
@@ -1387,11 +1012,30 @@ AtCommit_Notify(void)
 	if (Trace_notify)
 		elog(DEBUG1, "AtCommit_Notify");
 
-	/* Apply staged listen/unlisten changes */
-	ApplyPendingListenActions(true);
+	/* Perform any pending listen/unlisten actions */
+	if (pendingActions != NULL)
+	{
+		foreach(p, pendingActions->actions)
+		{
+			ListenAction *actrec = (ListenAction *) lfirst(p);
+
+			switch (actrec->action)
+			{
+				case LISTEN_LISTEN:
+					Exec_ListenCommit(actrec->channel);
+					break;
+				case LISTEN_UNLISTEN:
+					Exec_UnlistenCommit(actrec->channel);
+					break;
+				case LISTEN_UNLISTEN_ALL:
+					Exec_UnlistenAllCommit();
+					break;
+			}
+		}
+	}
 
 	/* If no longer listening to anything, get out of listener array */
-	if (amRegisteredListener && LocalChannelTableIsEmpty())
+	if (amRegisteredListener && listenChannels == NIL)
 		asyncQueueUnregister();
 
 	/*
@@ -1422,16 +1066,16 @@ AtCommit_Notify(void)
 }
 
 /*
- * BecomeRegisteredListener --- subroutine for PreCommit_Notify
+ * Exec_ListenPreCommit --- subroutine for PreCommit_Notify
  *
  * This function must make sure we are ready to catch any incoming messages.
  */
 static void
-BecomeRegisteredListener(void)
+Exec_ListenPreCommit(void)
 {
 	QueuePosition head;
 	QueuePosition max;
-	ProcNumber	prevListener;
+	BackendId	prevListener;
 
 	/*
 	 * Nothing to do if we are already listening to something, nor if we
@@ -1441,7 +1085,7 @@ BecomeRegisteredListener(void)
 		return;
 
 	if (Trace_notify)
-		elog(DEBUG1, "BecomeRegisteredListener(%d)", MyProcPid);
+		elog(DEBUG1, "Exec_ListenPreCommit(%d)", MyProcPid);
 
 	/*
 	 * Before registering, make sure we will unlisten before dying. (Note:
@@ -1476,30 +1120,28 @@ BecomeRegisteredListener(void)
 	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
 	head = QUEUE_HEAD;
 	max = QUEUE_TAIL;
-	prevListener = INVALID_PROC_NUMBER;
-	for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
+	prevListener = InvalidBackendId;
+	for (BackendId i = QUEUE_FIRST_LISTENER; i > 0; i = QUEUE_NEXT_LISTENER(i))
 	{
 		if (QUEUE_BACKEND_DBOID(i) == MyDatabaseId)
 			max = QUEUE_POS_MAX(max, QUEUE_BACKEND_POS(i));
 		/* Also find last listening backend before this one */
-		if (i < MyProcNumber)
+		if (i < MyBackendId)
 			prevListener = i;
 	}
-	QUEUE_BACKEND_POS(MyProcNumber) = max;
-	QUEUE_BACKEND_PID(MyProcNumber) = MyProcPid;
-	QUEUE_BACKEND_DBOID(MyProcNumber) = MyDatabaseId;
-	QUEUE_BACKEND_WAKEUP_PENDING(MyProcNumber) = false;
-	QUEUE_BACKEND_IS_ADVANCING(MyProcNumber) = false;
+	QUEUE_BACKEND_POS(MyBackendId) = max;
+	QUEUE_BACKEND_PID(MyBackendId) = MyProcPid;
+	QUEUE_BACKEND_DBOID(MyBackendId) = MyDatabaseId;
 	/* Insert backend into list of listeners at correct position */
-	if (prevListener != INVALID_PROC_NUMBER)
+	if (prevListener > 0)
 	{
-		QUEUE_NEXT_LISTENER(MyProcNumber) = QUEUE_NEXT_LISTENER(prevListener);
-		QUEUE_NEXT_LISTENER(prevListener) = MyProcNumber;
+		QUEUE_NEXT_LISTENER(MyBackendId) = QUEUE_NEXT_LISTENER(prevListener);
+		QUEUE_NEXT_LISTENER(prevListener) = MyBackendId;
 	}
 	else
 	{
-		QUEUE_NEXT_LISTENER(MyProcNumber) = QUEUE_FIRST_LISTENER;
-		QUEUE_FIRST_LISTENER = MyProcNumber;
+		QUEUE_NEXT_LISTENER(MyBackendId) = QUEUE_FIRST_LISTENER;
+		QUEUE_FIRST_LISTENER = MyBackendId;
 	}
 	LWLockRelease(NotifyQueueLock);
 
@@ -1519,390 +1161,99 @@ BecomeRegisteredListener(void)
 }
 
 /*
- * PrepareTableEntriesForListen --- subroutine for PreCommit_Notify
+ * Exec_ListenCommit --- subroutine for AtCommit_Notify
  *
- * Prepare a LISTEN by recording it in pendingListenActions, pre-allocating
- * an entry in localChannelTable, and pre-allocating an entry in the shared
- * globalChannelTable with removeOnAbort set.  AtCommit_Notify will clear
- * removeOnAbort; abort processing will remove entries still marked so.
+ * Add the channel to the list of channels we are listening on.
  */
 static void
-PrepareTableEntriesForListen(const char *channel)
+Exec_ListenCommit(const char *channel)
 {
-	GlobalChannelKey key;
-	GlobalChannelEntry *entry;
-	bool		found;
-	ListenerEntry *listeners;
-	PendingListenEntry *pending;
+	MemoryContext oldcontext;
 
-	/*
-	 * Record in local pending hash that we want to LISTEN, overwriting any
-	 * earlier attempt to UNLISTEN.
-	 */
-	pending = (PendingListenEntry *)
-		hash_search(pendingListenActions, channel, HASH_ENTER, NULL);
-	pending->action = PENDING_LISTEN;
-
-	/*
-	 * Ensure that there is an entry for the channel in localChannelTable.
-	 * (Should this fail, we can just roll back.)  If the transaction fails
-	 * after this point, we will remove the entry if appropriate during
-	 * ApplyPendingListenActions.  Note that this entry allows IsListeningOn()
-	 * to return TRUE; we assume nothing is going to consult that before
-	 * AtCommit_Notify/AtAbort_Notify.  However, if later actions attempt to
-	 * UNLISTEN this channel or UNLISTEN *, we need to have the local entry
-	 * present to ensure they do the right things; see
-	 * PrepareTableEntriesForUnlisten and PrepareTableEntriesForUnlistenAll.
-	 */
-	(void) hash_search(localChannelTable, channel, HASH_ENTER, NULL);
-
-	/* Pre-allocate entry in shared globalChannelTable */
-	GlobalChannelKeyInit(&key, MyDatabaseId, channel);
-	entry = dshash_find_or_insert(globalChannelTable, &key, &found);
-
-	if (!found)
-	{
-		/* New channel entry, so initialize it to a safe state */
-		entry->listenersArray = InvalidDsaPointer;
-		entry->numListeners = 0;
-		entry->allocatedListeners = 0;
-	}
-
-	/*
-	 * Create listenersArray if entry doesn't have one.  It's tempting to fold
-	 * this into the !found case, but this coding allows us to cope in case
-	 * dsa_allocate() failed in an earlier attempt.
-	 */
-	if (!DsaPointerIsValid(entry->listenersArray))
-	{
-		entry->listenersArray = dsa_allocate(globalChannelDSA,
-											 sizeof(ListenerEntry) * INITIAL_LISTENERS_ARRAY_SIZE);
-		entry->allocatedListeners = INITIAL_LISTENERS_ARRAY_SIZE;
-	}
-
-	listeners = (ListenerEntry *)
-		dsa_get_address(globalChannelDSA, entry->listenersArray);
-
-	/*
-	 * Check if we already have a ListenerEntry (possibly from earlier in this
-	 * transaction)
-	 */
-	for (int i = 0; i < entry->numListeners; i++)
-	{
-		if (listeners[i].procNo == MyProcNumber)
-		{
-			/* Already have an entry; leave removeOnAbort as-is */
-			dshash_release_lock(globalChannelTable, entry);
-			return;
-		}
-	}
-
-	/* Need to add a new entry; grow array if necessary */
-	if (entry->numListeners >= entry->allocatedListeners)
-	{
-		int			new_size = entry->allocatedListeners * 2;
-		dsa_pointer old_array = entry->listenersArray;
-		dsa_pointer new_array = dsa_allocate(globalChannelDSA,
-											 sizeof(ListenerEntry) * new_size);
-		ListenerEntry *new_listeners = (ListenerEntry *) dsa_get_address(globalChannelDSA, new_array);
-
-		memcpy(new_listeners, listeners, sizeof(ListenerEntry) * entry->numListeners);
-		entry->listenersArray = new_array;
-		entry->allocatedListeners = new_size;
-		dsa_free(globalChannelDSA, old_array);
-		listeners = new_listeners;
-	}
-
-	listeners[entry->numListeners].procNo = MyProcNumber;
-	listeners[entry->numListeners].removeOnAbort = true;
-	entry->numListeners++;
-
-	dshash_release_lock(globalChannelTable, entry);
-}
-
-/*
- * PrepareTableEntriesForUnlisten --- subroutine for PreCommit_Notify
- *
- * Prepare an UNLISTEN by recording it in pendingListenActions, but only if
- * we're currently listening (committed or staged).  We don't touch
- * globalChannelTable yet - the listener keeps receiving signals until
- * commit, when the entry is removed.
- */
-static void
-PrepareTableEntriesForUnlisten(const char *channel)
-{
-	PendingListenEntry *pending;
-
-	/*
-	 * If the channel name is not in localChannelTable, then we are neither
-	 * listening on it nor preparing to listen on it, so we don't need to
-	 * record an UNLISTEN action.
-	 */
-	Assert(localChannelTable != NULL);
-	if (hash_search(localChannelTable, channel, HASH_FIND, NULL) == NULL)
+	/* Do nothing if we are already listening on this channel */
+	if (IsListeningOn(channel))
 		return;
 
 	/*
-	 * Record in local pending hash that we want to UNLISTEN, overwriting any
-	 * earlier attempt to LISTEN.  Don't touch localChannelTable or
-	 * globalChannelTable yet - we keep receiving signals until commit.
+	 * Add the new channel name to listenChannels.
+	 *
+	 * XXX It is theoretically possible to get an out-of-memory failure here,
+	 * which would be bad because we already committed.  For the moment it
+	 * doesn't seem worth trying to guard against that, but maybe improve this
+	 * later.
 	 */
-	pending = (PendingListenEntry *)
-		hash_search(pendingListenActions, channel, HASH_ENTER, NULL);
-	pending->action = PENDING_UNLISTEN;
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	listenChannels = lappend(listenChannels, pstrdup(channel));
+	MemoryContextSwitchTo(oldcontext);
 }
 
 /*
- * PrepareTableEntriesForUnlistenAll --- subroutine for PreCommit_Notify
+ * Exec_UnlistenCommit --- subroutine for AtCommit_Notify
  *
- * Prepare UNLISTEN * by recording an UNLISTEN for all listened or
- * about-to-be-listened channels in pendingListenActions.
+ * Remove the specified channel name from listenChannels.
  */
 static void
-PrepareTableEntriesForUnlistenAll(void)
+Exec_UnlistenCommit(const char *channel)
 {
-	HASH_SEQ_STATUS seq;
-	ChannelName *channelEntry;
-	PendingListenEntry *pending;
-
-	/*
-	 * Scan localChannelTable, which will have the names of all channels that
-	 * we are listening on or have prepared to listen on.  Record an UNLISTEN
-	 * action for each one, overwriting any earlier attempt to LISTEN.
-	 */
-	hash_seq_init(&seq, localChannelTable);
-	while ((channelEntry = (ChannelName *) hash_seq_search(&seq)) != NULL)
-	{
-		pending = (PendingListenEntry *)
-			hash_search(pendingListenActions, channelEntry->channel, HASH_ENTER, NULL);
-		pending->action = PENDING_UNLISTEN;
-	}
-}
-
-/*
- * RemoveListenerFromChannel --- remove idx'th listener from global channel entry
- *
- * Decrements numListeners, compacts the array, and frees the entry if empty.
- * Sets *entry_ptr to NULL if the entry was deleted.
- *
- * We could get the listeners pointer from the entry, but all callers
- * already have it at hand.
- */
-static void
-RemoveListenerFromChannel(GlobalChannelEntry **entry_ptr,
-						  ListenerEntry *listeners,
-						  int idx)
-{
-	GlobalChannelEntry *entry = *entry_ptr;
-
-	entry->numListeners--;
-	if (idx < entry->numListeners)
-		memmove(&listeners[idx], &listeners[idx + 1],
-				sizeof(ListenerEntry) * (entry->numListeners - idx));
-
-	if (entry->numListeners == 0)
-	{
-		dsa_free(globalChannelDSA, entry->listenersArray);
-		dshash_delete_entry(globalChannelTable, entry);
-		/* tells caller not to release the entry's lock: */
-		*entry_ptr = NULL;
-	}
-}
-
-/*
- * ApplyPendingListenActions
- *
- * Apply, or revert, staged listen/unlisten changes to the local and global
- * hash tables.
- */
-static void
-ApplyPendingListenActions(bool isCommit)
-{
-	HASH_SEQ_STATUS seq;
-	PendingListenEntry *pending;
-
-	/* Quick exit if nothing to do */
-	if (pendingListenActions == NULL)
-		return;
-
-	/* We made a globalChannelTable before building pendingListenActions */
-	if (globalChannelTable == NULL)
-		elog(PANIC, "global channel table missing post-commit/abort");
-
-	/* For each staged action ... */
-	hash_seq_init(&seq, pendingListenActions);
-	while ((pending = (PendingListenEntry *) hash_seq_search(&seq)) != NULL)
-	{
-		GlobalChannelKey key;
-		GlobalChannelEntry *entry;
-		bool		removeLocal = true;
-		bool		foundListener = false;
-
-		/*
-		 * Find the global entry for this channel.  If isCommit, it had better
-		 * exist (it was created in PreCommit).  In an abort, it might not
-		 * exist, in which case we are not listening and should discard any
-		 * local entry that PreCommit may have managed to create.
-		 */
-		GlobalChannelKeyInit(&key, MyDatabaseId, pending->channel);
-		entry = dshash_find(globalChannelTable, &key, true);
-		if (entry != NULL)
-		{
-			/* Scan entry to find the ListenerEntry for this backend */
-			ListenerEntry *listeners;
-
-			listeners = (ListenerEntry *)
-				dsa_get_address(globalChannelDSA, entry->listenersArray);
-
-			for (int i = 0; i < entry->numListeners; i++)
-			{
-				if (listeners[i].procNo != MyProcNumber)
-					continue;
-				foundListener = true;
-				if (isCommit)
-				{
-					if (pending->action == PENDING_LISTEN)
-					{
-						/*
-						 * LISTEN being committed: entry is now permanent.
-						 * localChannelTable entry was created during
-						 * PreCommit and should be kept.
-						 */
-						listeners[i].removeOnAbort = false;
-						removeLocal = false;
-					}
-					else
-					{
-						/*
-						 * UNLISTEN being committed: remove pre-allocated
-						 * entries from both tables.
-						 */
-						RemoveListenerFromChannel(&entry, listeners, i);
-					}
-				}
-				else
-				{
-					/*
-					 * Note: this part is reachable only if the transaction
-					 * aborts after PreCommit_Notify() has made some
-					 * pendingListenActions entries, so it's pretty hard to
-					 * test.
-					 */
-					if (listeners[i].removeOnAbort)
-					{
-						/*
-						 * Staged LISTEN (or LISTEN+UNLISTEN) being aborted,
-						 * so remove pre-allocated entries from both tables.
-						 */
-						RemoveListenerFromChannel(&entry, listeners, i);
-					}
-					else
-					{
-						/*
-						 * Entry predates this transaction, so keep the
-						 * localChannelTable entry.
-						 */
-						removeLocal = false;
-					}
-				}
-				break;			/* there shouldn't be another match */
-			}
-
-			/* We might have already released the entry by removing it */
-			if (entry != NULL)
-				dshash_release_lock(globalChannelTable, entry);
-		}
-
-		/*
-		 * If we're committing a LISTEN action, we should have found a
-		 * matching ListenerEntry, but otherwise it's okay if we didn't.
-		 */
-		if (isCommit && pending->action == PENDING_LISTEN && !foundListener)
-			elog(PANIC, "could not find listener entry for channel \"%s\" backend %d",
-				 pending->channel, MyProcNumber);
-
-		/*
-		 * If we did not find a globalChannelTable entry for our backend, or
-		 * if we are unlistening, remove any localChannelTable entry that may
-		 * exist.  (Note in particular that this cleans up if we created a
-		 * localChannelTable entry and then failed while trying to create a
-		 * globalChannelTable entry.)
-		 */
-		if (removeLocal && localChannelTable != NULL)
-			(void) hash_search(localChannelTable, pending->channel,
-							   HASH_REMOVE, NULL);
-	}
-}
-
-/*
- * CleanupListenersOnExit --- called from Async_UnlistenOnExit
- *
- *		Remove this backend from all channels in the shared global table.
- */
-static void
-CleanupListenersOnExit(void)
-{
-	dshash_seq_status status;
-	GlobalChannelEntry *entry;
+	ListCell   *q;
 
 	if (Trace_notify)
-		elog(DEBUG1, "CleanupListenersOnExit(%d)", MyProcPid);
+		elog(DEBUG1, "Exec_UnlistenCommit(%s,%d)", channel, MyProcPid);
 
-	/* Clear our local cache (not really necessary, but be consistent) */
-	if (localChannelTable != NULL)
+	foreach(q, listenChannels)
 	{
-		hash_destroy(localChannelTable);
-		localChannelTable = NULL;
-	}
+		char	   *lchan = (char *) lfirst(q);
 
-	/* Now remove our entries from the shared globalChannelTable */
-	if (globalChannelTable == NULL)
-		return;
-
-	dshash_seq_init(&status, globalChannelTable, true);
-	while ((entry = dshash_seq_next(&status)) != NULL)
-	{
-		ListenerEntry *listeners;
-
-		if (entry->key.dboid != MyDatabaseId)
-			continue;			/* not relevant */
-
-		listeners = (ListenerEntry *)
-			dsa_get_address(globalChannelDSA, entry->listenersArray);
-
-		for (int i = 0; i < entry->numListeners; i++)
+		if (strcmp(lchan, channel) == 0)
 		{
-			if (listeners[i].procNo == MyProcNumber)
-			{
-				entry->numListeners--;
-				if (i < entry->numListeners)
-					memmove(&listeners[i], &listeners[i + 1],
-							sizeof(ListenerEntry) * (entry->numListeners - i));
-
-				if (entry->numListeners == 0)
-				{
-					dsa_free(globalChannelDSA, entry->listenersArray);
-					dshash_delete_current(&status);
-				}
-				break;
-			}
+			listenChannels = foreach_delete_current(listenChannels, q);
+			pfree(lchan);
+			break;
 		}
 	}
-	dshash_seq_term(&status);
+
+	/*
+	 * We do not complain about unlistening something not being listened;
+	 * should we?
+	 */
+}
+
+/*
+ * Exec_UnlistenAllCommit --- subroutine for AtCommit_Notify
+ *
+ *		Unlisten on all channels for this backend.
+ */
+static void
+Exec_UnlistenAllCommit(void)
+{
+	if (Trace_notify)
+		elog(DEBUG1, "Exec_UnlistenAllCommit(%d)", MyProcPid);
+
+	list_free_deep(listenChannels);
+	listenChannels = NIL;
 }
 
 /*
  * Test whether we are actively listening on the given channel name.
  *
  * Note: this function is executed for every notification found in the queue.
+ * Perhaps it is worth further optimization, eg convert the list to a sorted
+ * array so we can binary-search it.  In practice the list is likely to be
+ * fairly short, though.
  */
 static bool
 IsListeningOn(const char *channel)
 {
-	if (localChannelTable == NULL)
-		return false;
+	ListCell   *p;
 
-	return (hash_search(localChannelTable, channel, HASH_FIND, NULL) != NULL);
+	foreach(p, listenChannels)
+	{
+		char	   *lchan = (char *) lfirst(p);
+
+		if (strcmp(lchan, channel) == 0)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -1912,7 +1263,7 @@ IsListeningOn(const char *channel)
 static void
 asyncQueueUnregister(void)
 {
-	Assert(LocalChannelTableIsEmpty()); /* else caller error */
+	Assert(listenChannels == NIL);	/* else caller error */
 
 	if (!amRegisteredListener)	/* nothing to do */
 		return;
@@ -1922,25 +1273,23 @@ asyncQueueUnregister(void)
 	 */
 	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
 	/* Mark our entry as invalid */
-	QUEUE_BACKEND_PID(MyProcNumber) = InvalidPid;
-	QUEUE_BACKEND_DBOID(MyProcNumber) = InvalidOid;
-	QUEUE_BACKEND_WAKEUP_PENDING(MyProcNumber) = false;
-	QUEUE_BACKEND_IS_ADVANCING(MyProcNumber) = false;
+	QUEUE_BACKEND_PID(MyBackendId) = InvalidPid;
+	QUEUE_BACKEND_DBOID(MyBackendId) = InvalidOid;
 	/* and remove it from the list */
-	if (QUEUE_FIRST_LISTENER == MyProcNumber)
-		QUEUE_FIRST_LISTENER = QUEUE_NEXT_LISTENER(MyProcNumber);
+	if (QUEUE_FIRST_LISTENER == MyBackendId)
+		QUEUE_FIRST_LISTENER = QUEUE_NEXT_LISTENER(MyBackendId);
 	else
 	{
-		for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
+		for (BackendId i = QUEUE_FIRST_LISTENER; i > 0; i = QUEUE_NEXT_LISTENER(i))
 		{
-			if (QUEUE_NEXT_LISTENER(i) == MyProcNumber)
+			if (QUEUE_NEXT_LISTENER(i) == MyBackendId)
 			{
-				QUEUE_NEXT_LISTENER(i) = QUEUE_NEXT_LISTENER(MyProcNumber);
+				QUEUE_NEXT_LISTENER(i) = QUEUE_NEXT_LISTENER(MyBackendId);
 				break;
 			}
 		}
 	}
-	QUEUE_NEXT_LISTENER(MyProcNumber) = INVALID_PROC_NUMBER;
+	QUEUE_NEXT_LISTENER(MyBackendId) = InvalidBackendId;
 	LWLockRelease(NotifyQueueLock);
 
 	/* mark ourselves as no longer listed in the global array */
@@ -1955,11 +1304,27 @@ asyncQueueUnregister(void)
 static bool
 asyncQueueIsFull(void)
 {
-	int64		headPage = QUEUE_POS_PAGE(QUEUE_HEAD);
-	int64		tailPage = QUEUE_POS_PAGE(QUEUE_TAIL);
-	int64		occupied = headPage - tailPage;
+	int			nexthead;
+	int			boundary;
 
-	return occupied >= max_notify_queue_pages;
+	/*
+	 * The queue is full if creating a new head page would create a page that
+	 * logically precedes the current global tail pointer, ie, the head
+	 * pointer would wrap around compared to the tail.  We cannot create such
+	 * a head page for fear of confusing slru.c.  For safety we round the tail
+	 * pointer back to a segment boundary (truncation logic in
+	 * asyncQueueAdvanceTail does not do this, so doing it here is optional).
+	 *
+	 * Note that this test is *not* dependent on how much space there is on
+	 * the current head page.  This is necessary because asyncQueueAddEntries
+	 * might try to create the next head page in any case.
+	 */
+	nexthead = QUEUE_POS_PAGE(QUEUE_HEAD) + 1;
+	if (nexthead > QUEUE_MAX_PAGE)
+		nexthead = 0;			/* wrap around */
+	boundary = QUEUE_STOP_PAGE;
+	boundary -= boundary % SLRU_PAGES_PER_SEGMENT;
+	return asyncQueuePagePrecedes(nexthead, boundary);
 }
 
 /*
@@ -1968,9 +1333,9 @@ asyncQueueIsFull(void)
  * returns true, else false.
  */
 static bool
-asyncQueueAdvance(QueuePosition *position, int entryLength)
+asyncQueueAdvance(volatile QueuePosition *position, int entryLength)
 {
-	int64		pageno = QUEUE_POS_PAGE(*position);
+	int			pageno = QUEUE_POS_PAGE(*position);
 	int			offset = QUEUE_POS_OFFSET(*position);
 	bool		pageJump = false;
 
@@ -1989,6 +1354,8 @@ asyncQueueAdvance(QueuePosition *position, int entryLength)
 	if (offset + QUEUEALIGN(AsyncQueueEntryEmptySize) > QUEUE_PAGESIZE)
 	{
 		pageno++;
+		if (pageno > QUEUE_MAX_PAGE)
+			pageno = 0;			/* wrap around */
 		offset = 0;
 		pageJump = true;
 	}
@@ -2034,17 +1401,19 @@ asyncQueueNotificationToEntry(Notification *n, AsyncQueueEntry *qe)
  * Eventually we will return NULL indicating all is done.
  *
  * We are holding NotifyQueueLock already from the caller and grab
- * page specific SLRU bank lock locally in this function.
+ * NotifySLRULock locally in this function.
  */
 static ListCell *
 asyncQueueAddEntries(ListCell *nextNotify)
 {
 	AsyncQueueEntry qe;
 	QueuePosition queue_head;
-	int64		pageno;
+	int			pageno;
 	int			offset;
 	int			slotno;
-	LWLock	   *prevlock;
+
+	/* We hold both NotifyQueueLock and NotifySLRULock during this operation */
+	LWLockAcquire(NotifySLRULock, LW_EXCLUSIVE);
 
 	/*
 	 * We work with a local copy of QUEUE_HEAD, which we write back to shared
@@ -2063,17 +1432,16 @@ asyncQueueAddEntries(ListCell *nextNotify)
 	 * If this is the first write since the postmaster started, we need to
 	 * initialize the first page of the async SLRU.  Otherwise, the current
 	 * page should be initialized already, so just fetch it.
+	 *
+	 * (We could also take the first path when the SLRU position has just
+	 * wrapped around, but re-zeroing the page is harmless in that case.)
 	 */
 	pageno = QUEUE_POS_PAGE(queue_head);
-	prevlock = SimpleLruGetBankLock(NotifyCtl, pageno);
-
-	/* We hold both NotifyQueueLock and SLRU bank lock during this operation */
-	LWLockAcquire(prevlock, LW_EXCLUSIVE);
-
 	if (QUEUE_POS_IS_ZERO(queue_head))
 		slotno = SimpleLruZeroPage(NotifyCtl, pageno);
 	else
-		slotno = SimpleLruReadPage(NotifyCtl, pageno, true, &queue_head);
+		slotno = SimpleLruReadPage(NotifyCtl, pageno, true,
+								   InvalidTransactionId);
 
 	/* Note we mark the page dirty before writing in it */
 	NotifyCtl->shared->page_dirty[slotno] = true;
@@ -2115,17 +1483,6 @@ asyncQueueAddEntries(ListCell *nextNotify)
 		/* Advance queue_head appropriately, and detect if page is full */
 		if (asyncQueueAdvance(&(queue_head), qe.length))
 		{
-			LWLock	   *lock;
-
-			pageno = QUEUE_POS_PAGE(queue_head);
-			lock = SimpleLruGetBankLock(NotifyCtl, pageno);
-			if (lock != prevlock)
-			{
-				LWLockRelease(prevlock);
-				LWLockAcquire(lock, LW_EXCLUSIVE);
-				prevlock = lock;
-			}
-
 			/*
 			 * Page is full, so we're done here, but first fill the next page
 			 * with zeroes.  The reason to do this is to ensure that slru.c's
@@ -2152,7 +1509,7 @@ asyncQueueAddEntries(ListCell *nextNotify)
 	/* Success, so update the global QUEUE_HEAD */
 	QUEUE_HEAD = queue_head;
 
-	LWLockRelease(prevlock);
+	LWLockRelease(NotifySLRULock);
 
 	return nextNotify;
 }
@@ -2189,14 +1546,22 @@ pg_notification_queue_usage(PG_FUNCTION_ARGS)
 static double
 asyncQueueUsage(void)
 {
-	int64		headPage = QUEUE_POS_PAGE(QUEUE_HEAD);
-	int64		tailPage = QUEUE_POS_PAGE(QUEUE_TAIL);
-	int64		occupied = headPage - tailPage;
+	int			headPage = QUEUE_POS_PAGE(QUEUE_HEAD);
+	int			tailPage = QUEUE_POS_PAGE(QUEUE_TAIL);
+	int			occupied;
+
+	occupied = headPage - tailPage;
 
 	if (occupied == 0)
 		return (double) 0;		/* fast exit for common case */
 
-	return (double) occupied / (double) max_notify_queue_pages;
+	if (occupied < 0)
+	{
+		/* head has wrapped around, tail not yet */
+		occupied += QUEUE_MAX_PAGE + 1;
+	}
+
+	return (double) occupied / (double) ((QUEUE_MAX_PAGE + 1) / 2);
 }
 
 /*
@@ -2225,7 +1590,7 @@ asyncQueueFillWarning(void)
 		QueuePosition min = QUEUE_HEAD;
 		int32		minPid = InvalidPid;
 
-		for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
+		for (BackendId i = QUEUE_FIRST_LISTENER; i > 0; i = QUEUE_NEXT_LISTENER(i))
 		{
 			Assert(QUEUE_BACKEND_PID(i) != InvalidPid);
 			min = QUEUE_POS_MIN(min, QUEUE_BACKEND_POS(i));
@@ -2249,12 +1614,14 @@ asyncQueueFillWarning(void)
 /*
  * Send signals to listening backends.
  *
- * Normally we signal only backends that are interested in the notifies that
- * we just sent.  However, that will leave idle listeners falling further and
- * further behind.  Waken them anyway if they're far enough behind, so they'll
+ * Normally we signal only backends in our own database, since only those
+ * backends could be interested in notifies we send.  However, if there's
+ * notify traffic in our database but no traffic in another database that
+ * does have listener(s), those listeners will fall further and further
+ * behind.  Waken them anyway if they're far enough behind, so that they'll
  * advance their queue position pointers, allowing the global tail to advance.
  *
- * Since we know the ProcNumber and the Pid the signaling is quite cheap.
+ * Since we know the BackendId and the Pid the signaling is quite cheap.
  *
  * This is called during CommitTransaction(), so it's important for it
  * to have very low probability of failure.
@@ -2262,129 +1629,60 @@ asyncQueueFillWarning(void)
 static void
 SignalBackends(void)
 {
+	int32	   *pids;
+	BackendId  *ids;
 	int			count;
-
-	/* Can't get here without PreCommit_Notify having made the global table */
-	Assert(globalChannelTable != NULL);
-
-	/* It should have set up these arrays, too */
-	Assert(signalPids != NULL && signalProcnos != NULL);
 
 	/*
 	 * Identify backends that we need to signal.  We don't want to send
-	 * signals while holding the NotifyQueueLock, so this part just builds a
-	 * list of target PIDs in signalPids[] and signalProcnos[].
+	 * signals while holding the NotifyQueueLock, so this loop just builds a
+	 * list of target PIDs.
+	 *
+	 * XXX in principle these pallocs could fail, which would be bad. Maybe
+	 * preallocate the arrays?  They're not that large, though.
 	 */
+	pids = (int32 *) palloc(MaxBackends * sizeof(int32));
+	ids = (BackendId *) palloc(MaxBackends * sizeof(BackendId));
 	count = 0;
 
 	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
-
-	/* Scan each channel name that we notified in this transaction */
-	foreach_ptr(char, channel, pendingNotifies->uniqueChannelNames)
+	for (BackendId i = QUEUE_FIRST_LISTENER; i > 0; i = QUEUE_NEXT_LISTENER(i))
 	{
-		GlobalChannelKey key;
-		GlobalChannelEntry *entry;
-		ListenerEntry *listeners;
-
-		GlobalChannelKeyInit(&key, MyDatabaseId, channel);
-		entry = dshash_find(globalChannelTable, &key, false);
-		if (entry == NULL)
-			continue;			/* nobody is listening */
-
-		listeners = (ListenerEntry *) dsa_get_address(globalChannelDSA,
-													  entry->listenersArray);
-
-		/*
-		 * Identify listeners that now need waking, add them to arrays.
-		 *
-		 * Note that we signal listeners regardless of the state of their
-		 * removeOnAbort flags.  Hence a new listener that reached PreCommit,
-		 * but then failed before AtCommit_Notify, can receive a signal even
-		 * though it was never really listening.  This is okay because it will
-		 * not do anything in response to that signal.  If we did not do it
-		 * like this then a new listener might miss some messages due to the
-		 * direct-advance logic below.
-		 */
-		for (int j = 0; j < entry->numListeners; j++)
-		{
-			ProcNumber	i = listeners[j].procNo;
-			int32		pid;
-			QueuePosition pos;
-
-			if (QUEUE_BACKEND_WAKEUP_PENDING(i))
-				continue;		/* already signaled, no need to repeat */
-
-			pid = QUEUE_BACKEND_PID(i);
-			pos = QUEUE_BACKEND_POS(i);
-
-			if (QUEUE_POS_EQUAL(pos, QUEUE_HEAD))
-				continue;		/* it's fully caught up already */
-
-			Assert(pid != InvalidPid);
-
-			QUEUE_BACKEND_WAKEUP_PENDING(i) = true;
-			signalPids[count] = pid;
-			signalProcnos[count] = i;
-			count++;
-		}
-
-		dshash_release_lock(globalChannelTable, entry);
-	}
-
-	/*
-	 * Scan all listeners.  Any that are not already pending wakeup must not
-	 * be interested in our notifications (else we'd have set their wakeup
-	 * flags above).  Check to see if we can directly advance their queue
-	 * pointers to save a wakeup.  Otherwise, if they are far behind, wake
-	 * them anyway so they will catch up.
-	 */
-	for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
-	{
-		int32		pid;
+		int32		pid = QUEUE_BACKEND_PID(i);
 		QueuePosition pos;
 
-		if (QUEUE_BACKEND_WAKEUP_PENDING(i))
-			continue;
-
-		/* If it's currently advancing, we should not touch it */
-		if (QUEUE_BACKEND_IS_ADVANCING(i))
-			continue;
-
-		pid = QUEUE_BACKEND_PID(i);
+		Assert(pid != InvalidPid);
 		pos = QUEUE_BACKEND_POS(i);
-
-		/*
-		 * We can directly advance the other backend's queue pointer if it's
-		 * not currently advancing (else there are race conditions), and its
-		 * current pointer is not behind queueHeadBeforeWrite (else we'd make
-		 * it miss some older messages), and we'd not be moving the pointer
-		 * backward.
-		 */
-		if (!QUEUE_POS_PRECEDES(pos, queueHeadBeforeWrite) &&
-			QUEUE_POS_PRECEDES(pos, queueHeadAfterWrite))
+		if (QUEUE_BACKEND_DBOID(i) == MyDatabaseId)
 		{
-			/* We can directly advance its pointer past what we wrote */
-			QUEUE_BACKEND_POS(i) = queueHeadAfterWrite;
+			/*
+			 * Always signal listeners in our own database, unless they're
+			 * already caught up (unlikely, but possible).
+			 */
+			if (QUEUE_POS_EQUAL(pos, QUEUE_HEAD))
+				continue;
 		}
-		else if (asyncQueuePageDiff(QUEUE_POS_PAGE(QUEUE_HEAD),
-									QUEUE_POS_PAGE(pos)) >= QUEUE_CLEANUP_DELAY)
+		else
 		{
-			/* It's idle and far behind, so wake it up */
-			Assert(pid != InvalidPid);
-
-			QUEUE_BACKEND_WAKEUP_PENDING(i) = true;
-			signalPids[count] = pid;
-			signalProcnos[count] = i;
-			count++;
+			/*
+			 * Listeners in other databases should be signaled only if they
+			 * are far behind.
+			 */
+			if (asyncQueuePageDiff(QUEUE_POS_PAGE(QUEUE_HEAD),
+								   QUEUE_POS_PAGE(pos)) < QUEUE_CLEANUP_DELAY)
+				continue;
 		}
+		/* OK, need to signal this one */
+		pids[count] = pid;
+		ids[count] = i;
+		count++;
 	}
-
 	LWLockRelease(NotifyQueueLock);
 
 	/* Now send signals */
 	for (int i = 0; i < count; i++)
 	{
-		int32		pid = signalPids[i];
+		int32		pid = pids[i];
 
 		/*
 		 * If we are signaling our own process, no need to involve the kernel;
@@ -2402,9 +1700,12 @@ SignalBackends(void)
 		 * NotifyQueueLock; which is unlikely but certainly possible. So we
 		 * just log a low-level debug message if it happens.
 		 */
-		if (SendProcSignal(pid, PROCSIG_NOTIFY_INTERRUPT, signalProcnos[i]) < 0)
+		if (SendProcSignal(pid, PROCSIG_NOTIFY_INTERRUPT, ids[i]) < 0)
 			elog(DEBUG3, "could not signal backend with PID %d: %m", pid);
 	}
+
+	pfree(pids);
+	pfree(ids);
 }
 
 /*
@@ -2412,18 +1713,18 @@ SignalBackends(void)
  *
  *	This is called at transaction abort.
  *
- *	Revert any staged listen/unlisten changes and clean up transaction state.
- *	This only does anything if we abort after PreCommit_Notify has staged
- *	some entries.
+ *	Gets rid of pending actions and outbound notifies that we would have
+ *	executed if the transaction got committed.
  */
 void
 AtAbort_Notify(void)
 {
-	/* Revert staged listen/unlisten changes */
-	ApplyPendingListenActions(false);
-
-	/* If we're no longer listening on anything, unregister */
-	if (amRegisteredListener && LocalChannelTableIsEmpty())
+	/*
+	 * If we LISTEN but then roll back the transaction after PreCommit_Notify,
+	 * we have registered as a listener but have not made any entry in
+	 * listenChannels.  In that case, deregister again.
+	 */
+	if (amRegisteredListener && listenChannels == NIL)
 		asyncQueueUnregister();
 
 	/* And clean up */
@@ -2559,7 +1860,8 @@ HandleNotifyInterrupt(void)
 	/* signal that work needs to be done */
 	notifyInterruptPending = true;
 
-	/* latch will be set by procsignal_sigusr1_handler */
+	/* make sure the event is processed in due course */
+	SetLatch(MyLatch);
 }
 
 /*
@@ -2601,26 +1903,19 @@ asyncQueueReadAllNotifications(void)
 	QueuePosition head;
 	Snapshot	snapshot;
 
-	/*
-	 * Fetch current state, indicate to others that we have woken up, and that
-	 * we are in process of advancing our position.
-	 */
+	/* Fetch current state */
 	LWLockAcquire(NotifyQueueLock, LW_SHARED);
 	/* Assert checks that we have a valid state entry */
-	Assert(MyProcPid == QUEUE_BACKEND_PID(MyProcNumber));
-	QUEUE_BACKEND_WAKEUP_PENDING(MyProcNumber) = false;
-	pos = QUEUE_BACKEND_POS(MyProcNumber);
+	Assert(MyProcPid == QUEUE_BACKEND_PID(MyBackendId));
+	pos = QUEUE_BACKEND_POS(MyBackendId);
 	head = QUEUE_HEAD;
+	LWLockRelease(NotifyQueueLock);
 
 	if (QUEUE_POS_EQUAL(pos, head))
 	{
 		/* Nothing to do, we have read all notifications already. */
-		LWLockRelease(NotifyQueueLock);
 		return;
 	}
-
-	QUEUE_BACKEND_IS_ADVANCING(MyProcNumber) = true;
-	LWLockRelease(NotifyQueueLock);
 
 	/*----------
 	 * Get snapshot we'll use to decide which xacts are still in progress.
@@ -2656,7 +1951,7 @@ asyncQueueReadAllNotifications(void)
 	 *
 	 * What we do guarantee is that we'll see all notifications from
 	 * transactions committing after the snapshot we take here.
-	 * BecomeRegisteredListener has already added us to the listener array,
+	 * Exec_ListenPreCommit has already added us to the listener array,
 	 * so no not-yet-committed messages can be removed from the queue
 	 * before we see them.
 	 *----------
@@ -2708,8 +2003,7 @@ asyncQueueReadAllNotifications(void)
 
 		/* Update shared state */
 		LWLockAcquire(NotifyQueueLock, LW_SHARED);
-		QUEUE_BACKEND_POS(MyProcNumber) = pos;
-		QUEUE_BACKEND_IS_ADVANCING(MyProcNumber) = false;
+		QUEUE_BACKEND_POS(MyBackendId) = pos;
 		LWLockRelease(NotifyQueueLock);
 
 		ExitOnAnyError = save_ExitOnAnyError;
@@ -2742,12 +2036,17 @@ asyncQueueProcessPageEntries(QueuePosition *current,
 	/*
 	 * We copy the entries into a local buffer to avoid holding the SLRU lock
 	 * while we transmit them to our frontend.  The local buffer must be
-	 * adequately aligned.
+	 * adequately aligned, so use a union.
 	 */
-	alignas(AsyncQueueEntry) char local_buf[QUEUE_PAGESIZE];
-	char	   *local_buf_end = local_buf;
+	union
+	{
+		char		buf[QUEUE_PAGESIZE];
+		AsyncQueueEntry align;
+	}			local_buf;
+	char	   *local_buf_end = local_buf.buf;
 
-	slotno = SimpleLruReadPage_ReadOnly(NotifyCtl, curpage, current);
+	slotno = SimpleLruReadPage_ReadOnly(NotifyCtl, curpage,
+										InvalidTransactionId);
 	page_buffer = NotifyCtl->shared->page_buffer[slotno];
 
 	do
@@ -2803,11 +2102,9 @@ asyncQueueProcessPageEntries(QueuePosition *current,
 			 * that if there's a bad entry in the queue for which
 			 * TransactionIdDidCommit() fails for some reason, we can skip
 			 * over it on the first LISTEN in a session, and not get stuck on
-			 * it indefinitely.  (This is a little trickier than it looks: it
-			 * works because BecomeRegisteredListener runs this code before we
-			 * have made the first entry in localChannelTable.)
+			 * it indefinitely.
 			 */
-			if (LocalChannelTableIsEmpty())
+			if (listenChannels == NIL)
 				continue;
 
 			if (TransactionIdDidCommit(qe->xid))
@@ -2828,14 +2125,14 @@ asyncQueueProcessPageEntries(QueuePosition *current,
 	} while (!reachedEndOfPage);
 
 	/* Release lock that we got from SimpleLruReadPage_ReadOnly() */
-	LWLockRelease(SimpleLruGetBankLock(NotifyCtl, curpage));
+	LWLockRelease(NotifySLRULock);
 
 	/*
 	 * Now that we have let go of the SLRU bank lock, send the notifications
 	 * to our backend
 	 */
-	Assert(local_buf_end - local_buf <= BLCKSZ);
-	for (char *p = local_buf; p < local_buf_end;)
+	Assert(local_buf_end - local_buf.buf <= BLCKSZ);
+	for (char *p = local_buf.buf; p < local_buf_end;)
 	{
 		AsyncQueueEntry *qe = (AsyncQueueEntry *) p;
 
@@ -2870,9 +2167,9 @@ static void
 asyncQueueAdvanceTail(void)
 {
 	QueuePosition min;
-	int64		oldtailpage;
-	int64		newtailpage;
-	int64		boundary;
+	int			oldtailpage;
+	int			newtailpage;
+	int			boundary;
 
 	/* Restrict task to one backend per cluster; see SimpleLruTruncate(). */
 	LWLockAcquire(NotifyQueueTailLock, LW_EXCLUSIVE);
@@ -2896,7 +2193,7 @@ asyncQueueAdvanceTail(void)
 	 */
 	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
 	min = QUEUE_HEAD;
-	for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
+	for (BackendId i = QUEUE_FIRST_LISTENER; i > 0; i = QUEUE_NEXT_LISTENER(i))
 	{
 		Assert(QUEUE_BACKEND_PID(i) != InvalidPid);
 		min = QUEUE_POS_MIN(min, QUEUE_BACKEND_POS(i));
@@ -2917,11 +2214,16 @@ asyncQueueAdvanceTail(void)
 	if (asyncQueuePagePrecedes(oldtailpage, boundary))
 	{
 		/*
-		 * SimpleLruTruncate() will ask for SLRU bank locks but will also
+		 * SimpleLruTruncate() will ask for NotifySLRULock but will also
 		 * release the lock again.
 		 */
 		SimpleLruTruncate(NotifyCtl, newtailpage);
 
+		/*
+		 * Update QUEUE_STOP_PAGE.  This changes asyncQueueIsFull()'s verdict
+		 * for the segment immediately prior to the old tail, allowing fresh
+		 * data into that segment.
+		 */
 		LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
 		QUEUE_STOP_PAGE = newtailpage;
 		LWLockRelease(NotifyQueueLock);
@@ -2960,8 +2262,8 @@ AsyncNotifyFreezeXids(TransactionId newFrozenXid)
 
 	/*
 	 * Acquire locks in the correct order to avoid deadlocks. As per the
-	 * locking protocol: NotifyQueueTailLock, then NotifyQueueLock, then SLRU
-	 * bank locks.
+	 * locking protocol: NotifyQueueTailLock, then NotifyQueueLock, then
+	 * NotifySLRULock.
 	 *
 	 * We only need SHARED mode since we're just reading the head/tail
 	 * positions, not modifying them.
@@ -2990,8 +2292,6 @@ AsyncNotifyFreezeXids(TransactionId newFrozenXid)
 		/* If we need a different page, release old lock and get new one */
 		if (pageno != curpage)
 		{
-			LWLock	   *lock;
-
 			/* Release previous page if any */
 			if (slotno >= 0)
 			{
@@ -3000,12 +2300,12 @@ AsyncNotifyFreezeXids(TransactionId newFrozenXid)
 					NotifyCtl->shared->page_dirty[slotno] = true;
 					page_dirty = false;
 				}
-				LWLockRelease(SimpleLruGetBankLock(NotifyCtl, curpage));
+				LWLockRelease(NotifySLRULock);
 			}
 
-			lock = SimpleLruGetBankLock(NotifyCtl, pageno);
-			LWLockAcquire(lock, LW_EXCLUSIVE);
-			slotno = SimpleLruReadPage(NotifyCtl, pageno, true, &pos);
+			LWLockAcquire(NotifySLRULock, LW_EXCLUSIVE);
+			slotno = SimpleLruReadPage(NotifyCtl, pageno, true,
+									   InvalidTransactionId);
 			page_buffer = NotifyCtl->shared->page_buffer[slotno];
 			curpage = pageno;
 		}
@@ -3037,7 +2337,7 @@ AsyncNotifyFreezeXids(TransactionId newFrozenXid)
 	{
 		if (page_dirty)
 			NotifyCtl->shared->page_dirty[slotno] = true;
-		LWLockRelease(SimpleLruGetBankLock(NotifyCtl, curpage));
+		LWLockRelease(NotifySLRULock);
 	}
 
 	LWLockRelease(NotifyQueueTailLock);
@@ -3057,11 +2357,13 @@ AsyncNotifyFreezeXids(TransactionId newFrozenXid)
 static void
 ProcessIncomingNotify(bool flush)
 {
+	MemoryContext oldcontext;
+
 	/* We *must* reset the flag */
 	notifyInterruptPending = false;
 
 	/* Do nothing else if we aren't actively listening */
-	if (LocalChannelTableIsEmpty())
+	if (listenChannels == NIL)
 		return;
 
 	if (Trace_notify)
@@ -3071,13 +2373,20 @@ ProcessIncomingNotify(bool flush)
 
 	/*
 	 * We must run asyncQueueReadAllNotifications inside a transaction, else
-	 * bad things happen if it gets an error.
+	 * bad things happen if it gets an error.  However, we need to preserve
+	 * the caller's memory context (typically MessageContext).
 	 */
+	oldcontext = CurrentMemoryContext;
+
 	StartTransactionCommand();
 
 	asyncQueueReadAllNotifications();
 
 	CommitTransactionCommand();
+
+	/* Caller's context had better not have been transaction-local */
+	Assert(MemoryContextIsValid(oldcontext));
+	MemoryContextSwitchTo(oldcontext);
 
 	/*
 	 * If this isn't an end-of-command case, we must flush the notify messages
@@ -3102,7 +2411,7 @@ NotifyMyFrontEnd(const char *channel, const char *payload, int32 srcPid)
 	{
 		StringInfoData buf;
 
-		pq_beginmessage(&buf, PqMsg_NotificationResponse);
+		pq_beginmessage(&buf, 'A');
 		pq_sendint32(&buf, srcPid);
 		pq_sendstring(&buf, channel);
 		pq_sendstring(&buf, payload);
@@ -3165,7 +2474,7 @@ AddEventToPendingNotifies(Notification *n)
 {
 	Assert(pendingNotifies->events != NIL);
 
-	/* Create the hash tables if it's time to */
+	/* Create the hash table if it's time to */
 	if (list_length(pendingNotifies->events) >= MIN_HASHABLE_NOTIFIES &&
 		pendingNotifies->hashtab == NULL)
 	{
@@ -3174,7 +2483,7 @@ AddEventToPendingNotifies(Notification *n)
 
 		/* Create the hash table */
 		hash_ctl.keysize = sizeof(Notification *);
-		hash_ctl.entrysize = sizeof(struct NotificationHash);
+		hash_ctl.entrysize = sizeof(NotificationHash);
 		hash_ctl.hash = notification_hash;
 		hash_ctl.match = notification_match;
 		hash_ctl.hcxt = CurTransactionContext;
@@ -3184,58 +2493,37 @@ AddEventToPendingNotifies(Notification *n)
 						&hash_ctl,
 						HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
-		/* Create the unique channel name table */
-		Assert(pendingNotifies->uniqueChannelHash == NULL);
-		hash_ctl.keysize = NAMEDATALEN;
-		hash_ctl.entrysize = sizeof(ChannelName);
-		hash_ctl.hcxt = CurTransactionContext;
-		pendingNotifies->uniqueChannelHash =
-			hash_create("Pending Notify Channel Names",
-						64L,
-						&hash_ctl,
-						HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-
 		/* Insert all the already-existing events */
 		foreach(l, pendingNotifies->events)
 		{
 			Notification *oldn = (Notification *) lfirst(l);
-			char	   *channel = oldn->data;
+			NotificationHash *hentry;
 			bool		found;
 
-			(void) hash_search(pendingNotifies->hashtab,
-							   &oldn,
-							   HASH_ENTER,
-							   &found);
+			hentry = (NotificationHash *) hash_search(pendingNotifies->hashtab,
+													  &oldn,
+													  HASH_ENTER,
+													  &found);
 			Assert(!found);
-
-			/* Add channel name to uniqueChannelHash; might be there already */
-			(void) hash_search(pendingNotifies->uniqueChannelHash,
-							   channel,
-							   HASH_ENTER,
-							   NULL);
+			hentry->event = oldn;
 		}
 	}
 
 	/* Add new event to the list, in order */
 	pendingNotifies->events = lappend(pendingNotifies->events, n);
 
-	/* Add event to the hash tables if needed */
+	/* Add event to the hash table if needed */
 	if (pendingNotifies->hashtab != NULL)
 	{
-		char	   *channel = n->data;
+		NotificationHash *hentry;
 		bool		found;
 
-		(void) hash_search(pendingNotifies->hashtab,
-						   &n,
-						   HASH_ENTER,
-						   &found);
+		hentry = (NotificationHash *) hash_search(pendingNotifies->hashtab,
+												  &n,
+												  HASH_ENTER,
+												  &found);
 		Assert(!found);
-
-		/* Add channel name to uniqueChannelHash; might be there already */
-		(void) hash_search(pendingNotifies->uniqueChannelHash,
-						   channel,
-						   HASH_ENTER,
-						   NULL);
+		hentry->event = n;
 	}
 }
 
@@ -3285,15 +2573,4 @@ ClearPendingActionsAndNotifies(void)
 	 */
 	pendingActions = NULL;
 	pendingNotifies = NULL;
-	/* Also clear pendingListenActions, which is derived from pendingActions */
-	pendingListenActions = NULL;
-}
-
-/*
- * GUC check_hook for notify_buffers
- */
-bool
-check_notify_buffers(int *newval, void **extra, GucSource source)
-{
-	return check_slru_buffers("notify_buffers", newval);
 }

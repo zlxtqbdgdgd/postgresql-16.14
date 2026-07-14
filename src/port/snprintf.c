@@ -2,7 +2,7 @@
  * Copyright (c) 1983, 1995, 1996 Eric P. Allman
  * Copyright (c) 1988, 1993
  *	The Regents of the University of California.  All rights reserved.
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -199,7 +199,7 @@ pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args)
 }
 
 int
-pg_snprintf(char *str, size_t count, const char *fmt, ...)
+pg_snprintf(char *str, size_t count, const char *fmt,...)
 {
 	int			len;
 	va_list		args;
@@ -227,7 +227,7 @@ pg_vsprintf(char *str, const char *fmt, va_list args)
 }
 
 int
-pg_sprintf(char *str, const char *fmt, ...)
+pg_sprintf(char *str, const char *fmt,...)
 {
 	int			len;
 	va_list		args;
@@ -261,7 +261,7 @@ pg_vfprintf(FILE *stream, const char *fmt, va_list args)
 }
 
 int
-pg_fprintf(FILE *stream, const char *fmt, ...)
+pg_fprintf(FILE *stream, const char *fmt,...)
 {
 	int			len;
 	va_list		args;
@@ -279,7 +279,7 @@ pg_vprintf(const char *fmt, va_list args)
 }
 
 int
-pg_printf(const char *fmt, ...)
+pg_printf(const char *fmt,...)
 {
 	int			len;
 	va_list		args;
@@ -462,7 +462,7 @@ nextch2:
 				/* set zero padding if no nonzero digits yet */
 				if (accum == 0 && !pointflag)
 					zpad = '0';
-				pg_fallthrough;
+				/* FALL THRU */
 			case '1':
 			case '2':
 			case '3':
@@ -563,22 +563,17 @@ nextch2:
 				else
 					longflag = 1;
 				goto nextch2;
-			case 'j':
-#if SIZEOF_INTMAX_T == SIZEOF_LONG
-				longflag = 1;
-#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
-				longlongflag = 1;
-#else
-#error "cannot find integer type of the same size as intmax_t"
-#endif
-				goto nextch2;
 			case 'z':
-#if SIZEOF_SIZE_T == SIZEOF_LONG
+#if SIZEOF_SIZE_T == 8
+#ifdef HAVE_LONG_INT_64
 				longflag = 1;
-#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+#elif defined(HAVE_LONG_LONG_INT_64)
 				longlongflag = 1;
 #else
-#error "cannot find integer type of the same size as size_t"
+#error "Don't know how to print 64bit integers"
+#endif
+#else
+				/* assume size_t is same size as int */
 #endif
 				goto nextch2;
 			case 'h':
@@ -835,22 +830,17 @@ nextch1:
 				else
 					longflag = 1;
 				goto nextch1;
-			case 'j':
-#if SIZEOF_INTMAX_T == SIZEOF_LONG
-				longflag = 1;
-#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
-				longlongflag = 1;
-#else
-#error "cannot find integer type of the same size as intmax_t"
-#endif
-				goto nextch1;
 			case 'z':
-#if SIZEOF_SIZE_T == SIZEOF_LONG
+#if SIZEOF_SIZE_T == 8
+#ifdef HAVE_LONG_INT_64
 				longflag = 1;
-#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+#elif defined(HAVE_LONG_LONG_INT_64)
 				longlongflag = 1;
 #else
-#error "cannot find integer type of the same size as size_t"
+#error "Don't know how to print 64bit integers"
+#endif
+#else
+				/* assume size_t is same size as int */
 #endif
 				goto nextch1;
 			case 'h':
@@ -1223,6 +1213,22 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 		}
 		if (vallen < 0)
 			goto fail;
+
+		/*
+		 * Windows, alone among our supported platforms, likes to emit
+		 * three-digit exponent fields even when two digits would do.  Hack
+		 * such results to look like the way everyone else does it.
+		 */
+#ifdef WIN32
+		if (vallen >= 6 &&
+			convert[vallen - 5] == 'e' &&
+			convert[vallen - 3] == '0')
+		{
+			convert[vallen - 3] = convert[vallen - 2];
+			convert[vallen - 2] = convert[vallen - 1];
+			vallen--;
+		}
+#endif
 	}
 
 	padlen = compute_padlen(minlen, vallen + zeropadlen, leftjust);
@@ -1338,6 +1344,17 @@ pg_strfromd(char *str, size_t count, int precision, double value)
 				target.failed = true;
 				goto fail;
 			}
+
+#ifdef WIN32
+			if (vallen >= 6 &&
+				convert[vallen - 5] == 'e' &&
+				convert[vallen - 3] == '0')
+			{
+				convert[vallen - 3] = convert[vallen - 2];
+				convert[vallen - 2] = convert[vallen - 1];
+				vallen--;
+			}
+#endif
 		}
 	}
 

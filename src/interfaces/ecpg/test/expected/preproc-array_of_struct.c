@@ -50,14 +50,7 @@ typedef  struct ind {
 #line 21 "array_of_struct.pgc"
 
 
-typedef  struct { 
-#line 26 "array_of_struct.pgc"
- customer customers [ 10 ] ;
- } company ;
-#line 27 "array_of_struct.pgc"
-
-
-int main(void)
+int main()
 {
     /* exec sql begin declare section */
         
@@ -67,14 +60,14 @@ int main(void)
          
              
        typedef struct { 
-#line 36 "array_of_struct.pgc"
+#line 30 "array_of_struct.pgc"
   struct varchar_2  { int len; char arr[ 50 ]; }  name ;
  
-#line 37 "array_of_struct.pgc"
+#line 31 "array_of_struct.pgc"
  int phone ;
  }  customer2 ;
 
-#line 38 "array_of_struct.pgc"
+#line 32 "array_of_struct.pgc"
 
         
        
@@ -87,134 +80,106 @@ int main(void)
          
              
        
-
-       
-
        
        
     
-#line 32 "array_of_struct.pgc"
+#line 26 "array_of_struct.pgc"
  customer custs1 [ 10 ] ;
  
-#line 33 "array_of_struct.pgc"
+#line 27 "array_of_struct.pgc"
  cust_ind inds [ 10 ] ;
  
-#line 39 "array_of_struct.pgc"
+#line 33 "array_of_struct.pgc"
  customer2 custs2 [ 10 ] ;
  
-#line 44 "array_of_struct.pgc"
+#line 38 "array_of_struct.pgc"
  struct customer3 { 
-#line 42 "array_of_struct.pgc"
+#line 36 "array_of_struct.pgc"
   struct varchar_3  { int len; char arr[ 50 ]; }  name ;
  
-#line 43 "array_of_struct.pgc"
+#line 37 "array_of_struct.pgc"
  int phone ;
  } custs3 [ 10 ] ;
  
-#line 49 "array_of_struct.pgc"
+#line 43 "array_of_struct.pgc"
  struct customer4 { 
-#line 47 "array_of_struct.pgc"
+#line 41 "array_of_struct.pgc"
   struct varchar_4  { int len; char arr[ 50 ]; }  name ;
  
-#line 48 "array_of_struct.pgc"
+#line 42 "array_of_struct.pgc"
  int phone ;
  } custs4 ;
  
-#line 51 "array_of_struct.pgc"
- company acme ;
- 
-#line 53 "array_of_struct.pgc"
+#line 44 "array_of_struct.pgc"
  int r ;
  
-#line 54 "array_of_struct.pgc"
+#line 45 "array_of_struct.pgc"
   struct varchar_5  { int len; char arr[ 50 ]; }  onlyname [ 2 ] ;
 /* exec sql end declare section */
-#line 55 "array_of_struct.pgc"
+#line 46 "array_of_struct.pgc"
 
 
     ECPGdebug(1, stderr);
 
     { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
-#line 59 "array_of_struct.pgc"
+#line 50 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 59 "array_of_struct.pgc"
+#line 50 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 59 "array_of_struct.pgc"
+#line 50 "array_of_struct.pgc"
 
 
     { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "create table customers ( c varchar ( 50 ) , p int )", ECPGt_EOIT, ECPGt_EORT);
-#line 61 "array_of_struct.pgc"
+#line 52 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 61 "array_of_struct.pgc"
+#line 52 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 61 "array_of_struct.pgc"
+#line 52 "array_of_struct.pgc"
 
-
-    /* First we'll insert some data using C variable references */
-    strcpy(custs1[0].name.arr, "John Doe");
-    custs1[0].name.len = strlen(custs1[0].name.arr);
-    custs1[0].phone = 12345;
-
-    strcpy(acme.customers[1].name.arr, "Jane Doe");
-    acme.customers[1].name.len = strlen(acme.customers[1].name.arr);
-    acme.customers[1].phone = 67890;
-
-    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "insert into customers values ( $1  , $2  )", 
-	ECPGt_varchar,&(custs1->name),(long)50,(long)1,sizeof(struct varchar_1), 
-	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
-	ECPGt_int,&(custs1[0].phone),(long)1,(long)1,sizeof(int), 
-	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EOIT, ECPGt_EORT);
-#line 73 "array_of_struct.pgc"
+    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "insert into customers values ( 'John Doe' , '12345' )", ECPGt_EOIT, ECPGt_EORT);
+#line 53 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 73 "array_of_struct.pgc"
+#line 53 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 73 "array_of_struct.pgc"
+#line 53 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 73 "array_of_struct.pgc"
+#line 53 "array_of_struct.pgc"
 
-    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "insert into customers values ( $1  , $2  )", 
-	ECPGt_varchar,&(acme.customers[1].name),(long)50,(long)1,sizeof(struct varchar_1), 
-	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
-	ECPGt_int,&(acme.customers[1].phone),(long)1,(long)1,sizeof(int), 
-	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EOIT, ECPGt_EORT);
-#line 75 "array_of_struct.pgc"
+    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "insert into customers values ( 'Jane Doe' , '67890' )", ECPGt_EOIT, ECPGt_EORT);
+#line 54 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 75 "array_of_struct.pgc"
+#line 54 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 75 "array_of_struct.pgc"
+#line 54 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 75 "array_of_struct.pgc"
+#line 54 "array_of_struct.pgc"
 
 
-    /* Clear the array, to be sure reading back into it actually gets data */
-    memset(custs1, 0, sizeof(customer) * 10);
-
-    /* Now read back the data */
     { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select * from customers limit 2", ECPGt_EOIT, 
 	ECPGt_varchar,&(custs1->name),(long)50,(long)10,sizeof( customer ), 
 	ECPGt_short,&(inds->name_ind),(long)1,(long)10,sizeof( struct ind ), 
 	ECPGt_int,&(custs1->phone),(long)1,(long)10,sizeof( customer ), 
 	ECPGt_short,&(inds->phone_ind),(long)1,(long)10,sizeof( struct ind ), ECPGt_EORT);
-#line 81 "array_of_struct.pgc"
+#line 56 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 81 "array_of_struct.pgc"
+#line 56 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 81 "array_of_struct.pgc"
+#line 56 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 81 "array_of_struct.pgc"
+#line 56 "array_of_struct.pgc"
 
     printf("custs1:\n");
     for (r = 0; r < 2; r++)
@@ -228,16 +193,16 @@ if (sqlca.sqlcode < 0) sqlprint();}
 	ECPGt_short,&(inds->name_ind),(long)1,(long)10,sizeof( struct ind ), 
 	ECPGt_int,&(custs2->phone),(long)1,(long)10,sizeof( customer2 ), 
 	ECPGt_short,&(inds->phone_ind),(long)1,(long)10,sizeof( struct ind ), ECPGt_EORT);
-#line 89 "array_of_struct.pgc"
+#line 64 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 89 "array_of_struct.pgc"
+#line 64 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 89 "array_of_struct.pgc"
+#line 64 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 89 "array_of_struct.pgc"
+#line 64 "array_of_struct.pgc"
 
     printf("\ncusts2:\n");
     for (r = 0; r < 2; r++)
@@ -251,16 +216,16 @@ if (sqlca.sqlcode < 0) sqlprint();}
 	ECPGt_short,&(inds->name_ind),(long)1,(long)10,sizeof( struct ind ), 
 	ECPGt_int,&(custs3->phone),(long)1,(long)10,sizeof( struct customer3 ), 
 	ECPGt_short,&(inds->phone_ind),(long)1,(long)10,sizeof( struct ind ), ECPGt_EORT);
-#line 97 "array_of_struct.pgc"
+#line 72 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 97 "array_of_struct.pgc"
+#line 72 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 97 "array_of_struct.pgc"
+#line 72 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 97 "array_of_struct.pgc"
+#line 72 "array_of_struct.pgc"
 
     printf("\ncusts3:\n");
     for (r = 0; r < 2; r++)
@@ -274,16 +239,16 @@ if (sqlca.sqlcode < 0) sqlprint();}
 	ECPGt_short,&(inds[0].name_ind),(long)1,(long)1,sizeof( struct ind ), 
 	ECPGt_int,&(custs4.phone),(long)1,(long)1,sizeof( struct customer4 ), 
 	ECPGt_short,&(inds[0].phone_ind),(long)1,(long)1,sizeof( struct ind ), ECPGt_EORT);
-#line 105 "array_of_struct.pgc"
+#line 80 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 105 "array_of_struct.pgc"
+#line 80 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 105 "array_of_struct.pgc"
+#line 80 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 105 "array_of_struct.pgc"
+#line 80 "array_of_struct.pgc"
 
     printf("\ncusts4:\n");
     printf( "name  - %s\n", custs4.name.arr );
@@ -292,16 +257,16 @@ if (sqlca.sqlcode < 0) sqlprint();}
     { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select c from customers limit 2", ECPGt_EOIT, 
 	ECPGt_varchar,(onlyname),(long)50,(long)2,sizeof(struct varchar_5), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
-#line 110 "array_of_struct.pgc"
+#line 85 "array_of_struct.pgc"
 
 if (sqlca.sqlcode == ECPG_NOT_FOUND) sqlprint();
-#line 110 "array_of_struct.pgc"
+#line 85 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 110 "array_of_struct.pgc"
+#line 85 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 110 "array_of_struct.pgc"
+#line 85 "array_of_struct.pgc"
 
     printf("\nname:\n");
     for (r = 0; r < 2; r++)
@@ -310,13 +275,13 @@ if (sqlca.sqlcode < 0) sqlprint();}
     }
 
     { ECPGdisconnect(__LINE__, "ALL");
-#line 117 "array_of_struct.pgc"
+#line 92 "array_of_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 117 "array_of_struct.pgc"
+#line 92 "array_of_struct.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 117 "array_of_struct.pgc"
+#line 92 "array_of_struct.pgc"
 
 
     return 0;

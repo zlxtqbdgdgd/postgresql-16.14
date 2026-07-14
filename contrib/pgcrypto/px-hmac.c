@@ -157,7 +157,7 @@ px_find_hmac(const char *name, PX_HMAC **res)
 		return PXE_HASH_UNUSABLE_FOR_HMAC;
 	}
 
-	h = palloc_object(PX_HMAC);
+	h = palloc(sizeof(*h));
 	h->p.ipad = palloc(bs);
 	h->p.opad = palloc(bs);
 	h->md = md;

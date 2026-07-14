@@ -1,17 +1,15 @@
 /*
  * contrib/btree_gist/btree_text.c
- *
- * Support for text and bpchar types.
  */
 #include "postgres.h"
 
 #include "btree_gist.h"
 #include "btree_utils_var.h"
-#include "mb/pg_wchar.h"
-#include "utils/fmgrprotos.h"
-#include "utils/sortsupport.h"
+#include "utils/builtins.h"
 
-/* GiST support functions */
+/*
+** Text ops
+*/
 PG_FUNCTION_INFO_V1(gbt_text_compress);
 PG_FUNCTION_INFO_V1(gbt_bpchar_compress);
 PG_FUNCTION_INFO_V1(gbt_text_union);
@@ -20,8 +18,6 @@ PG_FUNCTION_INFO_V1(gbt_text_consistent);
 PG_FUNCTION_INFO_V1(gbt_bpchar_consistent);
 PG_FUNCTION_INFO_V1(gbt_text_penalty);
 PG_FUNCTION_INFO_V1(gbt_text_same);
-PG_FUNCTION_INFO_V1(gbt_text_sortsupport);
-PG_FUNCTION_INFO_V1(gbt_bpchar_sortsupport);
 
 
 /* define for comparison */
@@ -80,16 +76,11 @@ gbt_textcmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 												 PointerGetDatum(b)));
 }
 
-/*
- * Originally this module permitted truncation of internal keys, but that
- * tends to result in wrong comparison answers if the collation is any
- * more complicated than C.  The prefix-match hack used for simpler types
- * can't fix it, either.
- */
-static const gbtree_vinfo tinfo =
+static gbtree_vinfo tinfo =
 {
 	gbt_t_text,
-	false,						/* no truncation permitted */
+	0,
+	false,
 	gbt_textgt,
 	gbt_textge,
 	gbt_texteq,
@@ -155,10 +146,11 @@ gbt_bpcharcmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 												 PointerGetDatum(b)));
 }
 
-static const gbtree_vinfo bptinfo =
+static gbtree_vinfo bptinfo =
 {
 	gbt_t_bpchar,
-	false,						/* as above, no truncation permitted */
+	0,
+	false,
 	gbt_bpchargt,
 	gbt_bpcharge,
 	gbt_bpchareq,
@@ -170,13 +162,19 @@ static const gbtree_vinfo bptinfo =
 
 
 /**************************************************
- * GiST support functions
+ * Text ops
  **************************************************/
+
 
 Datum
 gbt_text_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
+
+	if (tinfo.eml == 0)
+	{
+		tinfo.eml = pg_database_encoding_max_length();
+	}
 
 	PG_RETURN_POINTER(gbt_var_compress(entry, &tinfo));
 }
@@ -188,15 +186,16 @@ gbt_bpchar_compress(PG_FUNCTION_ARGS)
 	return gbt_text_compress(fcinfo);
 }
 
+
+
 Datum
 gbt_text_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	void	   *query = DatumGetTextP(PG_GETARG_DATUM(1));
+	void	   *query = (void *) DatumGetTextP(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-#ifdef NOT_USED
-	Oid			subtype = PG_GETARG_OID(3);
-#endif
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
 	GBT_VARKEY *key = (GBT_VARKEY *) DatumGetPointer(entry->key);
@@ -204,6 +203,11 @@ gbt_text_consistent(PG_FUNCTION_ARGS)
 
 	/* All cases served by this function are exact */
 	*recheck = false;
+
+	if (tinfo.eml == 0)
+	{
+		tinfo.eml = pg_database_encoding_max_length();
+	}
 
 	retval = gbt_var_consistent(&r, query, strategy, PG_GET_COLLATION(),
 								GIST_LEAF(entry), &tinfo, fcinfo->flinfo);
@@ -211,15 +215,15 @@ gbt_text_consistent(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(retval);
 }
 
+
 Datum
 gbt_bpchar_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	void	   *query = DatumGetTextP(PG_GETARG_DATUM(1));
+	void	   *query = (void *) DatumGetTextP(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-#ifdef NOT_USED
-	Oid			subtype = PG_GETARG_OID(3);
-#endif
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
 	GBT_VARKEY *key = (GBT_VARKEY *) DatumGetPointer(entry->key);
@@ -228,10 +232,16 @@ gbt_bpchar_consistent(PG_FUNCTION_ARGS)
 	/* All cases served by this function are exact */
 	*recheck = false;
 
+	if (bptinfo.eml == 0)
+	{
+		bptinfo.eml = pg_database_encoding_max_length();
+	}
+
 	retval = gbt_var_consistent(&r, query, strategy, PG_GET_COLLATION(),
 								GIST_LEAF(entry), &bptinfo, fcinfo->flinfo);
 	PG_RETURN_BOOL(retval);
 }
+
 
 Datum
 gbt_text_union(PG_FUNCTION_ARGS)
@@ -242,6 +252,7 @@ gbt_text_union(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(gbt_var_union(entryvec, size, PG_GET_COLLATION(),
 									&tinfo, fcinfo->flinfo));
 }
+
 
 Datum
 gbt_text_picksplit(PG_FUNCTION_ARGS)
@@ -265,6 +276,7 @@ gbt_text_same(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
+
 Datum
 gbt_text_penalty(PG_FUNCTION_ARGS)
 {
@@ -274,70 +286,4 @@ gbt_text_penalty(PG_FUNCTION_ARGS)
 
 	PG_RETURN_POINTER(gbt_var_penalty(result, o, n, PG_GET_COLLATION(),
 									  &tinfo, fcinfo->flinfo));
-}
-
-static int
-gbt_text_ssup_cmp(Datum x, Datum y, SortSupport ssup)
-{
-	GBT_VARKEY *key1 = PG_DETOAST_DATUM(x);
-	GBT_VARKEY *key2 = PG_DETOAST_DATUM(y);
-
-	GBT_VARKEY_R arg1 = gbt_var_key_readable(key1);
-	GBT_VARKEY_R arg2 = gbt_var_key_readable(key2);
-	Datum		result;
-
-	/* for leaf items we expect lower == upper, so only compare lower */
-	result = DirectFunctionCall2Coll(bttextcmp,
-									 ssup->ssup_collation,
-									 PointerGetDatum(arg1.lower),
-									 PointerGetDatum(arg2.lower));
-
-	GBT_FREE_IF_COPY(key1, x);
-	GBT_FREE_IF_COPY(key2, y);
-
-	return DatumGetInt32(result);
-}
-
-Datum
-gbt_text_sortsupport(PG_FUNCTION_ARGS)
-{
-	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
-
-	ssup->comparator = gbt_text_ssup_cmp;
-	ssup->ssup_extra = NULL;
-
-	PG_RETURN_VOID();
-}
-
-static int
-gbt_bpchar_ssup_cmp(Datum x, Datum y, SortSupport ssup)
-{
-	GBT_VARKEY *key1 = PG_DETOAST_DATUM(x);
-	GBT_VARKEY *key2 = PG_DETOAST_DATUM(y);
-
-	GBT_VARKEY_R arg1 = gbt_var_key_readable(key1);
-	GBT_VARKEY_R arg2 = gbt_var_key_readable(key2);
-	Datum		result;
-
-	/* for leaf items we expect lower == upper, so only compare lower */
-	result = DirectFunctionCall2Coll(bpcharcmp,
-									 ssup->ssup_collation,
-									 PointerGetDatum(arg1.lower),
-									 PointerGetDatum(arg2.lower));
-
-	GBT_FREE_IF_COPY(key1, x);
-	GBT_FREE_IF_COPY(key2, y);
-
-	return DatumGetInt32(result);
-}
-
-Datum
-gbt_bpchar_sortsupport(PG_FUNCTION_ARGS)
-{
-	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
-
-	ssup->comparator = gbt_bpchar_ssup_cmp;
-	ssup->ssup_extra = NULL;
-
-	PG_RETURN_VOID();
 }

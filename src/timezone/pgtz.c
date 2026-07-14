@@ -3,7 +3,7 @@
  * pgtz.c
  *	  Timezone Library Integration Functions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/timezone/pgtz.c
@@ -219,6 +219,16 @@ init_timezone_hashtable(void)
 /*
  * Load a timezone from file or from cache.
  * Does not verify that the timezone is acceptable!
+ *
+ * "GMT" is always interpreted as the tzparse() definition, without attempting
+ * to load a definition from the filesystem.  This has a number of benefits:
+ * 1. It's guaranteed to succeed, so we don't have the failure mode wherein
+ * the bootstrap default timezone setting doesn't work (as could happen if
+ * the OS attempts to supply a leap-second-aware version of "GMT").
+ * 2. Because we aren't accessing the filesystem, we can safely initialize
+ * the "GMT" zone definition before my_exec_path is known.
+ * 3. It's quick enough that we don't waste much time when the bootstrap
+ * default timezone setting is later overridden from postgresql.conf.
  */
 pg_tz *
 pg_tzset(const char *tzname)
@@ -239,8 +249,8 @@ pg_tzset(const char *tzname)
 	/*
 	 * Upcase the given name to perform a case-insensitive hashtable search.
 	 * (We could alternatively downcase it, but we prefer upcase so that we
-	 * can get consistently upcased results from pg_tzload() in case the name
-	 * is a POSIX-style timezone spec.)
+	 * can get consistently upcased results from tzparse() in case the name is
+	 * a POSIX-style timezone spec.)
 	 */
 	p = uppername;
 	while (*tzname)
@@ -258,17 +268,27 @@ pg_tzset(const char *tzname)
 	}
 
 	/*
-	 * Let the IANA tzdb code interpret the time zone name.
+	 * "GMT" is always sent to tzparse(), as per discussion above.
 	 */
-	if (!pg_tzload(uppername, canonname, &tzstate))
+	if (strcmp(uppername, "GMT") == 0)
 	{
-		if (strcmp(uppername, "GMT") == 0)
+		if (!tzparse(uppername, &tzstate, true))
 		{
 			/* This really, really should not happen ... */
 			elog(ERROR, "could not initialize GMT time zone");
 		}
-		/* Unknown timezone. Fail our call instead of loading GMT! */
-		return NULL;
+		/* Use uppercase name as canonical */
+		strcpy(canonname, uppername);
+	}
+	else if (tzload(uppername, canonname, &tzstate, true) != 0)
+	{
+		if (uppername[0] == ':' || !tzparse(uppername, &tzstate, false))
+		{
+			/* Unknown timezone. Fail our call instead of loading GMT! */
+			return NULL;
+		}
+		/* For POSIX timezone specs, use uppercase name as canonical */
+		strcpy(canonname, uppername);
 	}
 
 	/* Save timezone in the cache */
@@ -344,8 +364,8 @@ pg_timezone_initialize(void)
 	 * We may not yet know where PGSHAREDIR is (in particular this is true in
 	 * an EXEC_BACKEND subprocess).  So use "GMT", which pg_tzset forces to be
 	 * interpreted without reference to the filesystem.  This corresponds to
-	 * the bootstrap default for these variables in guc_parameters.dat,
-	 * although in principle it could be different.
+	 * the bootstrap default for these variables in guc_tables.c, although in
+	 * principle it could be different.
 	 */
 	session_timezone = pg_tzset("GMT");
 	log_timezone = session_timezone;
@@ -376,7 +396,7 @@ struct pg_tzenum
 pg_tzenum *
 pg_tzenumerate_start(void)
 {
-	pg_tzenum  *ret = palloc0_object(pg_tzenum);
+	pg_tzenum  *ret = (pg_tzenum *) palloc0(sizeof(pg_tzenum));
 	char	   *startdir = pstrdup(pg_TZDIR());
 
 	ret->baselen = strlen(startdir) + 1;
@@ -447,12 +467,12 @@ pg_tzenumerate_next(pg_tzenum *dir)
 		}
 
 		/*
-		 * Load this timezone using pg_tzload() not pg_tzset(), so we don't
-		 * fill the cache.  Also, don't ask for the canonical spelling: we
-		 * already know it, and pg_open_tzfile's way of finding it out is
-		 * pretty inefficient.
+		 * Load this timezone using tzload() not pg_tzset(), so we don't fill
+		 * the cache.  Also, don't ask for the canonical spelling: we already
+		 * know it, and pg_open_tzfile's way of finding it out is pretty
+		 * inefficient.
 		 */
-		if (!pg_tzload(fullname + dir->baselen, NULL, &dir->tz.state))
+		if (tzload(fullname + dir->baselen, NULL, &dir->tz.state, true) != 0)
 		{
 			/* Zone could not be loaded, ignore it */
 			continue;

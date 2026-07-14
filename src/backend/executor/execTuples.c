@@ -46,7 +46,7 @@
  *		to avoid physically constructing projection tuples in many cases.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,7 +60,6 @@
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
-#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/nodeFuncs.h"
@@ -73,7 +72,7 @@
 static TupleDesc ExecTypeFromTLInternal(List *targetList,
 										bool skipjunk);
 static pg_attribute_always_inline void slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
-															  int reqnatts, bool support_cstring);
+															  int natts);
 static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   HeapTuple tuple,
 											   Buffer buffer,
@@ -150,22 +149,6 @@ tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 }
 
 /*
- * VirtualTupleTableSlots never have storage tuples.  We generally
- * shouldn't get here, but provide a user-friendly message if we do.
- */
-static bool
-tts_virtual_is_current_xact_tuple(TupleTableSlot *slot)
-{
-	Assert(!TTS_EMPTY(slot));
-
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("don't have transaction information for this type of tuple")));
-
-	return false;				/* silence compiler warnings */
-}
-
-/*
  * To materialize a virtual slot all the datums that aren't passed by value
  * have to be copied into the slot's memory context.  To do so, compute the
  * required size, and allocate enough memory to store all attributes.  That's
@@ -187,7 +170,7 @@ tts_virtual_materialize(TupleTableSlot *slot)
 	/* compute size of memory required */
 	for (int natt = 0; natt < desc->natts; natt++)
 	{
-		CompactAttribute *att = TupleDescCompactAttr(desc, natt);
+		Form_pg_attribute att = TupleDescAttr(desc, natt);
 		Datum		val;
 
 		if (att->attbyval || slot->tts_isnull[natt])
@@ -202,12 +185,12 @@ tts_virtual_materialize(TupleTableSlot *slot)
 			 * We want to flatten the expanded value so that the materialized
 			 * slot doesn't depend on it.
 			 */
-			sz = att_nominal_alignby(sz, att->attalignby);
+			sz = att_align_nominal(sz, att->attalign);
 			sz += EOH_get_flat_size(DatumGetEOHP(val));
 		}
 		else
 		{
-			sz = att_nominal_alignby(sz, att->attalignby);
+			sz = att_align_nominal(sz, att->attalign);
 			sz = att_addlength_datum(sz, att->attlen, val);
 		}
 	}
@@ -223,7 +206,7 @@ tts_virtual_materialize(TupleTableSlot *slot)
 	/* and copy all attributes into the pre-allocated space */
 	for (int natt = 0; natt < desc->natts; natt++)
 	{
-		CompactAttribute *att = TupleDescCompactAttr(desc, natt);
+		Form_pg_attribute att = TupleDescAttr(desc, natt);
 		Datum		val;
 
 		if (att->attbyval || slot->tts_isnull[natt])
@@ -242,8 +225,8 @@ tts_virtual_materialize(TupleTableSlot *slot)
 			 */
 			ExpandedObjectHeader *eoh = DatumGetEOHP(val);
 
-			data = (char *) att_nominal_alignby(data,
-												att->attalignby);
+			data = (char *) att_align_nominal(data,
+											  att->attalign);
 			data_length = EOH_get_flat_size(eoh);
 			EOH_flatten_into(eoh, data, data_length);
 
@@ -254,7 +237,7 @@ tts_virtual_materialize(TupleTableSlot *slot)
 		{
 			Size		data_length = 0;
 
-			data = (char *) att_nominal_alignby(data, att->attalignby);
+			data = (char *) att_align_nominal(data, att->attalign);
 			data_length = att_addlength_datum(data_length, att->attlen, val);
 
 			memcpy(data, DatumGetPointer(val), data_length);
@@ -269,6 +252,8 @@ static void
 tts_virtual_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 {
 	TupleDesc	srcdesc = srcslot->tts_tupleDescriptor;
+
+	Assert(srcdesc->natts <= dstslot->tts_tupleDescriptor->natts);
 
 	tts_virtual_clear(dstslot);
 
@@ -298,14 +283,13 @@ tts_virtual_copy_heap_tuple(TupleTableSlot *slot)
 }
 
 static MinimalTuple
-tts_virtual_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+tts_virtual_copy_minimal_tuple(TupleTableSlot *slot)
 {
 	Assert(!TTS_EMPTY(slot));
 
 	return heap_form_minimal_tuple(slot->tts_tupleDescriptor,
 								   slot->tts_values,
-								   slot->tts_isnull,
-								   extra);
+								   slot->tts_isnull);
 }
 
 
@@ -349,7 +333,7 @@ tts_heap_getsomeattrs(TupleTableSlot *slot, int natts)
 
 	Assert(!TTS_EMPTY(slot));
 
-	slot_deform_heap_tuple(slot, hslot->tuple, &hslot->off, natts, false);
+	slot_deform_heap_tuple(slot, hslot->tuple, &hslot->off, natts);
 }
 
 static Datum
@@ -370,29 +354,6 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 
 	return heap_getsysattr(hslot->tuple, attnum,
 						   slot->tts_tupleDescriptor, isnull);
-}
-
-static bool
-tts_heap_is_current_xact_tuple(TupleTableSlot *slot)
-{
-	HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) slot;
-	TransactionId xmin;
-
-	Assert(!TTS_EMPTY(slot));
-
-	/*
-	 * In some code paths it's possible to get here with a non-materialized
-	 * slot, in which case we can't check if tuple is created by the current
-	 * transaction.
-	 */
-	if (!hslot->tuple)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("don't have a storage tuple in this context")));
-
-	xmin = HeapTupleHeaderGetRawXmin(hslot->tuple->t_data);
-
-	return TransactionIdIsCurrentTransactionId(xmin);
 }
 
 static void
@@ -473,14 +434,14 @@ tts_heap_copy_heap_tuple(TupleTableSlot *slot)
 }
 
 static MinimalTuple
-tts_heap_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+tts_heap_copy_minimal_tuple(TupleTableSlot *slot)
 {
 	HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) slot;
 
 	if (!hslot->tuple)
 		tts_heap_materialize(slot);
 
-	return minimal_tuple_from_heap_tuple(hslot->tuple, extra);
+	return minimal_tuple_from_heap_tuple(hslot->tuple);
 }
 
 static void
@@ -512,7 +473,7 @@ tts_minimal_init(TupleTableSlot *slot)
 
 	/*
 	 * Initialize the heap tuple pointer to access attributes of the minimal
-	 * tuple contained in the slot as if it's a heap tuple.
+	 * tuple contained in the slot as if its a heap tuple.
 	 */
 	mslot->tuple = &mslot->minhdr;
 }
@@ -547,13 +508,9 @@ tts_minimal_getsomeattrs(TupleTableSlot *slot, int natts)
 
 	Assert(!TTS_EMPTY(slot));
 
-	slot_deform_heap_tuple(slot, mslot->tuple, &mslot->off, natts, true);
+	slot_deform_heap_tuple(slot, mslot->tuple, &mslot->off, natts);
 }
 
-/*
- * MinimalTupleTableSlots never provide system attributes. We generally
- * shouldn't get here, but provide a user-friendly message if we do.
- */
 static Datum
 tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
@@ -564,23 +521,6 @@ tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 			 errmsg("cannot retrieve a system column in this context")));
 
 	return 0;					/* silence compiler warnings */
-}
-
-/*
- * Within MinimalTuple abstraction transaction information is unavailable.
- * We generally shouldn't get here, but provide a user-friendly message if
- * we do.
- */
-static bool
-tts_minimal_is_current_xact_tuple(TupleTableSlot *slot)
-{
-	Assert(!TTS_EMPTY(slot));
-
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("don't have transaction information for this type of tuple")));
-
-	return false;				/* silence compiler warnings */
 }
 
 static void
@@ -608,8 +548,7 @@ tts_minimal_materialize(TupleTableSlot *slot)
 	{
 		mslot->mintuple = heap_form_minimal_tuple(slot->tts_tupleDescriptor,
 												  slot->tts_values,
-												  slot->tts_isnull,
-												  0);
+												  slot->tts_isnull);
 	}
 	else
 	{
@@ -619,7 +558,7 @@ tts_minimal_materialize(TupleTableSlot *slot)
 		 * TTS_FLAG_SHOULDFREE set).  Copy the minimal tuple into the given
 		 * slot's memory context.
 		 */
-		mslot->mintuple = heap_copy_minimal_tuple(mslot->mintuple, 0);
+		mslot->mintuple = heap_copy_minimal_tuple(mslot->mintuple);
 	}
 
 	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
@@ -668,14 +607,14 @@ tts_minimal_copy_heap_tuple(TupleTableSlot *slot)
 }
 
 static MinimalTuple
-tts_minimal_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+tts_minimal_copy_minimal_tuple(TupleTableSlot *slot)
 {
 	MinimalTupleTableSlot *mslot = (MinimalTupleTableSlot *) slot;
 
 	if (!mslot->mintuple)
 		tts_minimal_materialize(slot);
 
-	return heap_copy_minimal_tuple(mslot->mintuple, extra);
+	return heap_copy_minimal_tuple(mslot->mintuple);
 }
 
 static void
@@ -754,7 +693,7 @@ tts_buffer_heap_getsomeattrs(TupleTableSlot *slot, int natts)
 
 	Assert(!TTS_EMPTY(slot));
 
-	slot_deform_heap_tuple(slot, bslot->base.tuple, &bslot->base.off, natts, false);
+	slot_deform_heap_tuple(slot, bslot->base.tuple, &bslot->base.off, natts);
 }
 
 static Datum
@@ -775,29 +714,6 @@ tts_buffer_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 
 	return heap_getsysattr(bslot->base.tuple, attnum,
 						   slot->tts_tupleDescriptor, isnull);
-}
-
-static bool
-tts_buffer_is_current_xact_tuple(TupleTableSlot *slot)
-{
-	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-	TransactionId xmin;
-
-	Assert(!TTS_EMPTY(slot));
-
-	/*
-	 * In some code paths it's possible to get here with a non-materialized
-	 * slot, in which case we can't check if tuple is created by the current
-	 * transaction.
-	 */
-	if (!bslot->base.tuple)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("don't have a storage tuple in this context")));
-
-	xmin = HeapTupleHeaderGetRawXmin(bslot->base.tuple->t_data);
-
-	return TransactionIdIsCurrentTransactionId(xmin);
 }
 
 static void
@@ -928,7 +844,7 @@ tts_buffer_heap_copy_heap_tuple(TupleTableSlot *slot)
 }
 
 static MinimalTuple
-tts_buffer_heap_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+tts_buffer_heap_copy_minimal_tuple(TupleTableSlot *slot)
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 
@@ -937,7 +853,7 @@ tts_buffer_heap_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
 	if (!bslot->base.tuple)
 		tts_buffer_heap_materialize(slot);
 
-	return minimal_tuple_from_heap_tuple(bslot->base.tuple, extra);
+	return minimal_tuple_from_heap_tuple(bslot->base.tuple);
 }
 
 static inline void
@@ -996,10 +912,7 @@ tts_buffer_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple,
  * slot_deform_heap_tuple
  *		Given a TupleTableSlot, extract data from the slot's physical tuple
  *		into its Datum/isnull arrays.  Data is extracted up through the
- *		reqnatts'th column.  If there are insufficient attributes in the given
- *		tuple, then slot_getmissingattrs() is called to populate the
- *		remainder.  If reqnatts is above the number of attributes in the
- *		slot's TupleDesc, an error is raised.
+ *		natts'th column (caller must ensure this is a legal column number).
  *
  *		This is essentially an incremental version of heap_deform_tuple:
  *		on each call we extract attributes up to the one needed, without
@@ -1008,260 +921,107 @@ tts_buffer_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple,
  *
  * This is marked as always inline, so the different offp for different types
  * of slots gets optimized away.
- *
- * support_cstring should be passed as a const to allow the compiler only
- * emit code during inlining for cstring deforming when it's required.
- * cstrings can exist in MinimalTuples, but not in HeapTuples.
  */
 static pg_attribute_always_inline void
 slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
-					   int reqnatts, bool support_cstring)
+					   int natts)
 {
-	CompactAttribute *cattrs;
-	CompactAttribute *cattr;
 	TupleDesc	tupleDesc = slot->tts_tupleDescriptor;
+	Datum	   *values = slot->tts_values;
+	bool	   *isnull = slot->tts_isnull;
 	HeapTupleHeader tup = tuple->t_data;
-	size_t		attnum;
-	int			firstNonCacheOffsetAttr;
-	int			firstNonGuaranteedAttr;
-	int			firstNullAttr;
-	int			natts;
-	Datum	   *values;
-	bool	   *isnull;
+	bool		hasnulls = HeapTupleHasNulls(tuple);
+	int			attnum;
 	char	   *tp;				/* ptr to tuple data */
 	uint32		off;			/* offset in tuple data */
+	bits8	   *bp = tup->t_bits;	/* ptr to null bitmap in tuple */
+	bool		slow;			/* can we use/set attcacheoff? */
 
-	/* Did someone forget to call TupleDescFinalize()? */
-	Assert(tupleDesc->firstNonCachedOffsetAttr >= 0);
-
-	isnull = slot->tts_isnull;
+	/* We can only fetch as many attributes as the tuple has. */
+	natts = Min(HeapTupleHeaderGetNatts(tuple->t_data), natts);
 
 	/*
-	 * Some callers may form and deform tuples prior to NOT NULL constraints
-	 * being checked.  Here we'd like to optimize the case where we only need
-	 * to fetch attributes before or up to the point where the attribute is
-	 * guaranteed to exist in the tuple.  We rely on the slot flag being set
-	 * correctly to only enable this optimization when it's valid to do so.
-	 * This optimization allows us to save fetching the number of attributes
-	 * from the tuple and saves the additional cost of handling non-byval
-	 * attrs.
+	 * Check whether the first call for this tuple, and initialize or restore
+	 * loop state.
 	 */
-	firstNonGuaranteedAttr = Min(reqnatts, slot->tts_first_nonguaranteed);
-
-	firstNonCacheOffsetAttr = tupleDesc->firstNonCachedOffsetAttr;
-
-	if (HeapTupleHasNulls(tuple))
-	{
-		natts = HeapTupleHeaderGetNatts(tup);
-		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits) +
-									 BITMAPLEN(natts));
-
-		natts = Min(natts, reqnatts);
-		if (natts > firstNonGuaranteedAttr)
-		{
-			uint8	   *bp = tup->t_bits;
-
-			/* Find the first NULL attr */
-			firstNullAttr = first_null_attr(bp, natts);
-
-			/*
-			 * And populate the isnull array for all attributes being fetched
-			 * from the tuple.
-			 */
-			populate_isnull_array(bp, natts, isnull);
-		}
-		else
-		{
-			/* Otherwise all required columns are guaranteed to exist */
-			firstNullAttr = natts;
-
-			/*
-			 * Check TupleDescFinalize() didn't get confused when setting
-			 * firstNonGuaranteedAttr.  There should never be a NULL in a
-			 * guaranteed column.
-			 */
-			Assert(first_null_attr(tup->t_bits, natts) >= firstNullAttr);
-		}
-	}
-	else
-	{
-		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits));
-
-		/*
-		 * We only need to look at the tuple's natts if we need more than the
-		 * guaranteed number of columns
-		 */
-		if (reqnatts > firstNonGuaranteedAttr)
-			natts = Min(HeapTupleHeaderGetNatts(tup), reqnatts);
-		else
-		{
-			/* No need to access the number of attributes in the tuple */
-			natts = reqnatts;
-		}
-
-		/* All attrs can be fetched without checking for NULLs */
-		firstNullAttr = natts;
-	}
-
 	attnum = slot->tts_nvalid;
-	values = slot->tts_values;
-	slot->tts_nvalid = reqnatts;
-
-	/*
-	 * We store the tupleDesc's CompactAttribute array in 'cattrs' as gcc
-	 * seems to be unwilling to optimize accessing the CompactAttribute
-	 * element efficiently when accessing it via TupleDescCompactAttr().
-	 */
-	cattrs = tupleDesc->compact_attrs;
-
-	/* Ensure we calculated tp correctly */
-	Assert(tp == (char *) tup + tup->t_hoff);
-
-	if (attnum < firstNonGuaranteedAttr)
+	if (attnum == 0)
 	{
-		int			attlen;
-
-		do
-		{
-			isnull[attnum] = false;
-			cattr = &cattrs[attnum];
-			attlen = cattr->attlen;
-
-			/* We don't expect any non-byval types */
-			pg_assume(attlen > 0);
-			Assert(cattr->attbyval == true);
-
-			off = cattr->attcacheoff;
-			values[attnum] = fetch_att_noerr(tp + off, true, attlen);
-			attnum++;
-		} while (attnum < firstNonGuaranteedAttr);
-
-		off += attlen;
-
-		if (attnum == reqnatts)
-			goto done;
+		/* Start from the first attribute */
+		off = 0;
+		slow = false;
 	}
 	else
 	{
-		/*
-		 * We may be incrementally deforming the tuple, so set 'off' to the
-		 * previously cached value.  This may be 0, if the slot has just
-		 * received a new tuple.
-		 */
+		/* Restore state from previous execution */
 		off = *offp;
-
-		/* We expect *offp to be set to 0 when attnum == 0 */
-		Assert(off == 0 || attnum > 0);
+		slow = TTS_SLOW(slot);
 	}
 
-	/* We can use attcacheoff up until the first NULL */
-	firstNonCacheOffsetAttr = Min(firstNonCacheOffsetAttr, firstNullAttr);
+	tp = (char *) tup + tup->t_hoff;
 
-	/*
-	 * Handle the portion of the tuple that we have cached the offset for up
-	 * to the first NULL attribute.  The offset is effectively fixed for
-	 * these, so we can use the CompactAttribute's attcacheoff.
-	 */
-	if (attnum < firstNonCacheOffsetAttr)
-	{
-		int			attlen;
-
-		do
-		{
-			isnull[attnum] = false;
-			cattr = &cattrs[attnum];
-			attlen = cattr->attlen;
-			off = cattr->attcacheoff;
-			values[attnum] = fetch_att_noerr(tp + off,
-											 cattr->attbyval,
-											 attlen);
-			attnum++;
-		} while (attnum < firstNonCacheOffsetAttr);
-
-		/*
-		 * Point the offset after the end of the last attribute with a cached
-		 * offset.  We expect the final cached offset attribute to have a
-		 * fixed width, so just add the attlen to the attcacheoff
-		 */
-		Assert(attlen > 0);
-		off += attlen;
-	}
-
-	/*
-	 * Handle any portion of the tuple that doesn't have a fixed offset up
-	 * until the first NULL attribute.  This loop only differs from the one
-	 * after it by the NULL checks.
-	 */
-	for (; attnum < firstNullAttr; attnum++)
-	{
-		int			attlen;
-
-		isnull[attnum] = false;
-		cattr = &cattrs[attnum];
-		attlen = cattr->attlen;
-
-		/*
-		 * Only emit the cstring-related code in align_fetch_then_add() when
-		 * cstring support is needed.  We assume support_cstring will be
-		 * passed as a const to allow the compiler to eliminate this branch.
-		 */
-		if (!support_cstring)
-			pg_assume(attlen > 0 || attlen == -1);
-
-		/* align 'off', fetch the datum, and increment off beyond the datum */
-		values[attnum] = align_fetch_then_add(tp,
-											  &off,
-											  cattr->attbyval,
-											  attlen,
-											  cattr->attalignby);
-	}
-
-	/*
-	 * Now handle any remaining attributes in the tuple up to the requested
-	 * attnum.  This time, include NULL checks as we're now at the first NULL
-	 * attribute.
-	 */
 	for (; attnum < natts; attnum++)
 	{
-		int			attlen;
+		Form_pg_attribute thisatt = TupleDescAttr(tupleDesc, attnum);
 
-		if (isnull[attnum])
+		if (hasnulls && att_isnull(attnum, bp))
 		{
 			values[attnum] = (Datum) 0;
+			isnull[attnum] = true;
+			slow = true;		/* can't use attcacheoff anymore */
 			continue;
 		}
 
-		cattr = &cattrs[attnum];
-		attlen = cattr->attlen;
+		isnull[attnum] = false;
 
-		/* As above, only emit cstring code when needed. */
-		if (!support_cstring)
-			pg_assume(attlen > 0 || attlen == -1);
+		if (!slow && thisatt->attcacheoff >= 0)
+			off = thisatt->attcacheoff;
+		else if (thisatt->attlen == -1)
+		{
+			/*
+			 * We can only cache the offset for a varlena attribute if the
+			 * offset is already suitably aligned, so that there would be no
+			 * pad bytes in any case: then the offset will be valid for either
+			 * an aligned or unaligned value.
+			 */
+			if (!slow &&
+				off == att_align_nominal(off, thisatt->attalign))
+				thisatt->attcacheoff = off;
+			else
+			{
+				off = att_align_pointer(off, thisatt->attalign, -1,
+										tp + off);
+				slow = true;
+			}
+		}
+		else
+		{
+			/* not varlena, so safe to use att_align_nominal */
+			off = att_align_nominal(off, thisatt->attalign);
 
-		/* align 'off', fetch the datum, and increment off beyond the datum */
-		values[attnum] = align_fetch_then_add(tp,
-											  &off,
-											  cattr->attbyval,
-											  attlen,
-											  cattr->attalignby);
+			if (!slow)
+				thisatt->attcacheoff = off;
+		}
+
+		values[attnum] = fetchatt(thisatt, tp + off);
+
+		off = att_addlength_pointer(off, thisatt->attlen, tp + off);
+
+		if (thisatt->attlen <= 0)
+			slow = true;		/* can't use attcacheoff anymore */
 	}
 
-	/* Fetch any missing attrs and raise an error if reqnatts is invalid */
-	if (unlikely(attnum < reqnatts))
-	{
-		/*
-		 * Cache the offset before calling the function to allow the compiler
-		 * to implement a tail-call optimization
-		 */
-		*offp = off;
-		slot_getmissingattrs(slot, attnum, reqnatts);
-		return;
-	}
-done:
-
-	/* Save current offset for next execution */
+	/*
+	 * Save state for next execution
+	 */
+	slot->tts_nvalid = attnum;
 	*offp = off;
+	if (slow)
+		slot->tts_flags |= TTS_FLAG_SLOW;
+	else
+		slot->tts_flags &= ~TTS_FLAG_SLOW;
 }
+
 
 const TupleTableSlotOps TTSOpsVirtual = {
 	.base_slot_size = sizeof(VirtualTupleTableSlot),
@@ -1271,7 +1031,6 @@ const TupleTableSlotOps TTSOpsVirtual = {
 	.getsomeattrs = tts_virtual_getsomeattrs,
 	.getsysattr = tts_virtual_getsysattr,
 	.materialize = tts_virtual_materialize,
-	.is_current_xact_tuple = tts_virtual_is_current_xact_tuple,
 	.copyslot = tts_virtual_copyslot,
 
 	/*
@@ -1291,7 +1050,6 @@ const TupleTableSlotOps TTSOpsHeapTuple = {
 	.clear = tts_heap_clear,
 	.getsomeattrs = tts_heap_getsomeattrs,
 	.getsysattr = tts_heap_getsysattr,
-	.is_current_xact_tuple = tts_heap_is_current_xact_tuple,
 	.materialize = tts_heap_materialize,
 	.copyslot = tts_heap_copyslot,
 	.get_heap_tuple = tts_heap_get_heap_tuple,
@@ -1309,7 +1067,6 @@ const TupleTableSlotOps TTSOpsMinimalTuple = {
 	.clear = tts_minimal_clear,
 	.getsomeattrs = tts_minimal_getsomeattrs,
 	.getsysattr = tts_minimal_getsysattr,
-	.is_current_xact_tuple = tts_minimal_is_current_xact_tuple,
 	.materialize = tts_minimal_materialize,
 	.copyslot = tts_minimal_copyslot,
 
@@ -1327,7 +1084,6 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple = {
 	.clear = tts_buffer_heap_clear,
 	.getsomeattrs = tts_buffer_heap_getsomeattrs,
 	.getsysattr = tts_buffer_heap_getsysattr,
-	.is_current_xact_tuple = tts_buffer_is_current_xact_tuple,
 	.materialize = tts_buffer_heap_materialize,
 	.copyslot = tts_buffer_heap_copyslot,
 	.get_heap_tuple = tts_buffer_heap_get_heap_tuple,
@@ -1350,13 +1106,12 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple = {
  *		Basic routine to make an empty TupleTableSlot of given
  *		TupleTableSlotType. If tupleDesc is specified the slot's descriptor is
  *		fixed for its lifetime, gaining some efficiency. If that's
- *		undesirable, pass NULL.  'flags' allows any of non-TTS_FLAGS_TRANSIENT
- *		flags to be set in tts_flags.
+ *		undesirable, pass NULL.
  * --------------------------------
  */
 TupleTableSlot *
 MakeTupleTableSlot(TupleDesc tupleDesc,
-				   const TupleTableSlotOps *tts_ops, uint16 flags)
+				   const TupleTableSlotOps *tts_ops)
 {
 	Size		basesz,
 				allocsz;
@@ -1364,21 +1119,14 @@ MakeTupleTableSlot(TupleDesc tupleDesc,
 
 	basesz = tts_ops->base_slot_size;
 
-	/* Ensure callers don't have any way to set transient flags permanently */
-	flags &= ~TTS_FLAGS_TRANSIENT;
-
 	/*
 	 * When a fixed descriptor is specified, we can reduce overhead by
 	 * allocating the entire slot in one go.
-	 *
-	 * We round the size of tts_isnull up to the next highest multiple of 8.
-	 * This is needed as populate_isnull_array() operates on 8 elements at a
-	 * time when converting a tuple's NULL bitmap into a boolean array.
 	 */
 	if (tupleDesc)
 		allocsz = MAXALIGN(basesz) +
 			MAXALIGN(tupleDesc->natts * sizeof(Datum)) +
-			TYPEALIGN(8, tupleDesc->natts * sizeof(bool));
+			MAXALIGN(tupleDesc->natts * sizeof(bool));
 	else
 		allocsz = basesz;
 
@@ -1386,7 +1134,7 @@ MakeTupleTableSlot(TupleDesc tupleDesc,
 	/* const for optimization purposes, OK to modify at allocation time */
 	*((const TupleTableSlotOps **) &slot->tts_ops) = tts_ops;
 	slot->type = T_TupleTableSlot;
-	slot->tts_flags = TTS_FLAG_EMPTY | flags;
+	slot->tts_flags |= TTS_FLAG_EMPTY;
 	if (tupleDesc != NULL)
 		slot->tts_flags |= TTS_FLAG_FIXED;
 	slot->tts_tupleDescriptor = tupleDesc;
@@ -1398,25 +1146,12 @@ MakeTupleTableSlot(TupleDesc tupleDesc,
 		slot->tts_values = (Datum *)
 			(((char *) slot)
 			 + MAXALIGN(basesz));
-
 		slot->tts_isnull = (bool *)
 			(((char *) slot)
 			 + MAXALIGN(basesz)
 			 + MAXALIGN(tupleDesc->natts * sizeof(Datum)));
 
 		PinTupleDesc(tupleDesc);
-
-		/*
-		 * Precalculate the maximum guaranteed attribute that has to exist in
-		 * every tuple which gets deformed into this slot.  When the
-		 * TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS flag is enabled, we simply take
-		 * the pre-calculated value from the tupleDesc, otherwise the
-		 * optimization is disabled, and we set the value to 0.
-		 */
-		if ((flags & TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS) != 0)
-			slot->tts_first_nonguaranteed = tupleDesc->firstNonGuaranteedAttr;
-		else
-			slot->tts_first_nonguaranteed = 0;
 	}
 
 	/*
@@ -1435,9 +1170,9 @@ MakeTupleTableSlot(TupleDesc tupleDesc,
  */
 TupleTableSlot *
 ExecAllocTableSlot(List **tupleTable, TupleDesc desc,
-				   const TupleTableSlotOps *tts_ops, uint16 flags)
+				   const TupleTableSlotOps *tts_ops)
 {
-	TupleTableSlot *slot = MakeTupleTableSlot(desc, tts_ops, flags);
+	TupleTableSlot *slot = MakeTupleTableSlot(desc, tts_ops);
 
 	*tupleTable = lappend(*tupleTable, slot);
 
@@ -1504,7 +1239,7 @@ TupleTableSlot *
 MakeSingleTupleTableSlot(TupleDesc tupdesc,
 						 const TupleTableSlotOps *tts_ops)
 {
-	TupleTableSlot *slot = MakeTupleTableSlot(tupdesc, tts_ops, 0);
+	TupleTableSlot *slot = MakeTupleTableSlot(tupdesc, tts_ops);
 
 	return slot;
 }
@@ -1584,14 +1319,8 @@ ExecSetSlotDescriptor(TupleTableSlot *slot, /* slot to change */
 	 */
 	slot->tts_values = (Datum *)
 		MemoryContextAlloc(slot->tts_mcxt, tupdesc->natts * sizeof(Datum));
-
-	/*
-	 * We round the size of tts_isnull up to the next highest multiple of 8.
-	 * This is needed as populate_isnull_array() operates on 8 elements at a
-	 * time when converting a tuple's NULL bitmap into a boolean array.
-	 */
 	slot->tts_isnull = (bool *)
-		MemoryContextAlloc(slot->tts_mcxt, TYPEALIGN(8, tupdesc->natts * sizeof(bool)));
+		MemoryContextAlloc(slot->tts_mcxt, tupdesc->natts * sizeof(bool));
 }
 
 /* --------------------------------
@@ -1980,7 +1709,7 @@ ExecFetchSlotMinimalTuple(TupleTableSlot *slot,
 	{
 		if (shouldFree)
 			*shouldFree = true;
-		return slot->tts_ops->copy_minimal_tuple(slot, 0);
+		return slot->tts_ops->copy_minimal_tuple(slot);
 	}
 }
 
@@ -2053,7 +1782,7 @@ ExecInitResultSlot(PlanState *planstate, const TupleTableSlotOps *tts_ops)
 	TupleTableSlot *slot;
 
 	slot = ExecAllocTableSlot(&planstate->state->es_tupleTable,
-							  planstate->ps_ResultTupleDesc, tts_ops, 0);
+							  planstate->ps_ResultTupleDesc, tts_ops);
 	planstate->ps_ResultTupleSlot = slot;
 
 	planstate->resultopsfixed = planstate->ps_ResultTupleDesc != NULL;
@@ -2081,11 +1810,10 @@ ExecInitResultTupleSlotTL(PlanState *planstate,
  */
 void
 ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
-					  TupleDesc tupledesc, const TupleTableSlotOps *tts_ops,
-					  uint16 flags)
+					  TupleDesc tupledesc, const TupleTableSlotOps *tts_ops)
 {
 	scanstate->ss_ScanTupleSlot = ExecAllocTableSlot(&estate->es_tupleTable,
-													 tupledesc, tts_ops, flags);
+													 tupledesc, tts_ops);
 	scanstate->ps.scandesc = tupledesc;
 	scanstate->ps.scanopsfixed = tupledesc != NULL;
 	scanstate->ps.scanops = tts_ops;
@@ -2105,7 +1833,7 @@ ExecInitExtraTupleSlot(EState *estate,
 					   TupleDesc tupledesc,
 					   const TupleTableSlotOps *tts_ops)
 {
-	return ExecAllocTableSlot(&estate->es_tupleTable, tupledesc, tts_ops, 0);
+	return ExecAllocTableSlot(&estate->es_tupleTable, tupledesc, tts_ops);
 }
 
 /* ----------------
@@ -2142,36 +1870,34 @@ slot_getmissingattrs(TupleTableSlot *slot, int startAttNum, int lastAttNum)
 {
 	AttrMissing *attrmiss = NULL;
 
-	/* Check for invalid attnums */
-	if (unlikely(lastAttNum > slot->tts_tupleDescriptor->natts))
-		elog(ERROR, "invalid attribute number %d", lastAttNum);
-
 	if (slot->tts_tupleDescriptor->constr)
 		attrmiss = slot->tts_tupleDescriptor->constr->missing;
 
 	if (!attrmiss)
 	{
 		/* no missing values array at all, so just fill everything in as NULL */
-		for (int attnum = startAttNum; attnum < lastAttNum; attnum++)
-		{
-			slot->tts_values[attnum] = (Datum) 0;
-			slot->tts_isnull[attnum] = true;
-		}
+		memset(slot->tts_values + startAttNum, 0,
+			   (lastAttNum - startAttNum) * sizeof(Datum));
+		memset(slot->tts_isnull + startAttNum, 1,
+			   (lastAttNum - startAttNum) * sizeof(bool));
 	}
 	else
 	{
-		/* use attrmiss to set the missing values */
-		for (int attnum = startAttNum; attnum < lastAttNum; attnum++)
+		int			missattnum;
+
+		/* if there is a missing values array we must process them one by one */
+		for (missattnum = startAttNum;
+			 missattnum < lastAttNum;
+			 missattnum++)
 		{
-			slot->tts_values[attnum] = attrmiss[attnum].am_value;
-			slot->tts_isnull[attnum] = !attrmiss[attnum].am_present;
+			slot->tts_values[missattnum] = attrmiss[missattnum].am_value;
+			slot->tts_isnull[missattnum] = !attrmiss[missattnum].am_present;
 		}
 	}
 }
 
 /*
- * slot_getsomeattrs_int
- *		external function to call getsomeattrs() for use in JIT
+ * slot_getsomeattrs_int - workhorse for slot_getsomeattrs()
  */
 void
 slot_getsomeattrs_int(TupleTableSlot *slot, int attnum)
@@ -2180,13 +1906,21 @@ slot_getsomeattrs_int(TupleTableSlot *slot, int attnum)
 	Assert(slot->tts_nvalid < attnum);	/* checked in slot_getsomeattrs */
 	Assert(attnum > 0);
 
+	if (unlikely(attnum > slot->tts_tupleDescriptor->natts))
+		elog(ERROR, "invalid attribute number %d", attnum);
+
 	/* Fetch as many attributes as possible from the underlying tuple. */
 	slot->tts_ops->getsomeattrs(slot, attnum);
 
 	/*
-	 * Avoid putting new code here as that would prevent the compiler from
-	 * using the sibling call optimization for the above function.
+	 * If the underlying tuple doesn't have enough attributes, tuple
+	 * descriptor must have the missing attributes.
 	 */
+	if (unlikely(slot->tts_nvalid < attnum))
+	{
+		slot_getmissingattrs(slot, slot->tts_nvalid, attnum);
+		slot->tts_nvalid = attnum;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2251,8 +1985,6 @@ ExecTypeFromTLInternal(List *targetList, bool skipjunk)
 		cur_resno++;
 	}
 
-	TupleDescFinalize(typeInfo);
-
 	return typeInfo;
 }
 
@@ -2286,8 +2018,6 @@ ExecTypeFromExprList(List *exprList)
 									exprCollation(e));
 		cur_resno++;
 	}
-
-	TupleDescFinalize(typeInfo);
 
 	return typeInfo;
 }
@@ -2337,16 +2067,10 @@ ExecTypeSetColNames(TupleDesc typeInfo, List *namesList)
  * This happens "for free" if the tupdesc came from a relcache entry, but
  * not if we have manufactured a tupdesc for a transient RECORD datatype.
  * In that case we have to notify typcache.c of the existence of the type.
- *
- * TupleDescFinalize() must be called on the TupleDesc before calling this
- * function.
  */
 TupleDesc
 BlessTupleDesc(TupleDesc tupdesc)
 {
-	/* Did someone forget to call TupleDescFinalize()? */
-	Assert(tupdesc->firstNonCachedOffsetAttr >= 0);
-
 	if (tupdesc->tdtypeid == RECORDOID &&
 		tupdesc->tdtypmod < 0)
 		assign_record_type_typmod(tupdesc);
@@ -2371,7 +2095,7 @@ TupleDescGetAttInMetadata(TupleDesc tupdesc)
 	int32	   *atttypmods;
 	AttInMetadata *attinmeta;
 
-	attinmeta = palloc_object(AttInMetadata);
+	attinmeta = (AttInMetadata *) palloc(sizeof(AttInMetadata));
 
 	/* "Bless" the tupledesc so that we can make rowtype datums with it */
 	attinmeta->tupdesc = BlessTupleDesc(tupdesc);
@@ -2427,7 +2151,7 @@ BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values)
 	 */
 	for (i = 0; i < natts; i++)
 	{
-		if (!TupleDescCompactAttr(tupdesc, i)->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 		{
 			/* Non-dropped attributes */
 			dvalues[i] = InputFunctionCall(&attinmeta->attinfuncs[i],
@@ -2535,7 +2259,7 @@ begin_tup_output_tupdesc(DestReceiver *dest,
 {
 	TupOutputState *tstate;
 
-	tstate = palloc_object(TupOutputState);
+	tstate = (TupOutputState *) palloc(sizeof(TupOutputState));
 
 	tstate->slot = MakeSingleTupleTableSlot(tupdesc, tts_ops);
 	tstate->dest = dest;
@@ -2549,7 +2273,7 @@ begin_tup_output_tupdesc(DestReceiver *dest,
  * write a single tuple
  */
 void
-do_tup_output(TupOutputState *tstate, const Datum *values, const bool *isnull)
+do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
 {
 	TupleTableSlot *slot = tstate->slot;
 	int			natts = slot->tts_tupleDescriptor->natts;

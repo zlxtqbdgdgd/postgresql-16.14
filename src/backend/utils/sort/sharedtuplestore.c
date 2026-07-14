@@ -10,7 +10,7 @@
  * scan where each backend reads an arbitrary subset of the tuples that were
  * written.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,6 +23,7 @@
 
 #include "access/htup.h"
 #include "access/htup_details.h"
+#include "miscadmin.h"
 #include "storage/buffile.h"
 #include "storage/lwlock.h"
 #include "storage/sharedfileset.h"
@@ -88,6 +89,7 @@ struct SharedTuplestoreAccessor
 	/* State for writing. */
 	SharedTuplestoreChunk *write_chunk; /* Buffer for writing. */
 	BufFile    *write_file;		/* The current file to write to. */
+	BlockNumber write_page;		/* The next page to write to. */
 	char	   *write_pointer;	/* Current write pointer within chunk. */
 	char	   *write_end;		/* One past the end of the current chunk. */
 };
@@ -160,7 +162,7 @@ sts_initialize(SharedTuplestore *sts, int participants,
 		sts->participants[i].writing = false;
 	}
 
-	accessor = palloc0_object(SharedTuplestoreAccessor);
+	accessor = palloc0(sizeof(SharedTuplestoreAccessor));
 	accessor->participant = my_participant_number;
 	accessor->sts = sts;
 	accessor->fileset = fileset;
@@ -182,7 +184,7 @@ sts_attach(SharedTuplestore *sts,
 
 	Assert(my_participant_number < sts->nparticipants);
 
-	accessor = palloc0_object(SharedTuplestoreAccessor);
+	accessor = palloc0(sizeof(SharedTuplestoreAccessor));
 	accessor->participant = my_participant_number;
 	accessor->sts = sts;
 	accessor->fileset = fileset;

@@ -6,7 +6,7 @@
  *
  * Transforms tokenized jsonpath into tree of JsonPathParseItem structs.
  *
- * Copyright (c) 2019-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_gram.y
@@ -60,10 +60,8 @@ static bool makeItemLikeRegex(JsonPathParseItem *expr,
 %name-prefix="jsonpath_yy"
 %parse-param {JsonPathParseResult **result}
 %parse-param {struct Node *escontext}
-%parse-param {yyscan_t yyscanner}
 %lex-param {JsonPathParseResult **result}
 %lex-param {struct Node *escontext}
-%lex-param {yyscan_t yyscanner}
 
 %union
 {
@@ -84,20 +82,15 @@ static bool makeItemLikeRegex(JsonPathParseItem *expr,
 %token	<str>		ANY_P STRICT_P LAX_P LAST_P STARTS_P WITH_P LIKE_REGEX_P FLAG_P
 %token	<str>		ABS_P SIZE_P TYPE_P FLOOR_P DOUBLE_P CEILING_P KEYVALUE_P
 %token	<str>		DATETIME_P
-%token	<str>		BIGINT_P BOOLEAN_P DATE_P DECIMAL_P INTEGER_P NUMBER_P
-%token	<str>		STRINGFUNC_P TIME_P TIME_TZ_P TIMESTAMP_P TIMESTAMP_TZ_P
-%token	<str>		STR_REPLACE_P STR_LOWER_P STR_UPPER_P STR_LTRIM_P STR_RTRIM_P STR_BTRIM_P
-					STR_INITCAP_P STR_SPLIT_PART_P
 
 %type	<result>	result
 
 %type	<value>		scalar_value path_primary expr array_accessor
 					any_path accessor_op key predicate delimited_predicate
 					index_elem starts_with_initial expr_or_predicate
-					str_elem opt_str_arg int_elem
-					uint_elem opt_uint_arg
+					datetime_template opt_datetime_template
 
-%type	<elems>		accessor_expr int_list opt_int_list str_int_args str_str_args
+%type	<elems>		accessor_expr
 
 %type	<indexs>	index_list
 
@@ -122,7 +115,7 @@ static bool makeItemLikeRegex(JsonPathParseItem *expr,
 
 result:
 	mode expr_or_predicate			{
-										*result = palloc_object(JsonPathParseResult);
+										*result = palloc(sizeof(JsonPathParseResult));
 										(*result)->expr = $2;
 										(*result)->lax = $1;
 										(void) yynerrs;
@@ -255,86 +248,18 @@ accessor_op:
 	| array_accessor				{ $$ = $1; }
 	| '.' any_path					{ $$ = $2; }
 	| '.' method '(' ')'			{ $$ = makeItemType($2); }
+	| '.' DATETIME_P '(' opt_datetime_template ')'
+									{ $$ = makeItemUnary(jpiDatetime, $4); }
 	| '?' '(' predicate ')'			{ $$ = makeItemUnary(jpiFilter, $3); }
-	| '.' DECIMAL_P '(' opt_int_list ')'
-		{
-			if (list_length($4) == 0)
-				$$ = makeItemBinary(jpiDecimal, NULL, NULL);
-			else if (list_length($4) == 1)
-				$$ = makeItemBinary(jpiDecimal, linitial($4), NULL);
-			else if (list_length($4) == 2)
-				$$ = makeItemBinary(jpiDecimal, linitial($4), lsecond($4));
-			else
-				ereturn(escontext, false,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("invalid input syntax for type %s", "jsonpath"),
-						 errdetail(".decimal() can only have an optional precision[,scale].")));
-		}
-	| '.' DATETIME_P '(' opt_str_arg ')'
-		{ $$ = makeItemUnary(jpiDatetime, $4); }
-	| '.' TIME_P '(' opt_uint_arg ')'
-		{ $$ = makeItemUnary(jpiTime, $4); }
-	| '.' TIME_TZ_P '(' opt_uint_arg ')'
-		{ $$ = makeItemUnary(jpiTimeTz, $4); }
-	| '.' TIMESTAMP_P '(' opt_uint_arg ')'
-		{ $$ = makeItemUnary(jpiTimestamp, $4); }
-	| '.' TIMESTAMP_TZ_P '(' opt_uint_arg ')'
-		{ $$ = makeItemUnary(jpiTimestampTz, $4); }
-	| '.' STR_REPLACE_P '(' str_str_args ')'
-		{ $$ = makeItemBinary(jpiStrReplace, linitial($4), lsecond($4)); }
-	| '.' STR_SPLIT_PART_P '(' str_int_args ')'
-		{ $$ = makeItemBinary(jpiStrSplitPart, linitial($4), lsecond($4)); }
-	| '.' STR_LTRIM_P '(' opt_str_arg ')'
-		{ $$ = makeItemUnary(jpiStrLtrim, $4); }
-	| '.' STR_RTRIM_P '(' opt_str_arg ')'
-		{ $$ = makeItemUnary(jpiStrRtrim, $4); }
-	| '.' STR_BTRIM_P '(' opt_str_arg ')'
-		{ $$ = makeItemUnary(jpiStrBtrim, $4); }
 	;
 
-int_elem:
-	INT_P
-		{ $$ = makeItemNumeric(&$1); }
-	| '+' INT_P %prec UMINUS
-		{ $$ = makeItemUnary(jpiPlus, makeItemNumeric(&$2)); }
-	| '-' INT_P %prec UMINUS
-		{ $$ = makeItemUnary(jpiMinus, makeItemNumeric(&$2)); }
-	;
-
-int_list:
-	int_elem						{ $$ = list_make1($1); }
-	| int_list ',' int_elem			{ $$ = lappend($1, $3); }
-	;
-
-opt_int_list:
-	int_list						{ $$ = $1; }
-	| /* EMPTY */					{ $$ = NULL; }
-	;
-
-uint_elem:
-	INT_P							{ $$ = makeItemNumeric(&$1); }
-	;
-
-opt_uint_arg:
-	uint_elem						{ $$ = $1; }
-	| /* EMPTY */					{ $$ = NULL; }
-	;
-
-str_elem:
+datetime_template:
 	STRING_P						{ $$ = makeItemString(&$1); }
 	;
 
-opt_str_arg:
-	str_elem						{ $$ = $1; }
+opt_datetime_template:
+	datetime_template				{ $$ = $1; }
 	| /* EMPTY */					{ $$ = NULL; }
-	;
-
-str_int_args:
-	str_elem ',' int_elem			{ $$ = list_make2($1, $3); }
-	;
-
-str_str_args:
-	str_elem ',' str_elem 			{ $$ = list_make2($1, $3); }
 	;
 
 key:
@@ -366,25 +291,6 @@ key_name:
 	| WITH_P
 	| LIKE_REGEX_P
 	| FLAG_P
-	| BIGINT_P
-	| BOOLEAN_P
-	| DATE_P
-	| DECIMAL_P
-	| INTEGER_P
-	| NUMBER_P
-	| STRINGFUNC_P
-	| TIME_P
-	| TIME_TZ_P
-	| TIMESTAMP_P
-	| TIMESTAMP_TZ_P
-	| STR_LOWER_P
-	| STR_UPPER_P
-	| STR_INITCAP_P
-	| STR_REPLACE_P
-	| STR_SPLIT_PART_P
-	| STR_LTRIM_P
-	| STR_RTRIM_P
-	| STR_BTRIM_P
 	;
 
 method:
@@ -395,15 +301,6 @@ method:
 	| DOUBLE_P						{ $$ = jpiDouble; }
 	| CEILING_P						{ $$ = jpiCeiling; }
 	| KEYVALUE_P					{ $$ = jpiKeyValue; }
-	| BIGINT_P						{ $$ = jpiBigint; }
-	| BOOLEAN_P						{ $$ = jpiBoolean; }
-	| DATE_P						{ $$ = jpiDate; }
-	| INTEGER_P						{ $$ = jpiInteger; }
-	| NUMBER_P						{ $$ = jpiNumber; }
-	| STRINGFUNC_P					{ $$ = jpiStringFunc; }
-	| STR_LOWER_P					{ $$ = jpiStrLower; }
-	| STR_UPPER_P					{ $$ = jpiStrUpper; }
-	| STR_INITCAP_P					{ $$ = jpiStrInitcap; }
 	;
 %%
 
@@ -415,7 +312,7 @@ method:
 static JsonPathParseItem *
 makeItemType(JsonPathItemType type)
 {
-	JsonPathParseItem *v = palloc_object(JsonPathParseItem);
+	JsonPathParseItem *v = palloc(sizeof(*v));
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -593,7 +490,7 @@ makeAny(int first, int last)
 
 static bool
 makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
-				  JsonPathString *flags, JsonPathParseItem **result,
+				  JsonPathString *flags, JsonPathParseItem ** result,
 				  struct Node *escontext)
 {
 	JsonPathParseItem *v = makeItemType(jpiLikeRegex);
@@ -637,15 +534,15 @@ makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
 	}
 
 	/* Convert flags to what pg_regcomp needs */
-	if (!jspConvertRegexFlags(v->value.like_regex.flags, &cflags, escontext))
-		return false;
+	if ( !jspConvertRegexFlags(v->value.like_regex.flags, &cflags, escontext))
+		 return false;
 
 	/* check regex validity */
 	{
-		regex_t		re_tmp;
+		regex_t     re_tmp;
 		pg_wchar   *wpattern;
-		int			wpattern_len;
-		int			re_result;
+		int         wpattern_len;
+		int         re_result;
 
 		wpattern = (pg_wchar *) palloc((pattern->len + 1) * sizeof(pg_wchar));
 		wpattern_len = pg_mb2wchar_with_len(pattern->val,
@@ -655,7 +552,7 @@ makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
 		if ((re_result = pg_regcomp(&re_tmp, wpattern, wpattern_len, cflags,
 									DEFAULT_COLLATION_OID)) != REG_OKAY)
 		{
-			char		errMsg[100];
+			char        errMsg[100];
 
 			pg_regerror(re_result, &re_tmp, errMsg, sizeof(errMsg));
 			ereturn(escontext, false,

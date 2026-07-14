@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 seg_sources = files(
   'seg.c',
@@ -55,7 +55,6 @@ tests += {
     'sql': [
       'security',
       'seg',
-      'partition',
     ],
   },
 }

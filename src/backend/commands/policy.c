@@ -3,7 +3,7 @@
  * policy.c
  *	  Commands for manipulating policies.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/commands/policy.c
@@ -16,6 +16,7 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -28,6 +29,7 @@
 #include "catalog/pg_type.h"
 #include "commands/policy.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
@@ -35,6 +37,7 @@
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rowsecurity.h"
+#include "storage/lock.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -78,18 +81,6 @@ RangeVarCallbackForPolicy(const RangeVar *rv, Oid relid, Oid oldrelid,
 	/* Must own relation. */
 	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)), rv->relname);
-
-	/*
-	 * Conflict log tables are used internally for logical replication
-	 * conflict logging and should not be modified directly, as it could
-	 * disrupt conflict logging.
-	 */
-	if (IsConflictLogTableClass(classform))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("cannot create policy on conflict log table \"%s\"",
-						rv->relname),
-				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 	/* No system table modifications unless explicitly allowed. */
 	if (!allowSystemTableMods && IsSystemClass(relid, classform))
@@ -156,7 +147,7 @@ policy_role_list_to_array(List *roles, int *num_roles)
 	if (roles == NIL)
 	{
 		*num_roles = 1;
-		role_oids = palloc_array(Datum, *num_roles);
+		role_oids = (Datum *) palloc(*num_roles * sizeof(Datum));
 		role_oids[0] = ObjectIdGetDatum(ACL_ID_PUBLIC);
 
 		return role_oids;
@@ -483,7 +474,7 @@ RemoveRoleFromObjectPolicy(Oid roleid, Oid classid, Oid policy_id)
 	 * Ordinarily there'd be exactly one, but we must cope with duplicate
 	 * mentions, since CREATE/ALTER POLICY historically have allowed that.
 	 */
-	role_oids = palloc_array(Datum, num_roles);
+	role_oids = (Datum *) palloc(num_roles * sizeof(Datum));
 	for (i = 0, j = 0; i < num_roles; i++)
 	{
 		if (roles[i] != roleid)
@@ -639,7 +630,7 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	table_id = RangeVarGetRelidExtended(stmt->table, AccessExclusiveLock,
 										0,
 										RangeVarCallbackForPolicy,
-										stmt);
+										(void *) stmt);
 
 	/* Open target_table to build quals. No additional lock is necessary. */
 	target_table = relation_open(table_id, NoLock);
@@ -815,7 +806,7 @@ AlterPolicy(AlterPolicyStmt *stmt)
 	table_id = RangeVarGetRelidExtended(stmt->table, AccessExclusiveLock,
 										0,
 										RangeVarCallbackForPolicy,
-										stmt);
+										(void *) stmt);
 
 	target_table = relation_open(table_id, NoLock);
 
@@ -957,7 +948,7 @@ AlterPolicy(AlterPolicyStmt *stmt)
 
 		nitems = ARR_DIMS(policy_roles)[0];
 
-		role_oids = palloc_array(Datum, nitems);
+		role_oids = (Datum *) palloc(nitems * sizeof(Datum));
 
 		for (i = 0; i < nitems; i++)
 			role_oids[i] = ObjectIdGetDatum(roles[i]);
@@ -1120,7 +1111,7 @@ rename_policy(RenameStmt *stmt)
 	table_id = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
 										0,
 										RangeVarCallbackForPolicy,
-										stmt);
+										(void *) stmt);
 
 	target_table = relation_open(table_id, NoLock);
 

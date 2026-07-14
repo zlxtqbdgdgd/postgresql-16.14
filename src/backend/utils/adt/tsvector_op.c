@@ -3,7 +3,7 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
-#include "common/int.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "lib/qunique.h"
@@ -29,6 +28,7 @@
 #include "tsearch/ts_utils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 
@@ -75,7 +75,7 @@ static bool TS_execute_locations_recurse(QueryItem *curitem,
 										 void *arg,
 										 TSExecuteCallback chkcond,
 										 List **locations);
-static int	tsvector_bsearch(const TSVectorData *tsv, char *lexeme, int lexeme_len);
+static int	tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len);
 static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
 
 
@@ -83,7 +83,7 @@ static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
  * Order: haspos, len, word, for all positions (pos, weight)
  */
 static int
-silly_cmp_tsvector(const TSVectorData *a, const TSVectorData *b)
+silly_cmp_tsvector(const TSVector a, const TSVector b)
 {
 	if (VARSIZE(a) < VARSIZE(b))
 		return -1;
@@ -95,8 +95,8 @@ silly_cmp_tsvector(const TSVectorData *a, const TSVectorData *b)
 		return 1;
 	else
 	{
-		const WordEntry *aptr = ARRPTR(a);
-		const WordEntry *bptr = ARRPTR(b);
+		WordEntry  *aptr = ARRPTR(a);
+		WordEntry  *bptr = ARRPTR(b);
 		int			i = 0;
 		int			res;
 
@@ -207,10 +207,17 @@ tsvector_length(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(ret);
 }
 
-static int
-parse_weight(char cw)
+Datum
+tsvector_setweight(PG_FUNCTION_ARGS)
 {
-	int			w;
+	TSVector	in = PG_GETARG_TSVECTOR(0);
+	char		cw = PG_GETARG_CHAR(1);
+	TSVector	out;
+	int			i,
+				j;
+	WordEntry  *entry;
+	WordEntryPos *p;
+	int			w = 0;
 
 	switch (cw)
 	{
@@ -231,32 +238,9 @@ parse_weight(char cw)
 			w = 0;
 			break;
 		default:
-			/* Avoid printing non-ASCII bytes, else we have encoding issues */
-			if (cw >= ' ' && cw < 0x7f)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized weight: \"%c\"", cw)));
-			else				/* use \ooo format, like charout() */
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized weight: \"\\%03o\"",
-								(unsigned char) cw)));
+			/* internal error */
+			elog(ERROR, "unrecognized weight: %d", cw);
 	}
-	return w;
-}
-
-
-Datum
-tsvector_setweight(PG_FUNCTION_ARGS)
-{
-	TSVector	in = PG_GETARG_TSVECTOR(0);
-	char		cw = PG_GETARG_CHAR(1);
-	TSVector	out;
-	int			i,
-				j;
-	WordEntry  *entry;
-	WordEntryPos *p;
-	int			w = parse_weight(cw);
 
 	out = (TSVector) palloc(VARSIZE(in));
 	memcpy(out, in, VARSIZE(in));
@@ -301,7 +285,28 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 	Datum	   *dlexemes;
 	bool	   *nulls;
 
-	weight = parse_weight(char_weight);
+	switch (char_weight)
+	{
+		case 'A':
+		case 'a':
+			weight = 3;
+			break;
+		case 'B':
+		case 'b':
+			weight = 2;
+			break;
+		case 'C':
+		case 'c':
+			weight = 1;
+			break;
+		case 'D':
+		case 'd':
+			weight = 0;
+			break;
+		default:
+			/* internal error */
+			elog(ERROR, "unrecognized weight: %c", char_weight);
+	}
 
 	tsout = (TSVector) palloc(VARSIZE(tsin));
 	memcpy(tsout, tsin, VARSIZE(tsin));
@@ -324,8 +329,8 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 		if (nulls[i])
 			continue;
 
-		lex = VARDATA(DatumGetPointer(dlexemes[i]));
-		lex_len = VARSIZE(DatumGetPointer(dlexemes[i])) - VARHDRSZ;
+		lex = VARDATA(dlexemes[i]);
+		lex_len = VARSIZE(dlexemes[i]) - VARHDRSZ;
 		lex_pos = tsvector_bsearch(tsout, lex, lex_len);
 
 		if (lex_pos >= 0 && (j = POSDATALEN(tsout, entry + lex_pos)) != 0)
@@ -392,9 +397,9 @@ add_pos(TSVector src, WordEntry *srcptr,
  * found.
  */
 static int
-tsvector_bsearch(const TSVectorData *tsv, char *lexeme, int lexeme_len)
+tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len)
 {
-	const WordEntry *arrin = ARRPTR(tsv);
+	WordEntry  *arrin = ARRPTR(tsv);
 	int			StopLow = 0,
 				StopHigh = tsv->size,
 				StopMiddle,
@@ -430,7 +435,9 @@ compare_int(const void *va, const void *vb)
 	int			a = *((const int *) va);
 	int			b = *((const int *) vb);
 
-	return pg_cmp_s32(a, b);
+	if (a == b)
+		return 0;
+	return (a > b) ? 1 : -1;
 }
 
 static int
@@ -438,10 +445,10 @@ compare_text_lexemes(const void *va, const void *vb)
 {
 	Datum		a = *((const Datum *) va);
 	Datum		b = *((const Datum *) vb);
-	char	   *alex = VARDATA_ANY(DatumGetPointer(a));
-	int			alex_len = VARSIZE_ANY_EXHDR(DatumGetPointer(a));
-	char	   *blex = VARDATA_ANY(DatumGetPointer(b));
-	int			blex_len = VARSIZE_ANY_EXHDR(DatumGetPointer(b));
+	char	   *alex = VARDATA_ANY(a);
+	int			alex_len = VARSIZE_ANY_EXHDR(a);
+	char	   *blex = VARDATA_ANY(b);
+	int			blex_len = VARSIZE_ANY_EXHDR(b);
 
 	return tsCompareString(alex, alex_len, blex, blex_len, false);
 }
@@ -600,8 +607,8 @@ tsvector_delete_arr(PG_FUNCTION_ARGS)
 		if (nulls[i])
 			continue;
 
-		lex = VARDATA(DatumGetPointer(dlexemes[i]));
-		lex_len = VARSIZE(DatumGetPointer(dlexemes[i])) - VARHDRSZ;
+		lex = VARDATA(dlexemes[i]);
+		lex_len = VARSIZE(dlexemes[i]) - VARHDRSZ;
 		lex_pos = tsvector_bsearch(tsin, lex, lex_len);
 
 		if (lex_pos >= 0)
@@ -646,7 +653,6 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 						   TEXTARRAYOID, -1, 0);
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
-		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = tupdesc;
 
 		funcctx->user_fctx = PG_GETARG_TSVECTOR_COPY(0);
@@ -766,7 +772,7 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("lexeme array may not contain nulls")));
 
-		if (VARSIZE(DatumGetPointer(dlexemes[i])) - VARHDRSZ == 0)
+		if (VARSIZE(dlexemes[i]) - VARHDRSZ == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_ZERO_LENGTH_CHARACTER_STRING),
 					 errmsg("lexeme array may not contain empty strings")));
@@ -782,7 +788,7 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 
 	/* Calculate space needed for surviving lexemes. */
 	for (i = 0; i < nitems; i++)
-		datalen += VARSIZE(DatumGetPointer(dlexemes[i])) - VARHDRSZ;
+		datalen += VARSIZE(dlexemes[i]) - VARHDRSZ;
 	tslen = CALCDATASIZE(nitems, datalen);
 
 	/* Allocate and fill tsvector. */
@@ -794,8 +800,8 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 	cur = STRPTR(tsout);
 	for (i = 0; i < nitems; i++)
 	{
-		char	   *lex = VARDATA(DatumGetPointer(dlexemes[i]));
-		int			lex_len = VARSIZE(DatumGetPointer(dlexemes[i])) - VARHDRSZ;
+		char	   *lex = VARDATA(dlexemes[i]);
+		int			lex_len = VARSIZE(dlexemes[i]) - VARHDRSZ;
 
 		memcpy(cur, lex, lex_len);
 		arrout[i].haspos = 0;
@@ -841,7 +847,29 @@ tsvector_filter(PG_FUNCTION_ARGS)
 					 errmsg("weight array may not contain nulls")));
 
 		char_weight = DatumGetChar(dweights[i]);
-		mask |= 1 << parse_weight(char_weight);
+		switch (char_weight)
+		{
+			case 'A':
+			case 'a':
+				mask = mask | 8;
+				break;
+			case 'B':
+			case 'b':
+				mask = mask | 4;
+				break;
+			case 'C':
+			case 'c':
+				mask = mask | 2;
+				break;
+			case 'D':
+			case 'd':
+				mask = mask | 1;
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"%c\"", char_weight)));
+		}
 	}
 
 	tsout = (TSVector) palloc0(VARSIZE(tsin));
@@ -1186,7 +1214,7 @@ checkclass_str(CHKVAL *chkval, WordEntry *entry, QueryOperand *val,
 			/*
 			 * Filter position information by weights
 			 */
-			dptr = data->pos = palloc_array(WordEntryPos, posvec->npos);
+			dptr = data->pos = palloc(sizeof(WordEntryPos) * posvec->npos);
 			data->allocated = true;
 
 			/* Is there a position with a matching weight? */
@@ -1365,12 +1393,12 @@ checkcondition_str(void *checkval, QueryOperand *val, ExecPhraseData *data)
 						if (totalpos == 0)
 						{
 							totalpos = 256;
-							allpos = palloc_array(WordEntryPos, totalpos);
+							allpos = palloc(sizeof(WordEntryPos) * totalpos);
 						}
 						else
 						{
 							totalpos *= 2;
-							allpos = repalloc_array(allpos, WordEntryPos, totalpos);
+							allpos = repalloc(allpos, sizeof(WordEntryPos) * totalpos);
 						}
 					}
 
@@ -2426,11 +2454,11 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 	MemoryContext oldcontext;
 	StatEntry  *node;
 
-	funcctx->user_fctx = stat;
+	funcctx->user_fctx = (void *) stat;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-	stat->stack = palloc0_array(StatEntry *, stat->maxdepth + 1);
+	stat->stack = palloc0(sizeof(StatEntry *) * (stat->maxdepth + 1));
 	stat->stackpos = 0;
 
 	node = stat->root;
@@ -2817,7 +2845,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 	prs.lenwords = 32;
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = palloc_array(ParsedWord, prs.lenwords);
+	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
 	/* find all words in indexable column(s) */
 	for (i = 2; i < trigger->tgnargs; i++)

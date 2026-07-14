@@ -3,12 +3,9 @@
 #include "fmgr.h"
 #include "hstore/hstore.h"
 #include "plpy_typeio.h"
-#include "plpy_util.h"
+#include "plpython.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "hstore_plpython",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /* Linkage to functions in plpython module */
 typedef char *(*PLyObject_AsString_t) (PyObject *plrv);
@@ -28,15 +25,6 @@ static hstoreCheckKeyLen_t hstoreCheckKeyLen_p;
 typedef size_t (*hstoreCheckValLen_t) (size_t len);
 static hstoreCheckValLen_t hstoreCheckValLen_p;
 
-/* Static asserts verify that typedefs above match original declarations */
-StaticAssertVariableIsOfType(&PLyObject_AsString, PLyObject_AsString_t);
-StaticAssertVariableIsOfType(&PLyUnicode_FromStringAndSize, PLyUnicode_FromStringAndSize_t);
-StaticAssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
-StaticAssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
-StaticAssertVariableIsOfType(&hstorePairs, hstorePairs_t);
-StaticAssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
-StaticAssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
-
 
 /*
  * Module initialize function: fetch function pointers for cross-module calls.
@@ -44,24 +32,32 @@ StaticAssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
 void
 _PG_init(void)
 {
+	/* Asserts verify that typedefs above match original declarations */
+	AssertVariableIsOfType(&PLyObject_AsString, PLyObject_AsString_t);
 	PLyObject_AsString_p = (PLyObject_AsString_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyObject_AsString",
 							   true, NULL);
+	AssertVariableIsOfType(&PLyUnicode_FromStringAndSize, PLyUnicode_FromStringAndSize_t);
 	PLyUnicode_FromStringAndSize_p = (PLyUnicode_FromStringAndSize_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyUnicode_FromStringAndSize",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
 	hstoreUpgrade_p = (hstoreUpgrade_t)
 		load_external_function("$libdir/hstore", "hstoreUpgrade",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
 	hstoreUniquePairs_p = (hstoreUniquePairs_t)
 		load_external_function("$libdir/hstore", "hstoreUniquePairs",
 							   true, NULL);
+	AssertVariableIsOfType(&hstorePairs, hstorePairs_t);
 	hstorePairs_p = (hstorePairs_t)
 		load_external_function("$libdir/hstore", "hstorePairs",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
 	hstoreCheckKeyLen_p = (hstoreCheckKeyLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckKeyLen",
 							   true, NULL);
+	AssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
 	hstoreCheckValLen_p = (hstoreCheckValLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckValLen",
 							   true, NULL);
@@ -143,16 +139,7 @@ plpython_to_hstore(PG_FUNCTION_ARGS)
 				 errmsg("not a Python mapping")));
 
 	pcount = PyMapping_Size(dict);
-	if (pcount < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("could not get size of Python mapping")));
-
 	items = PyMapping_Items(dict);
-	if (items == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("could not get items from Python mapping")));
 
 	PG_TRY();
 	{
@@ -169,13 +156,6 @@ plpython_to_hstore(PG_FUNCTION_ARGS)
 			PyObject   *value;
 
 			tuple = PyList_GetItem(items, i);
-
-			/* The mapping's items() must yield key/value pairs */
-			if (tuple == NULL || !PyTuple_Check(tuple) || PyTuple_Size(tuple) < 2)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("items() of a Python mapping must return key/value pairs")));
-
 			key = PyTuple_GetItem(tuple, 0);
 			value = PyTuple_GetItem(tuple, 1);
 

@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -22,9 +22,7 @@ $node->issues_sql_like(
 	qr/statement: DROP ROLE regress_foobar1/,
 	'SQL DROP ROLE run');
 
-$node->command_fails_like(
-	[ 'dropuser', 'regress_nonexistent' ],
-	qr/role "regress_nonexistent" does not exist/,
+$node->command_fails([ 'dropuser', 'regress_nonexistent' ],
 	'fails with nonexistent user');
 
 done_testing();

@@ -1,9 +1,9 @@
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Tests for already-propagated WAL segments ending in incomplete WAL records.
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use FindBin;
 use PostgreSQL::Test::Cluster;
@@ -39,7 +39,7 @@ DECLARE
 BEGIN
     LOOP
         INSERT into filler
-        select g, repeat(encode(sha256(g::text::bytea), 'hex'), (random() * 15 + 1)::int)
+        select g, repeat(md5(g::text), (random() * 60 + 1)::int)
         from generate_series(1, 10) g;
 
         remain := wal_segsize - (pg_current_wal_insert_lsn() - '0/0') % wal_segsize;
@@ -58,7 +58,7 @@ my $initfile = $node->safe_psql('postgres',
 $node->safe_psql('postgres',
 	qq{SELECT pg_logical_emit_message(true, 'test 026', repeat('xyzxz', 123456))}
 );
-
+#$node->safe_psql('postgres', qq{create table foo ()});
 my $endfile = $node->safe_psql('postgres',
 	'SELECT pg_walfile_name(pg_current_wal_insert_lsn())');
 ok($initfile ne $endfile, "$initfile differs from $endfile");

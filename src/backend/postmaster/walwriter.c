@@ -31,7 +31,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -48,21 +48,20 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walwriter.h"
-#include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
-#include "utils/wait_event.h"
 
 
 /*
@@ -79,6 +78,9 @@ int			WalWriterFlushAfter = DEFAULT_WAL_WRITER_FLUSH_AFTER;
 #define LOOPS_UNTIL_HIBERNATE		50
 #define HIBERNATE_FACTOR			25
 
+/* Prototypes for private functions */
+static void HandleWalWriterInterrupts(void);
+
 /*
  * Main entry point for walwriter process
  *
@@ -86,33 +88,32 @@ int			WalWriterFlushAfter = DEFAULT_WAL_WRITER_FLUSH_AFTER;
  * basic execution environment, but not enabled signals yet.
  */
 void
-WalWriterMain(const void *startup_data, size_t startup_data_len)
+WalWriterMain(void)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext walwriter_context;
 	int			left_till_hibernate;
 	bool		hibernating;
 
-	Assert(startup_data_len == 0);
-
-	AuxiliaryProcessMainCommon();
-
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
+	 *
+	 * We have no particular use for SIGINT at the moment, but seems
+	 * reasonable to treat like SIGTERM.
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGINT, PG_SIG_IGN);	/* no query to cancel */
+	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	/* SIGQUIT handler was already set up by InitPostmasterChild */
-	pqsignal(SIGALRM, PG_SIG_IGN);
-	pqsignal(SIGPIPE, PG_SIG_IGN);
+	pqsignal(SIGALRM, SIG_IGN);
+	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
-	pqsignal(SIGUSR2, PG_SIG_IGN);	/* not used */
+	pqsignal(SIGUSR2, SIG_IGN); /* not used */
 
 	/*
 	 * Reset some signals that are accepted by postmaster but not here
 	 */
-	pqsignal(SIGCHLD, PG_SIG_DFL);
+	pqsignal(SIGCHLD, SIG_DFL);
 
 	/*
 	 * Create a memory context that we will do all our work in.  We do this so
@@ -162,7 +163,6 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
-		pgaio_error_cleanup();
 		UnlockBuffers();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
@@ -178,7 +178,7 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 		FlushErrorState();
 
 		/* Flush any leaked data in the top-level context */
-		MemoryContextReset(walwriter_context);
+		MemoryContextResetAndDeleteChildren(walwriter_context);
 
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
@@ -189,6 +189,13 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 		 * fast as we can.
 		 */
 		pg_usleep(1000000L);
+
+		/*
+		 * Close all open files after any error.  This is helpful on Windows,
+		 * where holding deleted files open causes various strange errors.
+		 * It's not clear we need it elsewhere, but shouldn't hurt.
+		 */
+		smgrcloseall();
 	}
 
 	/* We can now handle ereport(ERROR) */
@@ -205,6 +212,12 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 	left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
 	hibernating = false;
 	SetWalWriterSleeping(false);
+
+	/*
+	 * Advertise our latch that backends can use to wake us up while we're
+	 * sleeping.
+	 */
+	ProcGlobal->walwriterLatch = &MyProc->procLatch;
 
 	/*
 	 * Loop forever
@@ -232,7 +245,7 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 		ResetLatch(MyLatch);
 
 		/* Process any signals received recently */
-		ProcessMainLoopInterrupts();
+		HandleWalWriterInterrupts();
 
 		/*
 		 * Do what we're here for; then, if XLogBackgroundFlush() found useful
@@ -261,4 +274,27 @@ WalWriterMain(const void *startup_data, size_t startup_data_len)
 						 cur_timeout,
 						 WAIT_EVENT_WAL_WRITER_MAIN);
 	}
+}
+
+/*
+ * Interrupt handler for main loops of WAL writer process.
+ */
+static void
+HandleWalWriterInterrupts(void)
+{
+	if (ProcSignalBarrierPending)
+		ProcessProcSignalBarrier();
+
+	if (ConfigReloadPending)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+	}
+
+	if (ShutdownRequestPending)
+		proc_exit(0);
+
+	/* Perform logging of memory contexts of this process */
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
 }

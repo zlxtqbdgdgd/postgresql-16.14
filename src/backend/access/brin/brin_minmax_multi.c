@@ -2,7 +2,7 @@
  * brin_minmax_multi.c
  *		Implementation of Multi Min/Max opclass for BRIN
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,16 +59,16 @@
 /* needed for PGSQL_AF_INET */
 #include <sys/socket.h>
 
+#include "access/genam.h"
 #include "access/brin.h"
 #include "access/brin_internal.h"
 #include "access/brin_tuple.h"
-#include "access/genam.h"
-#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
+#include "access/htup_details.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
-#include "catalog/pg_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -77,6 +77,7 @@
 #include "utils/inet.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -130,6 +131,8 @@ typedef struct MinMaxMultiOptions
 		((opts) && (((MinMaxMultiOptions *) (opts))->valuesPerRange != 0) ? \
 		 ((MinMaxMultiOptions *) (opts))->valuesPerRange : \
 		 MINMAX_MULTI_DEFAULT_VALUES_PER_PAGE)
+
+#define SAMESIGN(a,b) (((a) < 0) == ((b) < 0))
 
 /*
  * The summary of minmax-multi indexes has two representations - Ranges for
@@ -274,7 +277,7 @@ static int	compare_values(const void *a, const void *b, void *arg);
  * function (which should be BTLessStrategyNumber).
  */
 static void
-AssertArrayOrder(FmgrInfo *cmp, Oid colloid, const Datum *values, int nvalues)
+AssertArrayOrder(FmgrInfo *cmp, Oid colloid, Datum *values, int nvalues)
 {
 	int			i;
 	Datum		lt;
@@ -410,7 +413,7 @@ AssertCheckRanges(Ranges *ranges, FmgrInfo *cmpFn, Oid colloid)
 
 			Assert(bsearch_arg(&value, &ranges->values[2 * ranges->nranges],
 							   ranges->nsorted, sizeof(Datum),
-							   compare_values, &cxt) == NULL);
+							   compare_values, (void *) &cxt) == NULL);
 		}
 	}
 #endif
@@ -547,7 +550,7 @@ range_deduplicate_values(Ranges *range)
 		/* same as preceding value, so store it */
 		if (compare_values(&range->values[start + i - 1],
 						   &range->values[start + i],
-						   &cxt) == 0)
+						   (void *) &cxt) == 0)
 			continue;
 
 		range->values[start + n] = range->values[start + i];
@@ -622,7 +625,7 @@ brin_range_serialize(Ranges *range)
 
 		for (i = 0; i < nvalues; i++)
 		{
-			len += VARSIZE_ANY(DatumGetPointer(range->values[i]));
+			len += VARSIZE_ANY(range->values[i]);
 		}
 	}
 	else if (typlen == -2)		/* cstring */
@@ -710,7 +713,7 @@ brin_range_serialize(Ranges *range)
 
 /*
  * brin_range_deserialize
- *	  Deserialize a compact varlena value into the in-memory representation.
+ *	  Serialize the in-memory representation into a compact varlena value.
  *
  * Simply copy the header and then also the individual values, as stored
  * in the in-memory value array.
@@ -855,8 +858,8 @@ brin_range_deserialize(int maxvalues, SerializedRanges *serialized)
 static int
 compare_expanded_ranges(const void *a, const void *b, void *arg)
 {
-	const ExpandedRange *ra = a;
-	const ExpandedRange *rb = b;
+	ExpandedRange *ra = (ExpandedRange *) a;
+	ExpandedRange *rb = (ExpandedRange *) b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -893,8 +896,8 @@ compare_expanded_ranges(const void *a, const void *b, void *arg)
 static int
 compare_values(const void *a, const void *b, void *arg)
 {
-	const Datum *da = a;
-	const Datum *db = b;
+	Datum	   *da = (Datum *) a;
+	Datum	   *db = (Datum *) b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -1082,7 +1085,7 @@ range_contains_value(BrinDesc *bdesc, Oid colloid,
 
 		if (bsearch_arg(&newval, &ranges->values[2 * ranges->nranges],
 						ranges->nsorted, sizeof(Datum),
-						compare_values, &cxt) != NULL)
+						compare_values, (void *) &cxt) != NULL)
 			return true;
 	}
 	else
@@ -1203,7 +1206,7 @@ sort_expanded_ranges(FmgrInfo *cmp, Oid colloid,
 	for (i = 1; i < neranges; i++)
 	{
 		/* if the current range is equal to the preceding one, do nothing */
-		if (!compare_expanded_ranges(&eranges[i - 1], &eranges[i], &cxt))
+		if (!compare_expanded_ranges(&eranges[i - 1], &eranges[i], (void *) &cxt))
 			continue;
 
 		/* otherwise, copy it to n-th place (if not already there) */
@@ -1302,8 +1305,8 @@ merge_overlapping_ranges(FmgrInfo *cmp, Oid colloid,
 static int
 compare_distances(const void *a, const void *b)
 {
-	const DistanceValue *da = a;
-	const DistanceValue *db = b;
+	DistanceValue *da = (DistanceValue *) a;
+	DistanceValue *db = (DistanceValue *) b;
 
 	if (da->value < db->value)
 		return 1;
@@ -1338,7 +1341,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 		return NULL;
 
 	ndistances = (neranges - 1);
-	distances = palloc0_array(DistanceValue, ndistances);
+	distances = (DistanceValue *) palloc0(sizeof(DistanceValue) * ndistances);
 
 	/*
 	 * Walk through the ranges once and compute the distance between the
@@ -1365,7 +1368,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 	 * Sort the distances in descending order, so that the longest gaps are at
 	 * the front.
 	 */
-	qsort(distances, ndistances, sizeof(DistanceValue), compare_distances);
+	pg_qsort(distances, ndistances, sizeof(DistanceValue), compare_distances);
 
 	return distances;
 }
@@ -1502,7 +1505,7 @@ reduce_expanded_ranges(ExpandedRange *eranges, int neranges,
 
 	/* allocate space for the boundary values */
 	nvalues = 0;
-	values = palloc_array(Datum, max_values);
+	values = (Datum *) palloc(sizeof(Datum) * max_values);
 
 	/* add the global min/max values, from the first/last range */
 	values[nvalues++] = eranges[0].minval;
@@ -1656,9 +1659,6 @@ ensure_free_space_in_buffer(BrinDesc *bdesc, Oid colloid,
 	/* build the expanded ranges */
 	eranges = build_expanded_ranges(cmpFn, colloid, range, &neranges);
 
-	/* Is the expanded representation of ranges correct? */
-	AssertCheckExpandedRanges(bdesc, colloid, attno, attr, eranges, neranges);
-
 	/* and we'll also need the 'distance' procedure */
 	distanceFn = minmax_multi_get_procinfo(bdesc, attno, PROCNUM_DISTANCE);
 
@@ -1673,9 +1673,6 @@ ensure_free_space_in_buffer(BrinDesc *bdesc, Oid colloid,
 	neranges = reduce_expanded_ranges(eranges, neranges, distances,
 									  range->maxvalues * MINMAX_BUFFER_LOAD_FACTOR,
 									  cmpFn, colloid);
-
-	/* Is the result of reducing expanded ranges correct? */
-	AssertCheckExpandedRanges(bdesc, colloid, attno, attr, eranges, neranges);
 
 	/* Make sure we've sufficiently reduced the number of ranges. */
 	Assert(count_values(eranges, neranges) <= range->maxvalues * MINMAX_BUFFER_LOAD_FACTOR);
@@ -1990,8 +1987,8 @@ brin_minmax_multi_distance_tid(PG_FUNCTION_ARGS)
 	double		da1,
 				da2;
 
-	ItemPointer pa1 = (ItemPointer) PG_GETARG_POINTER(0);
-	ItemPointer pa2 = (ItemPointer) PG_GETARG_POINTER(1);
+	ItemPointer pa1 = (ItemPointer) PG_GETARG_DATUM(0);
+	ItemPointer pa2 = (ItemPointer) PG_GETARG_DATUM(1);
 
 	/*
 	 * We know the values are range boundaries, but the range may be collapsed
@@ -2412,7 +2409,7 @@ brin_minmax_multi_add_value(PG_FUNCTION_ARGS)
 	BrinDesc   *bdesc = (BrinDesc *) PG_GETARG_POINTER(0);
 	BrinValues *column = (BrinValues *) PG_GETARG_POINTER(1);
 	Datum		newval = PG_GETARG_DATUM(2);
-	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_BOOL(3);
+	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_DATUM(3);
 	MinMaxMultiOptions *opts = (MinMaxMultiOptions *) PG_GET_OPCLASS_OPTIONS();
 	Oid			colloid = PG_GET_COLLATION();
 	bool		modified = false;
@@ -2578,7 +2575,7 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 
 		for (keyno = 0; keyno < nkeys; keyno++)
 		{
-			bool		matches;
+			Datum		matches;
 			ScanKey		key = keys[keyno];
 
 			/* NULL keys are handled and filtered-out in bringetbitmap */
@@ -2594,7 +2591,7 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 					finfo = minmax_multi_get_strategy_procinfo(bdesc, attno, subtype,
 															   key->sk_strategy);
 					/* first value from the array */
-					matches = DatumGetBool(FunctionCall2Coll(finfo, colloid, minval, value));
+					matches = FunctionCall2Coll(finfo, colloid, minval, value);
 					break;
 
 				case BTEqualStrategyNumber:
@@ -2640,18 +2637,18 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 					finfo = minmax_multi_get_strategy_procinfo(bdesc, attno, subtype,
 															   key->sk_strategy);
 					/* last value from the array */
-					matches = DatumGetBool(FunctionCall2Coll(finfo, colloid, maxval, value));
+					matches = FunctionCall2Coll(finfo, colloid, maxval, value);
 					break;
 
 				default:
 					/* shouldn't happen */
 					elog(ERROR, "invalid strategy number %d", key->sk_strategy);
-					matches = false;
+					matches = 0;
 					break;
 			}
 
 			/* the range has to match all the scan keys */
-			matching &= matches;
+			matching &= DatumGetBool(matches);
 
 			/* once we find a non-matching key, we're done */
 			if (!matching)
@@ -2662,7 +2659,7 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 		 * have we found a range matching all scan keys? if yes, we're done
 		 */
 		if (matching)
-			PG_RETURN_BOOL(true);
+			PG_RETURN_DATUM(BoolGetDatum(true));
 	}
 
 	/*
@@ -2679,7 +2676,7 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 
 		for (keyno = 0; keyno < nkeys; keyno++)
 		{
-			bool		matches;
+			Datum		matches;
 			ScanKey		key = keys[keyno];
 
 			/* we've already dealt with NULL keys at the beginning */
@@ -2699,18 +2696,18 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 
 					finfo = minmax_multi_get_strategy_procinfo(bdesc, attno, subtype,
 															   key->sk_strategy);
-					matches = DatumGetBool(FunctionCall2Coll(finfo, colloid, val, value));
+					matches = FunctionCall2Coll(finfo, colloid, val, value);
 					break;
 
 				default:
 					/* shouldn't happen */
 					elog(ERROR, "invalid strategy number %d", key->sk_strategy);
-					matches = false;
+					matches = 0;
 					break;
 			}
 
 			/* the range has to match all the scan keys */
-			matching &= matches;
+			matching &= DatumGetBool(matches);
 
 			/* once we find a non-matching key, we're done */
 			if (!matching)
@@ -2719,10 +2716,10 @@ brin_minmax_multi_consistent(PG_FUNCTION_ARGS)
 
 		/* have we found a range matching all scan keys? if yes, we're done */
 		if (matching)
-			PG_RETURN_BOOL(true);
+			PG_RETURN_DATUM(BoolGetDatum(true));
 	}
 
-	PG_RETURN_BOOL(false);
+	PG_RETURN_DATUM(BoolGetDatum(false));
 }
 
 /*
@@ -2835,9 +2832,6 @@ brin_minmax_multi_union(PG_FUNCTION_ARGS)
 									  ranges_a->maxvalues,
 									  cmpFn, colloid);
 
-	/* Is the result of reducing expanded ranges correct? */
-	AssertCheckExpandedRanges(bdesc, colloid, attno, attr, eranges, neranges);
-
 	/* update the first range summary */
 	store_expanded_ranges(ranges_a, eranges, neranges);
 
@@ -2930,7 +2924,7 @@ minmax_multi_get_strategy_procinfo(BrinDesc *bdesc, uint16 attno, Oid subtype,
 		tuple = SearchSysCache4(AMOPSTRATEGY, ObjectIdGetDatum(opfamily),
 								ObjectIdGetDatum(attr->atttypid),
 								ObjectIdGetDatum(subtype),
-								UInt16GetDatum(strategynum));
+								Int16GetDatum(strategynum));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
 				 strategynum, attr->atttypid, subtype, opfamily);

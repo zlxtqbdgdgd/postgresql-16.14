@@ -5,7 +5,7 @@
 # This makefile generates a static library, libpgfeutils.a,
 # for use by client applications
 #
-# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # IDENTIFICATION
@@ -21,11 +21,6 @@ override CPPFLAGS := -DFRONTEND -I$(libpq_srcdir) $(CPPFLAGS)
 
 OBJS = \
 	archive.o \
-	astreamer_file.o \
-	astreamer_gzip.o \
-	astreamer_lz4.o \
-	astreamer_tar.o \
-	astreamer_zstd.o \
 	cancel.o \
 	conditional.o \
 	connect_utils.o \
@@ -37,8 +32,7 @@ OBJS = \
 	query_utils.o \
 	recovery_gen.o \
 	simple_list.o \
-	string_utils.o \
-	version.o
+	string_utils.o
 
 ifeq ($(PORTNAME), win32)
 override CPPFLAGS += -DFD_SETSIZE=1024
@@ -52,6 +46,9 @@ libpgfeutils.a: $(OBJS)
 
 psqlscan.c: FLEXFLAGS = -Cfe -p -p
 psqlscan.c: FLEX_NO_BACKUP=yes
+psqlscan.c: FLEX_FIX_WARNING=yes
+
+distprep: psqlscan.c
 
 # libpgfeutils could be useful to contrib, so install it
 install: all installdirs
@@ -65,4 +62,8 @@ uninstall:
 
 clean distclean:
 	rm -f libpgfeutils.a $(OBJS) lex.backup
+
+# psqlscan.c is supposed to be in the distribution tarball,
+# so do not clean it in the clean/distclean rules
+maintainer-clean: distclean
 	rm -f psqlscan.c

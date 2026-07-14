@@ -46,7 +46,7 @@ int_custom_in(PG_FUNCTION_ARGS)
 {
 	char	   *num = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_INT32(pg_strtoint32_safe(num, fcinfo->context));
+	PG_RETURN_INT32(pg_strtoint32(num));
 }
 
 /*
@@ -96,10 +96,12 @@ Datum
 int_custom_typanalyze_invalid(PG_FUNCTION_ARGS)
 {
 	VacAttrStats *stats = (VacAttrStats *) PG_GETARG_POINTER(0);
+	Form_pg_attribute attr = stats->attr;
 
 	/* If the attstattarget column is negative, use the default value */
-	if (stats->attstattarget < 0)
-		stats->attstattarget = default_statistics_target;
+	/* NB: it is okay to scribble on stats->attr since it's a copy */
+	if (attr->attstattarget < 0)
+		attr->attstattarget = default_statistics_target;
 
 	/* Buggy number, no need to care as long as it is positive */
 	stats->minrows = 300;

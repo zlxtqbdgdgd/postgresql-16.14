@@ -4,7 +4,7 @@
  *	 Routines for archivers to write an uncompressed or compressed data
  *	 stream.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * This file includes two APIs for dealing with compressed data. The first
@@ -70,6 +70,7 @@
 #include "compress_lz4.h"
 #include "compress_none.h"
 #include "compress_zstd.h"
+#include "pg_backup_utils.h"
 
 /*----------------------
  * Generic functions
@@ -125,7 +126,7 @@ AllocateCompressor(const pg_compress_specification compression_spec,
 {
 	CompressorState *cs;
 
-	cs = pg_malloc0_object(CompressorState);
+	cs = (CompressorState *) pg_malloc0(sizeof(CompressorState));
 	cs->readF = readF;
 	cs->writeF = writeF;
 
@@ -195,7 +196,7 @@ InitCompressFileHandle(const pg_compress_specification compression_spec)
 {
 	CompressFileHandle *CFH;
 
-	CFH = pg_malloc0_object(CompressFileHandle);
+	CFH = pg_malloc0(sizeof(CompressFileHandle));
 
 	if (compression_spec.algorithm == PG_COMPRESSION_NONE)
 		InitCompressFileHandleNone(CFH, compression_spec);

@@ -3,7 +3,7 @@
  * jsonlog.c
  *	  JSON logging
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,21 +16,23 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "libpq/libpq-be.h"
+#include "libpq/libpq.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/syslogger.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/backend_status.h"
+#include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/ps_status.h"
 
 static void appendJSONKeyValueFmt(StringInfo buf, const char *key,
 								  bool escape_key,
-								  const char *fmt, ...) pg_attribute_printf(4, 5);
+								  const char *fmt,...) pg_attribute_printf(4, 5);
 
 /*
  * appendJSONKeyValue
@@ -68,7 +70,7 @@ appendJSONKeyValue(StringInfo buf, const char *key, const char *value,
  */
 static void
 appendJSONKeyValueFmt(StringInfo buf, const char *key,
-					  bool escape_key, const char *fmt, ...)
+					  bool escape_key, const char *fmt,...)
 {
 	int			save_errno = errno;
 	size_t		len = 128;		/* initial assumption about buffer size */
@@ -168,7 +170,7 @@ write_jsonlog(ErrorData *edata)
 	}
 
 	/* Session id */
-	appendJSONKeyValueFmt(&buf, "session_id", true, "%" PRIx64 ".%x",
+	appendJSONKeyValueFmt(&buf, "session_id", true, "%" INT64_MODIFIER "x.%x",
 						  MyStartTime, MyProcPid);
 
 	/* Line number */
@@ -195,9 +197,9 @@ write_jsonlog(ErrorData *edata)
 
 	/* Virtual transaction id */
 	/* keep VXID format in sync with lockfuncs.c */
-	if (MyProc != NULL && MyProc->vxid.procNumber != INVALID_PROC_NUMBER)
-		appendJSONKeyValueFmt(&buf, "vxid", true, "%d/%u",
-							  MyProc->vxid.procNumber, MyProc->vxid.lxid);
+	if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
+		appendJSONKeyValueFmt(&buf, "vxid", true, "%d/%u", MyProc->backendId,
+							  MyProc->lxid);
 
 	/* Transaction id */
 	appendJSONKeyValueFmt(&buf, "txid", false, "%u",
@@ -206,7 +208,7 @@ write_jsonlog(ErrorData *edata)
 	/* Error severity */
 	if (edata->elevel)
 		appendJSONKeyValue(&buf, "error_severity",
-						   error_severity(edata->elevel), true);
+						   (char *) error_severity(edata->elevel), true);
 
 	/* SQL state code */
 	if (edata->sqlerrcode)
@@ -284,15 +286,15 @@ write_jsonlog(ErrorData *edata)
 	}
 
 	/* query id */
-	appendJSONKeyValueFmt(&buf, "query_id", false, "%" PRId64,
-						  pgstat_get_my_query_id());
+	appendJSONKeyValueFmt(&buf, "query_id", false, "%lld",
+						  (long long) pgstat_get_my_query_id());
 
 	/* Finish string */
 	appendStringInfoChar(&buf, '}');
 	appendStringInfoChar(&buf, '\n');
 
 	/* If in the syslogger process, try to write messages direct to file */
-	if (syslogger_setup_done)
+	if (MyBackendType == B_LOGGER)
 		write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_JSONLOG);
 	else
 		write_pipe_chunks(buf.data, buf.len, LOG_DESTINATION_JSONLOG);

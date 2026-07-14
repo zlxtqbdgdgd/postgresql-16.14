@@ -4,7 +4,7 @@
  *	  definition of the "access method" system catalog (pg_am)
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_am.h
@@ -19,15 +19,13 @@
 #define PG_AM_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_am_d.h"	/* IWYU pragma: export */
+#include "catalog/pg_am_d.h"
 
 /* ----------------
  *		pg_am definition.  cpp turns this into
  *		typedef struct FormData_pg_am
  * ----------------
  */
-BEGIN_CATALOG_STRUCT
-
 CATALOG(pg_am,2601,AccessMethodRelationId)
 {
 	Oid			oid;			/* oid */
@@ -42,8 +40,6 @@ CATALOG(pg_am,2601,AccessMethodRelationId)
 	char		amtype;
 } FormData_pg_am;
 
-END_CATALOG_STRUCT
-
 /* ----------------
  *		Form_pg_am corresponds to a pointer to a tuple with
  *		the format of pg_am relation.
@@ -51,11 +47,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_am *Form_pg_am;
 
-DECLARE_UNIQUE_INDEX(pg_am_name_index, 2651, AmNameIndexId, pg_am, btree(amname name_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_am_oid_index, 2652, AmOidIndexId, pg_am, btree(oid oid_ops));
-
-MAKE_SYSCACHE(AMNAME, pg_am_name_index, 4);
-MAKE_SYSCACHE(AMOID, pg_am_oid_index, 4);
+DECLARE_UNIQUE_INDEX(pg_am_name_index, 2651, AmNameIndexId, on pg_am using btree(amname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_am_oid_index, 2652, AmOidIndexId, on pg_am using btree(oid oid_ops));
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 

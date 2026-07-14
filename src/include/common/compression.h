@@ -4,7 +4,7 @@
  *
  * Shared definitions for compression methods and specifications.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/include/common/compression.h
@@ -23,7 +23,7 @@ typedef enum pg_compress_algorithm
 	PG_COMPRESSION_NONE,
 	PG_COMPRESSION_GZIP,
 	PG_COMPRESSION_LZ4,
-	PG_COMPRESSION_ZSTD,
+	PG_COMPRESSION_ZSTD
 } pg_compress_algorithm;
 
 #define PG_COMPRESSION_OPTION_WORKERS		(1 << 0)
@@ -41,8 +41,6 @@ typedef struct pg_compress_specification
 
 extern void parse_compress_options(const char *option, char **algorithm,
 								   char **detail);
-extern bool parse_tar_compress_algorithm(const char *fname,
-										 pg_compress_algorithm *algorithm);
 extern bool parse_compress_algorithm(char *name, pg_compress_algorithm *algorithm);
 extern const char *get_compress_algorithm_name(pg_compress_algorithm algorithm);
 

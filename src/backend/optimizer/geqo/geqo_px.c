@@ -11,13 +11,12 @@
 *-------------------------------------------------------------------------
 */
 
-/*
- * contributed by:
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
- * *  Martin Utesch				 * Institute of Automatic Control	   *
- * =							 = University of Mining and Technology =
- * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/* contributed by:
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+   *  Martin Utesch				 * Institute of Automatic Control	   *
+   =							 = University of Mining and Technology =
+   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* the px algorithm is adopted from Genitor : */
@@ -35,15 +34,12 @@
 /*************************************************************/
 
 #include "postgres.h"
-#include "optimizer/geqo.h"
-
-#if defined(PX)
-
 #include "optimizer/geqo_random.h"
 #include "optimizer/geqo_recombination.h"
 
-/*
- * px
+#if defined(PX)
+
+/* px
  *
  *	 position crossover
  */

@@ -3,7 +3,7 @@
  * varchar.c
  *	  Functions for the built-in types char(n) and varchar(n).
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,6 +25,7 @@
 #include "nodes/supportnodes.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/varlena.h"
 
@@ -158,8 +159,8 @@ bpchar_input(const char *s, size_t len, int32 atttypmod, Node *escontext)
 				if (s[j] != ' ')
 					ereturn(escontext, NULL,
 							(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-							 errmsg("value too long for type character(%zu)",
-									maxlen)));
+							 errmsg("value too long for type character(%d)",
+									(int) maxlen)));
 			}
 
 			/*
@@ -307,7 +308,7 @@ bpchar(PG_FUNCTION_ARGS)
 		{
 			for (i = maxmblen; i < len; i++)
 				if (s[i] != ' ')
-					ereturn(fcinfo->context, (Datum) 0,
+					ereport(ERROR,
 							(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
 							 errmsg("value too long for type character(%d)",
 									maxlen)));
@@ -346,8 +347,7 @@ bpchar(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * char_bpchar()
+/* char_bpchar()
  * Convert char to bpchar(1).
  */
 Datum
@@ -365,8 +365,7 @@ char_bpchar(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * bpchar_name()
+/* bpchar_name()
  * Converts a bpchar() type to a NameData type.
  */
 Datum
@@ -399,8 +398,7 @@ bpchar_name(PG_FUNCTION_ARGS)
 	PG_RETURN_NAME(result);
 }
 
-/*
- * name_bpchar()
+/* name_bpchar()
  * Converts a NameData type to a bpchar type.
  *
  * Uses the text conversion functions, which is only appropriate if BpChar
@@ -475,8 +473,8 @@ varchar_input(const char *s, size_t len, int32 atttypmod, Node *escontext)
 			if (s[j] != ' ')
 				ereturn(escontext, NULL,
 						(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-						 errmsg("value too long for type character varying(%zu)",
-								maxlen)));
+						 errmsg("value too long for type character varying(%d)",
+								(int) maxlen)));
 		}
 
 		len = mbmaxlen;
@@ -637,7 +635,7 @@ varchar(PG_FUNCTION_ARGS)
 	{
 		for (i = maxmblen; i < len; i++)
 			if (s_data[i] != ' ')
-				ereturn(fcinfo->context, (Datum) 0,
+				ereport(ERROR,
 						(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
 						 errmsg("value too long for type character varying(%d)",
 								maxlen)));
@@ -751,16 +749,20 @@ bpchareq(PG_FUNCTION_ARGS)
 				len2;
 	bool		result;
 	Oid			collid = PG_GET_COLLATION();
-	pg_locale_t mylocale;
+	bool		locale_is_c = false;
+	pg_locale_t mylocale = 0;
 
 	check_collation_set(collid);
 
 	len1 = bcTruelen(arg1);
 	len2 = bcTruelen(arg2);
 
-	mylocale = pg_newlocale_from_collation(collid);
+	if (lc_collate_is_c(collid))
+		locale_is_c = true;
+	else
+		mylocale = pg_newlocale_from_collation(collid);
 
-	if (mylocale->deterministic)
+	if (locale_is_c || pg_locale_deterministic(mylocale))
 	{
 		/*
 		 * Since we only care about equality or not-equality, we can avoid all
@@ -792,16 +794,20 @@ bpcharne(PG_FUNCTION_ARGS)
 				len2;
 	bool		result;
 	Oid			collid = PG_GET_COLLATION();
-	pg_locale_t mylocale;
+	bool		locale_is_c = false;
+	pg_locale_t mylocale = 0;
 
 	check_collation_set(collid);
 
 	len1 = bcTruelen(arg1);
 	len2 = bcTruelen(arg2);
 
-	mylocale = pg_newlocale_from_collation(collid);
+	if (lc_collate_is_c(collid))
+		locale_is_c = true;
+	else
+		mylocale = pg_newlocale_from_collation(collid);
 
-	if (mylocale->deterministic)
+	if (locale_is_c || pg_locale_deterministic(mylocale))
 	{
 		/*
 		 * Since we only care about equality or not-equality, we can avoid all
@@ -994,7 +1000,7 @@ hashbpchar(PG_FUNCTION_ARGS)
 	Oid			collid = PG_GET_COLLATION();
 	char	   *keydata;
 	int			keylen;
-	pg_locale_t mylocale;
+	pg_locale_t mylocale = 0;
 	Datum		result;
 
 	if (!collid)
@@ -1006,9 +1012,10 @@ hashbpchar(PG_FUNCTION_ARGS)
 	keydata = VARDATA_ANY(key);
 	keylen = bcTruelen(key);
 
-	mylocale = pg_newlocale_from_collation(collid);
+	if (!lc_collate_is_c(collid))
+		mylocale = pg_newlocale_from_collation(collid);
 
-	if (mylocale->deterministic)
+	if (pg_locale_deterministic(mylocale))
 	{
 		result = hash_any((unsigned char *) keydata, keylen);
 	}
@@ -1050,7 +1057,7 @@ hashbpcharextended(PG_FUNCTION_ARGS)
 	Oid			collid = PG_GET_COLLATION();
 	char	   *keydata;
 	int			keylen;
-	pg_locale_t mylocale;
+	pg_locale_t mylocale = 0;
 	Datum		result;
 
 	if (!collid)
@@ -1062,9 +1069,10 @@ hashbpcharextended(PG_FUNCTION_ARGS)
 	keydata = VARDATA_ANY(key);
 	keylen = bcTruelen(key);
 
-	mylocale = pg_newlocale_from_collation(collid);
+	if (!lc_collate_is_c(collid))
+		mylocale = pg_newlocale_from_collation(collid);
 
-	if (mylocale->deterministic)
+	if (pg_locale_deterministic(mylocale))
 	{
 		result = hash_any_extended((unsigned char *) keydata, keylen,
 								   PG_GETARG_INT64(1));

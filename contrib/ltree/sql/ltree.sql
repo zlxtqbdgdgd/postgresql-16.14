@@ -34,7 +34,6 @@ SELECT subpath('Top.Child1.Child2',0,0);
 SELECT subpath('Top.Child1.Child2',1,0);
 SELECT subpath('Top.Child1.Child2',0);
 SELECT subpath('Top.Child1.Child2',1);
-SELECT subpath('Top.Child1.Child2',-4);  -- error
 
 
 SELECT index('1.2.3.4.5.6','1.2');
@@ -253,19 +252,6 @@ SELECT 'tree.awdfg'::ltree @ 'tree & aWdfg@'::ltxtquery;
 SELECT 'tree.awdfg_qwerty'::ltree @ 'tree & aw_qw%*'::ltxtquery;
 SELECT 'tree.awdfg_qwerty'::ltree @ 'tree & aw_rw%*'::ltxtquery;
 
--- Test for overflow of the int16 "left" field in findoprnd().
--- This query uses a balanced binary tree to avoid using too much stack.
-DO $$
-DECLARE
-  e text := 'a';
-BEGIN
-  FOR i IN 1..14 LOOP
-    e := '(' || e || '&' || e || ')';
-  END LOOP;
-  PERFORM ('b|' || e)::ltxtquery;
-END;
-$$;
-
 --arrays
 
 SELECT '{1.2.3}'::ltree[] @> '1.2.3.4';
@@ -296,20 +282,8 @@ SELECT ('{3456,1.2.3.4}'::ltree[] ?<@ '1.2.5') is null;
 SELECT '{ltree.asd, tree.awdfg}'::ltree[] ?@ 'tree & aWdfg@'::ltxtquery;
 SELECT '{j.k.l.m, g.b.c.d.e}'::ltree[] ?~ 'A*@|g.b.c.d.e';
 
--- Check that the hash_ltree() and hash_ltree_extended() function's lower
--- 32 bits match when the seed is 0 and do not match when the seed != 0
-SELECT v as value, hash_ltree(v)::bit(32) as standard,
-       hash_ltree_extended(v, 0)::bit(32) as extended0,
-       hash_ltree_extended(v, 1)::bit(32) as extended1
-FROM   (VALUES (NULL::ltree), (''::ltree), ('0'::ltree), ('0.1'::ltree),
-       ('0.1.2'::ltree), ('0'::ltree), ('0_asd.1_ASD'::ltree)) x(v)
-WHERE  hash_ltree(v)::bit(32) != hash_ltree_extended(v, 0)::bit(32)
-       OR hash_ltree(v)::bit(32) = hash_ltree_extended(v, 1)::bit(32);
-
 CREATE TABLE ltreetest (t ltree);
 \copy ltreetest FROM 'data/ltree.data'
-
-SELECT count(*) from ltreetest;
 
 SELECT * FROM ltreetest WHERE t <  '12.3' order by t asc;
 SELECT * FROM ltreetest WHERE t <= '12.3' order by t asc;
@@ -355,41 +329,6 @@ SELECT * FROM ltreetest WHERE t ~ '23.*.2' order by t asc;
 SELECT * FROM ltreetest WHERE t ? '{23.*.1,23.*.2}' order by t asc;
 
 drop index tstidx;
-
---- test hash index
-
-create index tstidx on ltreetest using hash (t);
-set enable_seqscan=off;
-set enable_bitmapscan=off;
-
-EXPLAIN (COSTS OFF)
-SELECT * FROM ltreetest WHERE t =  '12.3' order by t asc;
-SELECT * FROM ltreetest WHERE t =  '12.3' order by t asc;
-
-reset enable_seqscan;
-reset enable_bitmapscan;
-
--- test hash aggregate
-
-set enable_hashagg=on;
-set enable_groupagg=off;
-
-EXPLAIN (COSTS OFF)
-SELECT count(*) FROM (
-SELECT t FROM (SELECT * FROM ltreetest UNION ALL SELECT * FROM ltreetest) t1 GROUP BY t
-) t2;
-
-SELECT count(*) FROM (
-SELECT t FROM (SELECT * FROM ltreetest UNION ALL SELECT * FROM ltreetest) t1 GROUP BY t
-) t2;
-
-reset enable_hashagg;
-reset enable_groupagg;
-
-drop index tstidx;
-
--- test gist index
-
 create index tstidx on ltreetest using gist (t gist_ltree_ops(siglen=0));
 create index tstidx on ltreetest using gist (t gist_ltree_ops(siglen=2025));
 create index tstidx on ltreetest using gist (t gist_ltree_ops(siglen=2028));
@@ -470,16 +409,3 @@ FROM (VALUES ('.2.3', 'ltree'),
              ('!tree & aWdf@*','ltxtquery'))
       AS a(str,typ),
      LATERAL pg_input_error_info(a.str, a.typ) as errinfo;
-
--- Test for overflow of lquery_level.totallen.
-SELECT (repeat('x', 255) || repeat('|' || repeat('x', 255), 256))::lquery;
-
---- Test for overflow of lquery_level.numvar, with a set of single-char
---- variants in one level.
-SELECT (repeat('a|', 65535) || 'a')::lquery;
-
--- Test that ltree_compare() does not overflow with very deep paths.
-WITH s AS (SELECT 'a'::ltree AS v),
-     l AS (SELECT (repeat('a.', 14999) || 'a')::ltree AS v)
-SELECT (l.v > s.v) AS gt_ok, (l.v < s.v) AS lt_ok, (l.v = s.v) AS eq_ok
-  FROM s, l;

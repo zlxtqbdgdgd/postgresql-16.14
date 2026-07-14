@@ -35,28 +35,26 @@ struct ECPGtype
 /* Everything is malloced. */
 void		ECPGmake_struct_member(const char *name, struct ECPGtype *type,
 								   struct ECPGstruct_member **start);
-struct ECPGtype *ECPGmake_simple_type(enum ECPGttype type, const char *size, int counter);
-struct ECPGtype *ECPGmake_array_type(struct ECPGtype *type, const char *size);
+struct ECPGtype *ECPGmake_simple_type(enum ECPGttype type, char *size, int counter);
+struct ECPGtype *ECPGmake_array_type(struct ECPGtype *type, char *size);
 struct ECPGtype *ECPGmake_struct_type(struct ECPGstruct_member *rm,
-									  enum ECPGttype type,
-									  const char *type_name,
-									  const char *struct_sizeof);
+									  enum ECPGttype type, char *type_name,
+									  char *struct_sizeof);
 struct ECPGstruct_member *ECPGstruct_member_dup(struct ECPGstruct_member *rm);
 
 /* Frees a type. */
 void		ECPGfree_struct_member(struct ECPGstruct_member *rm);
 void		ECPGfree_type(struct ECPGtype *type);
 
-/*
- * Dump a type.
- * The type is dumped as:
- * type-tag <comma> reference-to-variable <comma> arrsize <comma> size <comma>
- * Where:
- * type-tag is one of the simple types or varchar.
- * reference-to-variable can be a reference to a struct element.
- * arrsize is the size of the array in case of array fetches. Otherwise 0.
- * size is the maxsize in case it is a varchar. Otherwise it is the size of
- * the variable (required to do array fetches of structs).
+/* Dump a type.
+   The type is dumped as:
+   type-tag <comma> reference-to-variable <comma> arrsize <comma> size <comma>
+   Where:
+   type-tag is one of the simple types or varchar.
+   reference-to-variable can be a reference to a struct element.
+   arrsize is the size of the array in case of array fetches. Otherwise 0.
+   size is the maxsize in case it is a varchar. Otherwise it is the size of
+	   the variable (required to do array fetches of structs).
  */
 void		ECPGdump_a_type(FILE *o, const char *name, struct ECPGtype *type,
 							const int brace_level, const char *ind_name,
@@ -95,28 +93,28 @@ struct when
 
 struct index
 {
-	const char *index1;
-	const char *index2;
-	const char *str;
+	char	   *index1;
+	char	   *index2;
+	char	   *str;
 };
 
 struct su_symbol
 {
-	const char *su;
-	const char *symbol;
+	char	   *su;
+	char	   *symbol;
 };
 
 struct prep
 {
-	const char *name;
-	const char *stmt;
-	const char *type;
+	char	   *name;
+	char	   *stmt;
+	char	   *type;
 };
 
 struct exec
 {
-	const char *name;
-	const char *type;
+	char	   *name;
+	char	   *type;
 };
 
 struct this_type
@@ -223,14 +221,14 @@ enum errortype
 
 struct fetch_desc
 {
-	const char *str;
-	const char *name;
+	char	   *str;
+	char	   *name;
 };
 
 struct describe
 {
 	int			input;
-	const char *stmt_name;
+	char	   *stmt_name;
 };
 
 #endif							/* _ECPG_PREPROC_TYPE_H */

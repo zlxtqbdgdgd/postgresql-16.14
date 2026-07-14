@@ -4,7 +4,7 @@
  *	  Low level infrastructure related to expression evaluation
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execExpr.h
@@ -16,7 +16,6 @@
 
 #include "executor/nodeAgg.h"
 #include "nodes/execnodes.h"
-#include "nodes/miscnodes.h"
 
 /* forward references to avoid circularity */
 struct ExprEvalStep;
@@ -26,9 +25,9 @@ struct JsonConstructorExprState;
 
 /* Bits in ExprState->flags (see also execnodes.h for public flag bits): */
 /* expression's interpreter has been initialized */
-#define EEO_FLAG_INTERPRETER_INITIALIZED	(1 << 5)
+#define EEO_FLAG_INTERPRETER_INITIALIZED	(1 << 1)
 /* jump-threading is in use */
-#define EEO_FLAG_DIRECT_THREADED			(1 << 6)
+#define EEO_FLAG_DIRECT_THREADED			(1 << 2)
 
 /* Typical API for out-of-line evaluation subroutines */
 typedef void (*ExecEvalSubroutine) (ExprState *state,
@@ -65,32 +64,23 @@ typedef struct ExprEvalRowtypeCache
  */
 typedef enum ExprEvalOp
 {
-	/* entire expression has been evaluated, return value */
-	EEOP_DONE_RETURN,
-
-	/* entire expression has been evaluated, no return value */
-	EEOP_DONE_NO_RETURN,
+	/* entire expression has been evaluated completely, return */
+	EEOP_DONE,
 
 	/* apply slot_getsomeattrs on corresponding tuple slot */
 	EEOP_INNER_FETCHSOME,
 	EEOP_OUTER_FETCHSOME,
 	EEOP_SCAN_FETCHSOME,
-	EEOP_OLD_FETCHSOME,
-	EEOP_NEW_FETCHSOME,
 
 	/* compute non-system Var value */
 	EEOP_INNER_VAR,
 	EEOP_OUTER_VAR,
 	EEOP_SCAN_VAR,
-	EEOP_OLD_VAR,
-	EEOP_NEW_VAR,
 
 	/* compute system Var value */
 	EEOP_INNER_SYSVAR,
 	EEOP_OUTER_SYSVAR,
 	EEOP_SCAN_SYSVAR,
-	EEOP_OLD_SYSVAR,
-	EEOP_NEW_SYSVAR,
 
 	/* compute wholerow Var */
 	EEOP_WHOLEROW,
@@ -103,8 +93,6 @@ typedef enum ExprEvalOp
 	EEOP_ASSIGN_INNER_VAR,
 	EEOP_ASSIGN_OUTER_VAR,
 	EEOP_ASSIGN_SCAN_VAR,
-	EEOP_ASSIGN_OLD_VAR,
-	EEOP_ASSIGN_NEW_VAR,
 
 	/* assign ExprState's resvalue/resnull to a column of its resultslot */
 	EEOP_ASSIGN_TMP,
@@ -116,13 +104,11 @@ typedef enum ExprEvalOp
 
 	/*
 	 * Evaluate function call (including OpExprs etc).  For speed, we
-	 * distinguish in the opcode whether the function is strict with 1, 2, or
-	 * more arguments and/or requires usage stats tracking.
+	 * distinguish in the opcode whether the function is strict and/or
+	 * requires usage stats tracking.
 	 */
 	EEOP_FUNCEXPR,
 	EEOP_FUNCEXPR_STRICT,
-	EEOP_FUNCEXPR_STRICT_1,
-	EEOP_FUNCEXPR_STRICT_2,
 	EEOP_FUNCEXPR_FUSAGE,
 	EEOP_FUNCEXPR_STRICT_FUSAGE,
 
@@ -173,26 +159,21 @@ typedef enum ExprEvalOp
 	EEOP_PARAM_EXEC,
 	EEOP_PARAM_EXTERN,
 	EEOP_PARAM_CALLBACK,
-	/* set PARAM_EXEC value */
-	EEOP_PARAM_SET,
 
 	/* return CaseTestExpr value */
 	EEOP_CASE_TESTVAL,
-	EEOP_CASE_TESTVAL_EXT,
 
 	/* apply MakeExpandedObjectReadOnly() to target value */
 	EEOP_MAKE_READONLY,
 
 	/* evaluate assorted special-purpose expression types */
 	EEOP_IOCOERCE,
-	EEOP_IOCOERCE_SAFE,
 	EEOP_DISTINCT,
 	EEOP_NOT_DISTINCT,
 	EEOP_NULLIF,
 	EEOP_SQLVALUEFUNCTION,
 	EEOP_CURRENTOFEXPR,
 	EEOP_NEXTVALUEEXPR,
-	EEOP_RETURNINGEXPR,
 	EEOP_ARRAYEXPR,
 	EEOP_ARRAYCOERCE,
 	EEOP_ROW,
@@ -243,20 +224,12 @@ typedef enum ExprEvalOp
 
 	/* evaluate value for CoerceToDomainValue */
 	EEOP_DOMAIN_TESTVAL,
-	EEOP_DOMAIN_TESTVAL_EXT,
 
 	/* evaluate a domain's NOT NULL constraint */
 	EEOP_DOMAIN_NOTNULL,
 
 	/* evaluate a single domain CHECK constraint */
 	EEOP_DOMAIN_CHECK,
-
-	/* evaluation steps for hashing */
-	EEOP_HASHDATUM_SET_INITVAL,
-	EEOP_HASHDATUM_FIRST,
-	EEOP_HASHDATUM_FIRST_STRICT,
-	EEOP_HASHDATUM_NEXT32,
-	EEOP_HASHDATUM_NEXT32_STRICT,
 
 	/* evaluate assorted special-purpose expression types */
 	EEOP_CONVERT_ROWTYPE,
@@ -265,20 +238,15 @@ typedef enum ExprEvalOp
 	EEOP_XMLEXPR,
 	EEOP_JSON_CONSTRUCTOR,
 	EEOP_IS_JSON,
-	EEOP_JSONEXPR_PATH,
-	EEOP_JSONEXPR_COERCION,
-	EEOP_JSONEXPR_COERCION_FINISH,
 	EEOP_AGGREF,
 	EEOP_GROUPING_FUNC,
 	EEOP_WINDOW_FUNC,
-	EEOP_MERGE_SUPPORT_FUNC,
 	EEOP_SUBPLAN,
 
 	/* aggregation related nodes */
 	EEOP_AGG_STRICT_DESERIALIZE,
 	EEOP_AGG_DESERIALIZE,
 	EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
-	EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1,
 	EEOP_AGG_STRICT_INPUT_CHECK_NULLS,
 	EEOP_AGG_PLAIN_PERGROUP_NULLCHECK,
 	EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL,
@@ -318,7 +286,7 @@ typedef struct ExprEvalStep
 	 */
 	union
 	{
-		/* for EEOP_INNER/OUTER/SCAN/OLD/NEW_FETCHSOME */
+		/* for EEOP_INNER/OUTER/SCAN_FETCHSOME */
 		struct
 		{
 			/* attribute number up to which to fetch (inclusive) */
@@ -331,14 +299,13 @@ typedef struct ExprEvalStep
 			const TupleTableSlotOps *kind;
 		}			fetch;
 
-		/* for EEOP_INNER/OUTER/SCAN/OLD/NEW_[SYS]VAR */
+		/* for EEOP_INNER/OUTER/SCAN_[SYS]VAR[_FIRST] */
 		struct
 		{
 			/* attnum is attr number - 1 for regular VAR ... */
 			/* but it's just the normal (negative) attr number for SYSVAR */
 			int			attnum;
 			Oid			vartype;	/* type OID of variable */
-			VarReturningType varreturningtype;	/* return old/new/default */
 		}			var;
 
 		/* for EEOP_WHOLEROW */
@@ -366,13 +333,6 @@ typedef struct ExprEvalStep
 			/* target index in ExprState->resultslot->tts_values/nulls */
 			int			resultnum;
 		}			assign_tmp;
-
-		/* for EEOP_RETURNINGEXPR */
-		struct
-		{
-			uint8		nullflag;	/* flag to test if OLD/NEW row is NULL */
-			int			jumpdone;	/* jump here if OLD/NEW row is NULL */
-		}			returningexpr;
 
 		/* for EEOP_CONST */
 		struct
@@ -419,7 +379,7 @@ typedef struct ExprEvalStep
 			ExprEvalRowtypeCache rowcache;
 		}			nulltest_row;
 
-		/* for EEOP_PARAM_EXEC/EXTERN and EEOP_PARAM_SET */
+		/* for EEOP_PARAM_EXEC/EXTERN */
 		struct
 		{
 			int			paramid;	/* numeric ID for parameter */
@@ -431,7 +391,6 @@ typedef struct ExprEvalStep
 		{
 			ExecEvalSubroutine paramfunc;	/* add-on evaluation subroutine */
 			void	   *paramarg;	/* private data for same */
-			void	   *paramarg2;	/* more private data for same */
 			int			paramid;	/* numeric ID for parameter */
 			Oid			paramtype;	/* OID of parameter's datatype */
 		}			cparam;
@@ -520,7 +479,7 @@ typedef struct ExprEvalStep
 		/* for EEOP_ROWCOMPARE_FINAL */
 		struct
 		{
-			CompareType cmptype;
+			RowCompareType rctype;
 		}			rowcompare_final;
 
 		/* for EEOP_MINMAX */
@@ -589,26 +548,7 @@ typedef struct ExprEvalStep
 			bool	   *checknull;
 			/* OID of domain type */
 			Oid			resulttype;
-			ErrorSaveContext *escontext;
 		}			domaincheck;
-
-		/* for EEOP_HASH_SET_INITVAL */
-		struct
-		{
-			Datum		init_value;
-
-		}			hashdatum_initvalue;
-
-		/* for EEOP_HASHDATUM_(FIRST|NEXT32)[_STRICT] */
-		struct
-		{
-			FmgrInfo   *finfo;	/* function's lookup data */
-			FunctionCallInfo fcinfo_data;	/* arguments etc */
-			/* faster to access without additional indirection: */
-			PGFunction	fn_addr;	/* actual call address */
-			int			jumpdone;	/* jump here on null */
-			NullableDatum *iresult; /* intermediate hash result */
-		}			hashdatum;
 
 		/* for EEOP_CONVERT_ROWTYPE */
 		struct
@@ -754,25 +694,6 @@ typedef struct ExprEvalStep
 			JsonIsPredicate *pred;	/* original expression node */
 		}			is_json;
 
-		/* for EEOP_JSONEXPR_PATH */
-		struct
-		{
-			struct JsonExprState *jsestate;
-		}			jsonexpr;
-
-		/* for EEOP_JSONEXPR_COERCION */
-		struct
-		{
-			Oid			targettype;
-			int32		targettypmod;
-			bool		omit_quotes;
-			/* exists_* fields only relevant for JSON_EXISTS_OP. */
-			bool		exists_coerce;
-			bool		exists_cast_to_int;
-			bool		exists_check_domain;
-			void	   *json_coercion_cache;
-			ErrorSaveContext *escontext;
-		}			jsonexpr_coercion;
 	}			d;
 } ExprEvalStep;
 
@@ -858,11 +779,8 @@ extern void ExecEvalFuncExprStrictFusage(ExprState *state, ExprEvalStep *op,
 										 ExprContext *econtext);
 extern void ExecEvalParamExec(ExprState *state, ExprEvalStep *op,
 							  ExprContext *econtext);
-extern void ExecEvalParamSet(ExprState *state, ExprEvalStep *op,
-							 ExprContext *econtext);
 extern void ExecEvalParamExtern(ExprState *state, ExprEvalStep *op,
 								ExprContext *econtext);
-extern void ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalSQLValueFunction(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op);
@@ -892,14 +810,7 @@ extern void ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
 									ExprContext *econtext);
 extern void ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op);
-extern int	ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
-								 ExprContext *econtext);
-extern void ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
-								 ExprContext *econtext);
-extern void ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op);
-extern void ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
-									 ExprContext *econtext);
 extern void ExecEvalSubPlan(ExprState *state, ExprEvalStep *op,
 							ExprContext *econtext);
 extern void ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op,

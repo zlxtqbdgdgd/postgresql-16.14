@@ -1,11 +1,11 @@
 /*
  * contrib/seg/seg.c
  *
- *
- * This file contains routines that can be bound to a Postgres backend and
- * called by the backend in the process of processing queries.  The calling
- * format for these routines is dictated by Postgres architecture.
- */
+ ******************************************************************************
+  This file contains routines that can be bound to a Postgres backend and
+  called by the backend in the process of processing queries.  The calling
+  format for these routines is dictated by Postgres architecture.
+******************************************************************************/
 
 #include "postgres.h"
 
@@ -24,14 +24,11 @@
 
 
 /*
- * #define GIST_DEBUG
- * #define GIST_QUERY_DEBUG
- */
+#define GIST_DEBUG
+#define GIST_QUERY_DEBUG
+*/
 
-PG_MODULE_MAGIC_EXT(
-					.name = "seg",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /*
  * Auxiliary data structure for picksplit method.
@@ -44,8 +41,8 @@ typedef struct
 } gseg_picksplit_item;
 
 /*
- * Input/Output routines
- */
+** Input/Output routines
+*/
 PG_FUNCTION_INFO_V1(seg_in);
 PG_FUNCTION_INFO_V1(seg_out);
 PG_FUNCTION_INFO_V1(seg_size);
@@ -54,8 +51,8 @@ PG_FUNCTION_INFO_V1(seg_upper);
 PG_FUNCTION_INFO_V1(seg_center);
 
 /*
- * GiST support methods
- */
+** GiST support methods
+*/
 PG_FUNCTION_INFO_V1(gseg_consistent);
 PG_FUNCTION_INFO_V1(gseg_compress);
 PG_FUNCTION_INFO_V1(gseg_decompress);
@@ -69,8 +66,8 @@ static Datum gseg_binary_union(Datum r1, Datum r2, int *sizep);
 
 
 /*
- * R-tree support functions
- */
+** R-tree support functions
+*/
 PG_FUNCTION_INFO_V1(seg_same);
 PG_FUNCTION_INFO_V1(seg_contains);
 PG_FUNCTION_INFO_V1(seg_contained);
@@ -84,8 +81,8 @@ PG_FUNCTION_INFO_V1(seg_inter);
 static void rt_seg_size(SEG *a, float *size);
 
 /*
- * Various operators
- */
+** Various operators
+*/
 PG_FUNCTION_INFO_V1(seg_cmp);
 PG_FUNCTION_INFO_V1(seg_lt);
 PG_FUNCTION_INFO_V1(seg_le);
@@ -94,8 +91,8 @@ PG_FUNCTION_INFO_V1(seg_ge);
 PG_FUNCTION_INFO_V1(seg_different);
 
 /*
- * Auxiliary functions
- */
+** Auxiliary functions
+*/
 static int	restore(char *result, float val, int n);
 
 
@@ -107,15 +104,14 @@ Datum
 seg_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	SEG		   *result = palloc_object(SEG);
-	yyscan_t	scanner;
+	SEG		   *result = palloc(sizeof(SEG));
 
-	seg_scanner_init(str, &scanner);
+	seg_scanner_init(str);
 
-	if (seg_yyparse(result, fcinfo->context, scanner) != 0)
-		seg_yyerror(result, fcinfo->context, scanner, "bogus input");
+	if (seg_yyparse(result, fcinfo->context) != 0)
+		seg_yyerror(result, fcinfo->context, "bogus input");
 
-	seg_scanner_finish(scanner);
+	seg_scanner_finish();
 
 	PG_RETURN_POINTER(result);
 }
@@ -152,7 +148,7 @@ seg_out(PG_FUNCTION_ARGS)
 		{
 			/* print the upper boundary if exists */
 			p += sprintf(p, " ");
-			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->u_ext == '~')
+			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->l_ext == '~')
 				p += sprintf(p, "%c", seg->u_ext);
 			p += restore(p, seg->upper, seg->u_sigd);
 		}
@@ -191,20 +187,19 @@ seg_upper(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /*
- * The GiST Consistent method for segments
- * Should return false if for all data items x below entry,
- * the predicate x op query == false, where op is the oper
- * corresponding to strategy in the pg_amop table.
- */
+** The GiST Consistent method for segments
+** Should return false if for all data items x below entry,
+** the predicate x op query == false, where op is the oper
+** corresponding to strategy in the pg_amop table.
+*/
 Datum
 gseg_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	Datum		query = PG_GETARG_DATUM(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-#ifdef NOT_USED
-	Oid			subtype = PG_GETARG_OID(3);
-#endif
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 
 	/* All cases served by this function are exact */
@@ -221,9 +216,9 @@ gseg_consistent(PG_FUNCTION_ARGS)
 }
 
 /*
- * The GiST Union method for segments
- * returns the minimal bounding seg that encloses all the entries in entryvec
- */
+** The GiST Union method for segments
+** returns the minimal bounding seg that encloses all the entries in entryvec
+*/
 Datum
 gseg_union(PG_FUNCTION_ARGS)
 {
@@ -252,9 +247,9 @@ gseg_union(PG_FUNCTION_ARGS)
 }
 
 /*
- * GiST Compress and Decompress methods for segments
- * do not do anything.
- */
+** GiST Compress and Decompress methods for segments
+** do not do anything.
+*/
 Datum
 gseg_compress(PG_FUNCTION_ARGS)
 {
@@ -268,9 +263,9 @@ gseg_decompress(PG_FUNCTION_ARGS)
 }
 
 /*
- * The GiST Penalty method for segments
- * As in the R-tree paper, we use change in area as our penalty metric
- */
+** The GiST Penalty method for segments
+** As in the R-tree paper, we use change in area as our penalty metric
+*/
 Datum
 gseg_penalty(PG_FUNCTION_ARGS)
 {
@@ -371,7 +366,7 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * Emit segments to the left output page, and compute its bounding box.
 	 */
-	seg_l = palloc_object(SEG);
+	seg_l = (SEG *) palloc(sizeof(SEG));
 	memcpy(seg_l, sort_items[0].data, sizeof(SEG));
 	*left++ = sort_items[0].index;
 	v->spl_nleft++;
@@ -389,7 +384,7 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * Likewise for the right page.
 	 */
-	seg_r = palloc_object(SEG);
+	seg_r = (SEG *) palloc(sizeof(SEG));
 	memcpy(seg_r, sort_items[firstright].data, sizeof(SEG));
 	*right++ = sort_items[firstright].index;
 	v->spl_nright++;
@@ -411,14 +406,14 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 }
 
 /*
- * Equality methods
- */
+** Equality methods
+*/
 Datum
 gseg_same(PG_FUNCTION_ARGS)
 {
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
 
-	if (DatumGetBool(DirectFunctionCall2(seg_same, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1))))
+	if (DirectFunctionCall2(seg_same, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)))
 		*result = true;
 	else
 		*result = false;
@@ -431,8 +426,8 @@ gseg_same(PG_FUNCTION_ARGS)
 }
 
 /*
- * SUPPORT ROUTINES
- */
+** SUPPORT ROUTINES
+*/
 static Datum
 gseg_leaf_consistent(Datum key, Datum query, StrategyNumber strategy)
 {
@@ -471,7 +466,7 @@ gseg_leaf_consistent(Datum key, Datum query, StrategyNumber strategy)
 			retval = DirectFunctionCall2(seg_contained, key, query);
 			break;
 		default:
-			retval = BoolGetDatum(false);
+			retval = false;
 	}
 
 	PG_RETURN_DATUM(retval);
@@ -570,8 +565,7 @@ seg_same(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(cmp == 0);
 }
 
-/*
- * seg_overlap -- does a overlap b?
+/*	seg_overlap -- does a overlap b?
  */
 Datum
 seg_overlap(PG_FUNCTION_ARGS)
@@ -583,8 +577,7 @@ seg_overlap(PG_FUNCTION_ARGS)
 				   ((b->upper >= a->upper) && (b->lower <= a->upper)));
 }
 
-/*
- * seg_over_left -- is the right edge of (a) located at or left of the right edge of (b)?
+/*	seg_over_left -- is the right edge of (a) located at or left of the right edge of (b)?
  */
 Datum
 seg_over_left(PG_FUNCTION_ARGS)
@@ -595,8 +588,7 @@ seg_over_left(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->upper <= b->upper);
 }
 
-/*
- * seg_left -- is (a) entirely on the left of (b)?
+/*	seg_left -- is (a) entirely on the left of (b)?
  */
 Datum
 seg_left(PG_FUNCTION_ARGS)
@@ -607,8 +599,7 @@ seg_left(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->upper < b->lower);
 }
 
-/*
- * seg_right -- is (a) entirely on the right of (b)?
+/*	seg_right -- is (a) entirely on the right of (b)?
  */
 Datum
 seg_right(PG_FUNCTION_ARGS)
@@ -619,8 +610,7 @@ seg_right(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->lower > b->upper);
 }
 
-/*
- * seg_over_right -- is the left edge of (a) located at or right of the left edge of (b)?
+/*	seg_over_right -- is the left edge of (a) located at or right of the left edge of (b)?
  */
 Datum
 seg_over_right(PG_FUNCTION_ARGS)
@@ -638,7 +628,7 @@ seg_union(PG_FUNCTION_ARGS)
 	SEG		   *b = PG_GETARG_SEG_P(1);
 	SEG		   *n;
 
-	n = palloc_object(SEG);
+	n = (SEG *) palloc(sizeof(*n));
 
 	/* take max of upper endpoints */
 	if (a->upper > b->upper)
@@ -678,7 +668,7 @@ seg_inter(PG_FUNCTION_ARGS)
 	SEG		   *b = PG_GETARG_SEG_P(1);
 	SEG		   *n;
 
-	n = palloc_object(SEG);
+	n = (SEG *) palloc(sizeof(*n));
 
 	/* take min of upper endpoints */
 	if (a->upper < b->upper)
@@ -1064,11 +1054,10 @@ restore(char *result, float val, int n)
 
 
 /*
- * Miscellany
- */
+** Miscellany
+*/
 
-/*
- * find out the number of significant digits in a string representing
+/* find out the number of significant digits in a string representing
  * a floating point number
  */
 int

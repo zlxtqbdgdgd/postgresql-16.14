@@ -3,19 +3,16 @@
  *
  *	controldata functions
  *
- *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/controldata.c
  */
 
 #include "postgres_fe.h"
 
 #include <ctype.h>
-#include <limits.h>				/* for CHAR_MIN */
 
-#include "access/xlog_internal.h"
-#include "common/string.h"
 #include "pg_upgrade.h"
-#include "storage/checksum.h"
+#include "common/string.h"
 
 
 /*
@@ -36,12 +33,15 @@
  * return valid xid data for a running server.
  */
 void
-get_control_data(ClusterInfo *cluster)
+get_control_data(ClusterInfo *cluster, bool live_check)
 {
 	char		cmd[MAXPGPATH];
 	char		bufin[MAX_STRING];
 	FILE	   *output;
 	char	   *p;
+	bool		got_tli = false;
+	bool		got_log_id = false;
+	bool		got_log_seg = false;
 	bool		got_xid = false;
 	bool		got_oid = false;
 	bool		got_multi = false;
@@ -62,7 +62,6 @@ get_control_data(ClusterInfo *cluster)
 	bool		got_date_is_int = false;
 	bool		got_data_checksum_version = false;
 	bool		got_cluster_state = false;
-	bool		got_default_char_signedness = false;
 	char	   *lc_collate = NULL;
 	char	   *lc_ctype = NULL;
 	char	   *lc_monetary = NULL;
@@ -72,8 +71,11 @@ get_control_data(ClusterInfo *cluster)
 	char	   *language = NULL;
 	char	   *lc_all = NULL;
 	char	   *lc_messages = NULL;
+	uint32		tli = 0;
+	uint32		logid = 0;
+	uint32		segno = 0;
+	char	   *resetwal_bin;
 	int			rc;
-	bool		live_check = (cluster == &old_cluster && user_opts.live_check);
 
 	/*
 	 * Because we test the pg_resetwal output as strings, it has to be in
@@ -124,7 +126,8 @@ get_control_data(ClusterInfo *cluster)
 		fflush(NULL);
 
 		if ((output = popen(cmd, "r")) == NULL)
-			pg_fatal("could not get control data using %s: %m", cmd);
+			pg_fatal("could not get control data using %s: %s",
+					 cmd, strerror(errno));
 
 		/* we have the result of cmd in "output". so parse it line by line now */
 		while (fgets(bufin, sizeof(bufin), output))
@@ -146,23 +149,22 @@ get_control_data(ClusterInfo *cluster)
 				 * the server was shut down cleanly, from the controldata
 				 * perspective.
 				 */
-				/* Remove trailing newline and leading spaces */
-				(void) pg_strip_crlf(p);
+				/* remove leading spaces */
 				while (*p == ' ')
 					p++;
-				if (strcmp(p, "shut down in recovery") == 0)
+				if (strcmp(p, "shut down in recovery\n") == 0)
 				{
 					if (cluster == &old_cluster)
 						pg_fatal("The source cluster was shut down while in recovery mode.  To upgrade, use \"rsync\" as documented or shut it down as a primary.");
 					else
 						pg_fatal("The target cluster was shut down while in recovery mode.  To upgrade, use \"rsync\" as documented or shut it down as a primary.");
 				}
-				else if (strcmp(p, "shut down") != 0)
+				else if (strcmp(p, "shut down\n") != 0)
 				{
 					if (cluster == &old_cluster)
-						pg_fatal("The source cluster was not shut down cleanly, state reported as: \"%s\"", p);
+						pg_fatal("The source cluster was not shut down cleanly.");
 					else
-						pg_fatal("The target cluster was not shut down cleanly, state reported as: \"%s\"", p);
+						pg_fatal("The target cluster was not shut down cleanly.");
 				}
 				got_cluster_state = true;
 			}
@@ -182,14 +184,27 @@ get_control_data(ClusterInfo *cluster)
 		}
 	}
 
+	/* pg_resetxlog has been renamed to pg_resetwal in version 10 */
+	if (GET_MAJOR_VERSION(cluster->bin_version) <= 906)
+		resetwal_bin = "pg_resetxlog\" -n";
+	else
+		resetwal_bin = "pg_resetwal\" -n";
 	snprintf(cmd, sizeof(cmd), "\"%s/%s \"%s\"",
 			 cluster->bindir,
-			 live_check ? "pg_controldata\"" : "pg_resetwal\" -n",
+			 live_check ? "pg_controldata\"" : resetwal_bin,
 			 cluster->pgdata);
 	fflush(NULL);
 
 	if ((output = popen(cmd, "r")) == NULL)
-		pg_fatal("could not get control data using %s: %m", cmd);
+		pg_fatal("could not get control data using %s: %s",
+				 cmd, strerror(errno));
+
+	/* Only in <= 9.2 */
+	if (GET_MAJOR_VERSION(cluster->major_version) <= 902)
+	{
+		cluster->controldata.data_checksum_version = 0;
+		got_data_checksum_version = true;
+	}
 
 	/* we have the result of cmd in "output". so parse it line by line now */
 	while (fgets(bufin, sizeof(bufin), output))
@@ -218,6 +233,39 @@ get_control_data(ClusterInfo *cluster)
 			p++;				/* remove ':' char */
 			cluster->controldata.cat_ver = str2uint(p);
 		}
+		else if ((p = strstr(bufin, "Latest checkpoint's TimeLineID:")) != NULL)
+		{
+			p = strchr(p, ':');
+
+			if (p == NULL || strlen(p) <= 1)
+				pg_fatal("%d: controldata retrieval problem", __LINE__);
+
+			p++;				/* remove ':' char */
+			tli = str2uint(p);
+			got_tli = true;
+		}
+		else if ((p = strstr(bufin, "First log file ID after reset:")) != NULL)
+		{
+			p = strchr(p, ':');
+
+			if (p == NULL || strlen(p) <= 1)
+				pg_fatal("%d: controldata retrieval problem", __LINE__);
+
+			p++;				/* remove ':' char */
+			logid = str2uint(p);
+			got_log_id = true;
+		}
+		else if ((p = strstr(bufin, "First log file segment after reset:")) != NULL)
+		{
+			p = strchr(p, ':');
+
+			if (p == NULL || strlen(p) <= 1)
+				pg_fatal("%d: controldata retrieval problem", __LINE__);
+
+			p++;				/* remove ':' char */
+			segno = str2uint(p);
+			got_log_seg = true;
+		}
 		else if ((p = strstr(bufin, "Latest checkpoint's NextXID:")) != NULL)
 		{
 			p = strchr(p, ':');
@@ -228,12 +276,23 @@ get_control_data(ClusterInfo *cluster)
 			p++;				/* remove ':' char */
 			cluster->controldata.chkpnt_nxtepoch = str2uint(p);
 
-			p = strchr(p, ':');
+			/*
+			 * Delimiter changed from '/' to ':' in 9.6.  We don't test for
+			 * the catalog version of the change because the catalog version
+			 * is pulled from pg_controldata too, and it isn't worth adding an
+			 * order dependency for this --- we just check the string.
+			 */
+			if (strchr(p, '/') != NULL)
+				p = strchr(p, '/');
+			else if (GET_MAJOR_VERSION(cluster->major_version) >= 906)
+				p = strchr(p, ':');
+			else
+				p = NULL;
 
 			if (p == NULL || strlen(p) <= 1)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
 
-			p++;				/* remove ':' char */
+			p++;				/* remove '/' or ':' char */
 			cluster->controldata.chkpnt_nxtxid = str2uint(p);
 			got_xid = true;
 		}
@@ -298,7 +357,7 @@ get_control_data(ClusterInfo *cluster)
 			p = strchr(p, ':');
 			if (p == NULL || strlen(p) <= 1)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
-			p = strpbrk(p, "0123456789ABCDEF");
+			p = strpbrk(p, "01234567890ABCDEF");
 			if (p == NULL || strlen(p) <= 1)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
 
@@ -442,25 +501,6 @@ get_control_data(ClusterInfo *cluster)
 			cluster->controldata.data_checksum_version = str2uint(p);
 			got_data_checksum_version = true;
 		}
-		else if ((p = strstr(bufin, "Default char data signedness:")) != NULL)
-		{
-			p = strchr(p, ':');
-
-			if (p == NULL || strlen(p) <= 1)
-				pg_fatal("%d: controldata retrieval problem", __LINE__);
-
-			/* Skip the colon and any whitespace after it */
-			p++;
-			while (isspace((unsigned char) *p))
-				p++;
-
-			/* The value should be either 'signed' or 'unsigned' */
-			if (strcmp(p, "signed") != 0 && strcmp(p, "unsigned") != 0)
-				pg_fatal("%d: controldata retrieval problem", __LINE__);
-
-			cluster->controldata.default_char_signedness = strcmp(p, "signed") == 0;
-			got_default_char_signedness = true;
-		}
 	}
 
 	rc = pclose(output);
@@ -506,32 +546,33 @@ get_control_data(ClusterInfo *cluster)
 	pg_free(lc_messages);
 
 	/*
-	 * Pre-v18 database clusters don't have the default char signedness
-	 * information. We use the char signedness of the platform where
-	 * pg_upgrade was built.
+	 * Before 9.3, pg_resetwal reported the xlogid and segno of the first log
+	 * file after reset as separate lines. Starting with 9.3, it reports the
+	 * WAL file name. If the old cluster is older than 9.3, we construct the
+	 * WAL file name from the xlogid and segno.
 	 */
-	if (cluster->controldata.cat_ver < DEFAULT_CHAR_SIGNEDNESS_CAT_VER)
+	if (GET_MAJOR_VERSION(cluster->major_version) <= 902)
 	{
-		Assert(!got_default_char_signedness);
-#if CHAR_MIN != 0
-		cluster->controldata.default_char_signedness = true;
-#else
-		cluster->controldata.default_char_signedness = false;
-#endif
+		if (got_tli && got_log_id && got_log_seg)
+		{
+			snprintf(cluster->controldata.nextxlogfile, 25, "%08X%08X%08X",
+					 tli, logid, segno);
+			got_nextxlogfile = true;
+		}
 	}
 
 	/* verify that we got all the mandatory pg_control data */
 	if (!got_xid || !got_oid ||
 		!got_multi || !got_oldestxid ||
-		!got_oldestmulti ||
+		(!got_oldestmulti &&
+		 cluster->controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER) ||
 		!got_mxoff || (!live_check && !got_nextxlogfile) ||
 		!got_float8_pass_by_value || !got_align || !got_blocksz ||
 		!got_largesz || !got_walsz || !got_walseg || !got_ident ||
 		!got_index || !got_toast ||
-		!got_large_object ||
-		!got_date_is_int || !got_data_checksum_version ||
-		(!got_default_char_signedness &&
-		 cluster->controldata.cat_ver >= DEFAULT_CHAR_SIGNEDNESS_CAT_VER))
+		(!got_large_object &&
+		 cluster->controldata.ctrl_ver >= LARGE_OBJECT_SIZE_PG_CONTROL_VER) ||
+		!got_date_is_int || !got_data_checksum_version)
 	{
 		if (cluster == &old_cluster)
 			pg_log(PG_REPORT,
@@ -549,7 +590,8 @@ get_control_data(ClusterInfo *cluster)
 		if (!got_multi)
 			pg_log(PG_REPORT, "  latest checkpoint next MultiXactId");
 
-		if (!got_oldestmulti)
+		if (!got_oldestmulti &&
+			cluster->controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
 			pg_log(PG_REPORT, "  latest checkpoint oldest MultiXactId");
 
 		if (!got_oldestxid)
@@ -588,7 +630,8 @@ get_control_data(ClusterInfo *cluster)
 		if (!got_toast)
 			pg_log(PG_REPORT, "  maximum TOAST chunk size");
 
-		if (!got_large_object)
+		if (!got_large_object &&
+			cluster->controldata.ctrl_ver >= LARGE_OBJECT_SIZE_PG_CONTROL_VER)
 			pg_log(PG_REPORT, "  large-object chunk size");
 
 		if (!got_date_is_int)
@@ -597,10 +640,6 @@ get_control_data(ClusterInfo *cluster)
 		/* value added in Postgres 9.3 */
 		if (!got_data_checksum_version)
 			pg_log(PG_REPORT, "  data checksum version");
-
-		/* value added in Postgres 18 */
-		if (!got_default_char_signedness)
-			pg_log(PG_REPORT, "  default char signedness");
 
 		pg_fatal("Cannot continue without required control information, terminating");
 	}
@@ -641,7 +680,8 @@ check_control_data(ControlData *oldctrl,
 	if (oldctrl->toast == 0 || oldctrl->toast != newctrl->toast)
 		pg_fatal("old and new pg_controldata maximum TOAST chunk sizes are invalid or do not match");
 
-	if (oldctrl->large_object == 0 ||
+	/* large_object added in 9.5, so it might not exist in the old cluster */
+	if (oldctrl->large_object != 0 &&
 		oldctrl->large_object != newctrl->large_object)
 		pg_fatal("old and new pg_controldata large-object chunk sizes are invalid or do not match");
 
@@ -654,22 +694,14 @@ check_control_data(ControlData *oldctrl,
 	 */
 
 	/*
-	 * If data checksums are in any in-progress state then disallow the
-	 * upgrade. The user should either let the process finish, or turn off
-	 * data checksums, before retrying.
-	 */
-	if (oldctrl->data_checksum_version > PG_DATA_CHECKSUM_VERSION)
-		pg_fatal("checksums are being enabled in the old cluster");
-
-	/*
 	 * We might eventually allow upgrades from checksum to no-checksum
 	 * clusters.
 	 */
-	if (oldctrl->data_checksum_version == PG_DATA_CHECKSUM_OFF &&
-		newctrl->data_checksum_version != PG_DATA_CHECKSUM_OFF)
+	if (oldctrl->data_checksum_version == 0 &&
+		newctrl->data_checksum_version != 0)
 		pg_fatal("old cluster does not use data checksums but the new one does");
-	else if (oldctrl->data_checksum_version != PG_DATA_CHECKSUM_OFF &&
-			 newctrl->data_checksum_version == PG_DATA_CHECKSUM_OFF)
+	else if (oldctrl->data_checksum_version != 0 &&
+			 newctrl->data_checksum_version == 0)
 		pg_fatal("old cluster uses data checksums but the new one does not");
 	else if (oldctrl->data_checksum_version != newctrl->data_checksum_version)
 		pg_fatal("old and new cluster pg_controldata checksum versions do not match");
@@ -677,34 +709,25 @@ check_control_data(ControlData *oldctrl,
 
 
 void
-disable_old_cluster(transferMode transfer_mode)
+disable_old_cluster(void)
 {
 	char		old_path[MAXPGPATH],
 				new_path[MAXPGPATH];
 
 	/* rename pg_control so old server cannot be accidentally started */
-	/* translator: %s is the file path of the control file */
-	prep_status("Adding \".old\" suffix to old \"%s\"", XLOG_CONTROL_FILE);
+	prep_status("Adding \".old\" suffix to old global/pg_control");
 
-	snprintf(old_path, sizeof(old_path), "%s/%s", old_cluster.pgdata, XLOG_CONTROL_FILE);
-	snprintf(new_path, sizeof(new_path), "%s/%s.old", old_cluster.pgdata, XLOG_CONTROL_FILE);
+	snprintf(old_path, sizeof(old_path), "%s/global/pg_control", old_cluster.pgdata);
+	snprintf(new_path, sizeof(new_path), "%s/global/pg_control.old", old_cluster.pgdata);
 	if (pg_mv_file(old_path, new_path) != 0)
 		pg_fatal("could not rename file \"%s\" to \"%s\": %m",
 				 old_path, new_path);
 	check_ok();
 
-	if (transfer_mode == TRANSFER_MODE_LINK)
-		/* translator: %s/%s is the file path of the control file */
-		pg_log(PG_REPORT, "\n"
-			   "If you want to start the old cluster, you will need to remove\n"
-			   "the \".old\" suffix from \"%s/%s.old\".\n"
-			   "Because \"link\" mode was used, the old cluster cannot be safely\n"
-			   "started once the new cluster has been started.",
-			   old_cluster.pgdata, XLOG_CONTROL_FILE);
-	else if (transfer_mode == TRANSFER_MODE_SWAP)
-		pg_log(PG_REPORT, "\n"
-			   "Because \"swap\" mode was used, the old cluster can no longer be\n"
-			   "safely started.");
-	else
-		pg_fatal("unrecognized transfer mode");
+	pg_log(PG_REPORT, "\n"
+		   "If you want to start the old cluster, you will need to remove\n"
+		   "the \".old\" suffix from %s/global/pg_control.old.\n"
+		   "Because \"link\" mode was used, the old cluster cannot be safely\n"
+		   "started once the new cluster has been started.",
+		   old_cluster.pgdata);
 }

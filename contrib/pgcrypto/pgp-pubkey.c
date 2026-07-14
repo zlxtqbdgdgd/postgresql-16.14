@@ -39,7 +39,7 @@ pgp_key_alloc(PGP_PubKey **pk_p)
 {
 	PGP_PubKey *pk;
 
-	pk = palloc0_object(PGP_PubKey);
+	pk = palloc0(sizeof(*pk));
 	*pk_p = pk;
 	return 0;
 }

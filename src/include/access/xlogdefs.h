@@ -4,7 +4,7 @@
  * Postgres write-ahead log manager record pointer and
  * timeline number definitions
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlogdefs.h
@@ -39,12 +39,9 @@ typedef uint64 XLogRecPtr;
 /*
  * Handy macro for printing XLogRecPtr in conventional format, e.g.,
  *
- * printf("%X/%08X", LSN_FORMAT_ARGS(lsn));
- *
- * To avoid breaking translatable messages, we're directly applying the
- * LSN format instead of using a macro.
+ * printf("%X/%X", LSN_FORMAT_ARGS(lsn));
  */
-#define LSN_FORMAT_ARGS(lsn) (StaticAssertVariableIsOfTypeMacro((lsn), XLogRecPtr), (uint32) ((lsn) >> 32)), ((uint32) (lsn))
+#define LSN_FORMAT_ARGS(lsn) (AssertVariableIsOfTypeMacro((lsn), XLogRecPtr), (uint32) ((lsn) >> 32)), ((uint32) (lsn))
 
 /*
  * XLogSegNo - physical log file sequence number.
@@ -66,7 +63,7 @@ typedef uint32 TimeLineID;
  * Replication origin id - this is located in this file to avoid having to
  * include origin.h in a bunch of xlog related places.
  */
-typedef uint16 ReplOriginId;
+typedef uint16 RepOriginId;
 
 /*
  * This chunk of hackery attempts to determine which file sync methods
@@ -75,12 +72,12 @@ typedef uint16 ReplOriginId;
  *
  * Note that we define our own O_DSYNC on Windows, but not O_SYNC.
  */
-#if defined(PLATFORM_DEFAULT_WAL_SYNC_METHOD)
-#define DEFAULT_WAL_SYNC_METHOD		PLATFORM_DEFAULT_WAL_SYNC_METHOD
+#if defined(PLATFORM_DEFAULT_SYNC_METHOD)
+#define DEFAULT_SYNC_METHOD		PLATFORM_DEFAULT_SYNC_METHOD
 #elif defined(O_DSYNC) && (!defined(O_SYNC) || O_DSYNC != O_SYNC)
-#define DEFAULT_WAL_SYNC_METHOD		WAL_SYNC_METHOD_OPEN_DSYNC
+#define DEFAULT_SYNC_METHOD		SYNC_METHOD_OPEN_DSYNC
 #else
-#define DEFAULT_WAL_SYNC_METHOD		WAL_SYNC_METHOD_FDATASYNC
+#define DEFAULT_SYNC_METHOD		SYNC_METHOD_FDATASYNC
 #endif
 
 #endif							/* XLOG_DEFS_H */

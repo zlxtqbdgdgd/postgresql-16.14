@@ -11,7 +11,7 @@
  * The following code is written with the assumption that the OUI field
  * size is 24 bits.
  *
- * Portions Copyright (c) 1998-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1998-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/utils/adt/mac8.c
@@ -23,8 +23,7 @@
 
 #include "common/hashfn.h"
 #include "libpq/pqformat.h"
-#include "nodes/nodes.h"
-#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 #include "utils/inet.h"
 
 /*
@@ -207,7 +206,7 @@ macaddr8_in(PG_FUNCTION_ARGS)
 	else if (count != 8)
 		goto fail;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 
 	result->a = a;
 	result->b = b;
@@ -256,7 +255,7 @@ macaddr8_recv(PG_FUNCTION_ARGS)
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	macaddr8   *addr;
 
-	addr = palloc0_object(macaddr8);
+	addr = (macaddr8 *) palloc0(sizeof(macaddr8));
 
 	addr->a = pq_getmsgbyte(buf);
 	addr->b = pq_getmsgbyte(buf);
@@ -417,7 +416,7 @@ macaddr8_not(PG_FUNCTION_ARGS)
 	macaddr8   *addr = PG_GETARG_MACADDR8_P(0);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 	result->a = ~addr->a;
 	result->b = ~addr->b;
 	result->c = ~addr->c;
@@ -437,7 +436,7 @@ macaddr8_and(PG_FUNCTION_ARGS)
 	macaddr8   *addr2 = PG_GETARG_MACADDR8_P(1);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 	result->a = addr1->a & addr2->a;
 	result->b = addr1->b & addr2->b;
 	result->c = addr1->c & addr2->c;
@@ -457,7 +456,7 @@ macaddr8_or(PG_FUNCTION_ARGS)
 	macaddr8   *addr2 = PG_GETARG_MACADDR8_P(1);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 	result->a = addr1->a | addr2->a;
 	result->b = addr1->b | addr2->b;
 	result->c = addr1->c | addr2->c;
@@ -479,7 +478,7 @@ macaddr8_trunc(PG_FUNCTION_ARGS)
 	macaddr8   *addr = PG_GETARG_MACADDR8_P(0);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 
 	result->a = addr->a;
 	result->b = addr->b;
@@ -502,7 +501,7 @@ macaddr8_set7bit(PG_FUNCTION_ARGS)
 	macaddr8   *addr = PG_GETARG_MACADDR8_P(0);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 
 	result->a = addr->a | 0x02;
 	result->b = addr->b;
@@ -526,7 +525,7 @@ macaddrtomacaddr8(PG_FUNCTION_ARGS)
 	macaddr    *addr6 = PG_GETARG_MACADDR_P(0);
 	macaddr8   *result;
 
-	result = palloc0_object(macaddr8);
+	result = (macaddr8 *) palloc0(sizeof(macaddr8));
 
 	result->a = addr6->a;
 	result->b = addr6->b;
@@ -547,10 +546,10 @@ macaddr8tomacaddr(PG_FUNCTION_ARGS)
 	macaddr8   *addr = PG_GETARG_MACADDR8_P(0);
 	macaddr    *result;
 
-	result = palloc0_object(macaddr);
+	result = (macaddr *) palloc0(sizeof(macaddr));
 
 	if ((addr->d != 0xFF) || (addr->e != 0xFE))
-		ereturn(fcinfo->context, (Datum) 0,
+		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("macaddr8 data out of range to convert to macaddr"),
 				 errhint("Only addresses that have FF and FE as values in the "

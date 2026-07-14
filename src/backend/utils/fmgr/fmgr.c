@@ -3,7 +3,7 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,7 +16,6 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "access/htup_details.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -31,7 +30,6 @@
 #include "utils/builtins.h"
 #include "utils/fmgrtab.h"
 #include "utils/guc.h"
-#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -614,9 +612,7 @@ struct fmgr_security_definer_cache
 {
 	FmgrInfo	flinfo;			/* lookup info for target function */
 	Oid			userid;			/* userid to set, or InvalidOid */
-	List	   *configNames;	/* GUC names to set, or NIL */
-	List	   *configHandles;	/* GUC handles to set, or NIL */
-	List	   *configValues;	/* GUC values to set, or NIL */
+	ArrayType  *proconfig;		/* GUC values to set, or NULL */
 	Datum		arg;			/* passthrough argument for plugin modules */
 };
 
@@ -638,10 +634,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 	FmgrInfo   *save_flinfo;
 	Oid			save_userid;
 	int			save_sec_context;
-	ListCell   *lc1,
-			   *lc2,
-			   *lc3;
-	int			save_nestlevel;
+	volatile int save_nestlevel;
 	PgStat_FunctionCallUsage fcusage;
 
 	if (!fcinfo->flinfo->fn_extra)
@@ -673,24 +666,8 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 								&isnull);
 		if (!isnull)
 		{
-			ArrayType  *array;
-			ListCell   *lc;
-
 			oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
-			array = DatumGetArrayTypeP(datum);
-			TransformGUCArray(array, &fcache->configNames,
-							  &fcache->configValues);
-
-			/* transform names to config handles to avoid lookup cost */
-			fcache->configHandles = NIL;
-			foreach(lc, fcache->configNames)
-			{
-				char	   *name = (char *) lfirst(lc);
-
-				fcache->configHandles = lappend(fcache->configHandles,
-												get_config_handle(name));
-			}
-
+			fcache->proconfig = DatumGetArrayTypePCopy(datum);
 			MemoryContextSwitchTo(oldcxt);
 		}
 
@@ -703,7 +680,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	/* GetUserIdAndSecContext is cheap enough that no harm in a wasted call */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	if (fcache->configNames != NIL) /* Need a new GUC nesting level */
+	if (fcache->proconfig)		/* Need a new GUC nesting level */
 		save_nestlevel = NewGUCNestLevel();
 	else
 		save_nestlevel = 0;		/* keep compiler quiet */
@@ -712,20 +689,12 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 		SetUserIdAndSecContext(fcache->userid,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
-	forthree(lc1, fcache->configNames,
-			 lc2, fcache->configHandles,
-			 lc3, fcache->configValues)
+	if (fcache->proconfig)
 	{
-		GucContext	context = superuser() ? PGC_SUSET : PGC_USERSET;
-		GucSource	source = PGC_S_SESSION;
-		GucAction	action = GUC_ACTION_SAVE;
-		char	   *name = lfirst(lc1);
-		config_handle *handle = lfirst(lc2);
-		char	   *value = lfirst(lc3);
-
-		(void) set_config_with_handle(name, handle, value,
-									  context, source, GetUserId(),
-									  action, true, 0, false);
+		ProcessGUCArray(fcache->proconfig,
+						(superuser() ? PGC_SUSET : PGC_USERSET),
+						PGC_S_SESSION,
+						GUC_ACTION_SAVE);
 	}
 
 	/* function manager hook */
@@ -768,7 +737,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	fcinfo->flinfo = save_flinfo;
 
-	if (fcache->configNames != NIL)
+	if (fcache->proconfig)
 		AtEOXact_GUC(true, save_nestlevel);
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(save_userid, save_sec_context);
@@ -1572,6 +1541,7 @@ InputFunctionCall(FmgrInfo *flinfo, char *str, Oid typioparam, int32 typmod)
  * This is basically like InputFunctionCall, but the converted Datum is
  * returned into *result while the function result is true for success or
  * false for failure.  Also, the caller may pass an ErrorSaveContext node.
+ * (We declare that as "fmNodePtr" to avoid including nodes.h in fmgr.h.)
  *
  * If escontext points to an ErrorSaveContext, any "soft" errors detected by
  * the input function will be reported by filling the escontext struct and
@@ -1585,7 +1555,7 @@ InputFunctionCall(FmgrInfo *flinfo, char *str, Oid typioparam, int32 typmod)
 bool
 InputFunctionCallSafe(FmgrInfo *flinfo, char *str,
 					  Oid typioparam, int32 typmod,
-					  Node *escontext,
+					  fmNodePtr escontext,
 					  Datum *result)
 {
 	LOCAL_FCINFO(fcinfo, 3);
@@ -1640,7 +1610,7 @@ InputFunctionCallSafe(FmgrInfo *flinfo, char *str,
 bool
 DirectInputFunctionCallSafe(PGFunction func, char *str,
 							Oid typioparam, int32 typmod,
-							Node *escontext,
+							fmNodePtr escontext,
 							Datum *result)
 {
 	LOCAL_FCINFO(fcinfo, 3);
@@ -1790,12 +1760,47 @@ OidSendFunctionCall(Oid functionId, Datum val)
 
 
 /*-------------------------------------------------------------------------
+ *		Support routines for standard maybe-pass-by-reference datatypes
+ *
+ * int8 and float8 can be passed by value if Datum is wide enough.
+ * (For backwards-compatibility reasons, we allow pass-by-ref to be chosen
+ * at compile time even if pass-by-val is possible.)
+ *
+ * Note: there is only one switch controlling the pass-by-value option for
+ * both int8 and float8; this is to avoid making things unduly complicated
+ * for the timestamp types, which might have either representation.
+ *-------------------------------------------------------------------------
+ */
+
+#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
+
+Datum
+Int64GetDatum(int64 X)
+{
+	int64	   *retval = (int64 *) palloc(sizeof(int64));
+
+	*retval = X;
+	return PointerGetDatum(retval);
+}
+
+Datum
+Float8GetDatum(float8 X)
+{
+	float8	   *retval = (float8 *) palloc(sizeof(float8));
+
+	*retval = X;
+	return PointerGetDatum(retval);
+}
+#endif							/* USE_FLOAT8_BYVAL */
+
+
+/*-------------------------------------------------------------------------
  *		Support routines for toastable datatypes
  *-------------------------------------------------------------------------
  */
 
-varlena *
-pg_detoast_datum(varlena *datum)
+struct varlena *
+pg_detoast_datum(struct varlena *datum)
 {
 	if (VARATT_IS_EXTENDED(datum))
 		return detoast_attr(datum);
@@ -1803,8 +1808,8 @@ pg_detoast_datum(varlena *datum)
 		return datum;
 }
 
-varlena *
-pg_detoast_datum_copy(varlena *datum)
+struct varlena *
+pg_detoast_datum_copy(struct varlena *datum)
 {
 	if (VARATT_IS_EXTENDED(datum))
 		return detoast_attr(datum);
@@ -1812,22 +1817,22 @@ pg_detoast_datum_copy(varlena *datum)
 	{
 		/* Make a modifiable copy of the varlena object */
 		Size		len = VARSIZE(datum);
-		varlena    *result = (varlena *) palloc(len);
+		struct varlena *result = (struct varlena *) palloc(len);
 
 		memcpy(result, datum, len);
 		return result;
 	}
 }
 
-varlena *
-pg_detoast_datum_slice(varlena *datum, int32 first, int32 count)
+struct varlena *
+pg_detoast_datum_slice(struct varlena *datum, int32 first, int32 count)
 {
 	/* Only get the specified portion from the toast rel */
 	return detoast_attr_slice(datum, first, count);
 }
 
-varlena *
-pg_detoast_datum_packed(varlena *datum)
+struct varlena *
+pg_detoast_datum_packed(struct varlena *datum)
 {
 	if (VARATT_IS_COMPRESSED(datum) || VARATT_IS_EXTERNAL(datum))
 		return detoast_attr(datum);

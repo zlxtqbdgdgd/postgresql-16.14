@@ -1,12 +1,12 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Tests for peer authentication and user name map.
 # The test is skipped if the platform does not support peer authentication,
 # and is only able to run with Unix-domain sockets.
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -71,9 +71,7 @@ sub test_role
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = authentication\n");
-# Needed to allow connect_fails to inspect postmaster log:
-$node->append_conf('postgresql.conf', "log_min_messages = debug2");
+$node->append_conf('postgresql.conf', "log_connections = on\n");
 $node->start;
 
 # Set pg_hba.conf with the peer authentication.
@@ -101,12 +99,6 @@ $node->safe_psql('postgres', 'GRANT "testmapgroupliteral\\1" TO testmapuser');
 my $system_user =
   $node->safe_psql('postgres',
 	q(select (string_to_array(SYSTEM_USER, ':'))[2]));
-
-# While on it, check the status of huge pages, that can be either on
-# or off, but never unknown.
-my $huge_pages_status =
-  $node->safe_psql('postgres', q(SHOW huge_pages_status;));
-isnt($huge_pages_status, 'unknown', "check huge_pages_status");
 
 # Tests without the user name map.
 # Failure as connection is attempted with a database role not mapping
@@ -171,8 +163,7 @@ test_role(
 
 # Test with regular expression in user name map.
 # Extract the last 3 characters from the system_user
-# or the entire system_user name (if its length is <= 3).
-# We trust this will not include any regex metacharacters.
+# or the entire system_user (if its length is <= -3).
 my $regex_test_string = substr($system_user, -3);
 
 # Success as the system user regular expression matches.
@@ -211,17 +202,12 @@ test_role(
 	log_like =>
 	  [qr/connection authenticated: identity="$system_user" method=peer/]);
 
-# Create target role for \1 tests.
-my $mapped_name = "test${regex_test_string}map${regex_test_string}user";
-$node->safe_psql('postgres', "CREATE ROLE $mapped_name LOGIN");
-
 # Success as the regular expression matches and \1 is replaced in the given
 # subexpression.
-reset_pg_ident($node, 'mypeermap', qq{/^.*($regex_test_string)\$},
-	'test\1map\1user');
+reset_pg_ident($node, 'mypeermap', qq{/^$system_user(.*)\$}, 'test\1mapuser');
 test_role(
 	$node,
-	$mapped_name,
+	qq{testmapuser},
 	'peer',
 	0,
 	'with regular expression in user name map with \1 replaced',
@@ -230,11 +216,11 @@ test_role(
 
 # Success as the regular expression matches and \1 is replaced in the given
 # subexpression, even if quoted.
-reset_pg_ident($node, 'mypeermap', qq{/^.*($regex_test_string)\$},
-	'"test\1map\1user"');
+reset_pg_ident($node, 'mypeermap', qq{/^$system_user(.*)\$},
+	'"test\1mapuser"');
 test_role(
 	$node,
-	$mapped_name,
+	qq{testmapuser},
 	'peer',
 	0,
 	'with regular expression in user name map with quoted \1 replaced',

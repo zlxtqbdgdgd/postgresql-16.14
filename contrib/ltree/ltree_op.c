@@ -7,16 +7,14 @@
 
 #include <ctype.h>
 
-#include "common/hashfn.h"
+#include "access/htup_details.h"
+#include "catalog/pg_statistic.h"
 #include "ltree.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
-#include "varatt.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "ltree",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /* compare functions */
 PG_FUNCTION_INFO_V1(ltree_cmp);
@@ -26,8 +24,6 @@ PG_FUNCTION_INFO_V1(ltree_eq);
 PG_FUNCTION_INFO_V1(ltree_ne);
 PG_FUNCTION_INFO_V1(ltree_ge);
 PG_FUNCTION_INFO_V1(ltree_gt);
-PG_FUNCTION_INFO_V1(hash_ltree);
-PG_FUNCTION_INFO_V1(hash_ltree_extended);
 PG_FUNCTION_INFO_V1(nlevel);
 PG_FUNCTION_INFO_V1(ltree_isparent);
 PG_FUNCTION_INFO_V1(ltree_risparent);
@@ -42,9 +38,6 @@ PG_FUNCTION_INFO_V1(ltree2text);
 PG_FUNCTION_INFO_V1(text2ltree);
 PG_FUNCTION_INFO_V1(ltreeparentsel);
 
-/*
- * btree-comparison function.
- */
 int
 ltree_compare(const ltree *a, const ltree *b)
 {
@@ -57,52 +50,18 @@ ltree_compare(const ltree *a, const ltree *b)
 	{
 		int			res;
 
-		res = memcmp(al->name, bl->name, Min(al->len, bl->len));
-		if (res == 0)
+		if ((res = memcmp(al->name, bl->name, Min(al->len, bl->len))) == 0)
 		{
 			if (al->len != bl->len)
-				return (int) al->len - (int) bl->len;
-		}
-		else
-			return res;
-
-		an--;
-		bn--;
-		al = LEVEL_NEXT(al);
-		bl = LEVEL_NEXT(bl);
-	}
-
-	return a->numlevel - b->numlevel;
-}
-
-/*
- * Returns a "distance" between a and b.  If a < b, the distance is negative,
- * consistent with the ltree_compare() ordering.
- */
-float
-ltree_compare_distance(const ltree *a, const ltree *b)
-{
-	ltree_level *al = LTREE_FIRST(a);
-	ltree_level *bl = LTREE_FIRST(b);
-	int			an = a->numlevel;
-	int			bn = b->numlevel;
-
-	while (an > 0 && bn > 0)
-	{
-		int			res;
-
-		res = memcmp(al->name, bl->name, Min(al->len, bl->len));
-		if (res == 0)
-		{
-			if (al->len != bl->len)
-				return (float) (al->len - bl->len) * 10.0 * (an + 1);
+				return (al->len - bl->len) * 10 * (an + 1);
 		}
 		else
 		{
 			if (res < 0)
-				return -1.0 * 10.0 * (an + 1);
+				res = -1;
 			else
-				return 1.0 * 10.0 * (an + 1);
+				res = 1;
+			return res * 10 * (an + 1);
 		}
 
 		an--;
@@ -111,7 +70,7 @@ ltree_compare_distance(const ltree *a, const ltree *b)
 		bl = LEVEL_NEXT(bl);
 	}
 
-	return ((float) (a->numlevel - b->numlevel)) * 10.0 * (an + 1);
+	return (a->numlevel - b->numlevel) * 10 * (an + 1);
 }
 
 #define RUNCMP						\
@@ -168,72 +127,6 @@ ltree_ne(PG_FUNCTION_ARGS)
 {
 	RUNCMP;
 	PG_RETURN_BOOL(res != 0);
-}
-
-/* Compute a hash for the ltree */
-Datum
-hash_ltree(PG_FUNCTION_ARGS)
-{
-	ltree	   *a = PG_GETARG_LTREE_P(0);
-	uint32		result = 1;
-	int			an = a->numlevel;
-	ltree_level *al = LTREE_FIRST(a);
-
-	while (an > 0)
-	{
-		uint32		levelHash = DatumGetUInt32(hash_any((unsigned char *) al->name, al->len));
-
-		/*
-		 * Combine hash values of successive elements by multiplying the
-		 * current value by 31 and adding on the new element's hash value.
-		 *
-		 * This method is borrowed from hash_array(), which see for further
-		 * commentary.
-		 */
-		result = (result << 5) - result + levelHash;
-
-		an--;
-		al = LEVEL_NEXT(al);
-	}
-
-	PG_FREE_IF_COPY(a, 0);
-	PG_RETURN_UINT32(result);
-}
-
-/* Compute an extended hash for the ltree */
-Datum
-hash_ltree_extended(PG_FUNCTION_ARGS)
-{
-	ltree	   *a = PG_GETARG_LTREE_P(0);
-	const uint64 seed = PG_GETARG_INT64(1);
-	uint64		result = 1;
-	int			an = a->numlevel;
-	ltree_level *al = LTREE_FIRST(a);
-
-	/*
-	 * If the path has length zero, return 1 + seed to ensure that the low 32
-	 * bits of the result match hash_ltree when the seed is 0, as required by
-	 * the hash index support functions, but to also return a different value
-	 * when there is a seed.
-	 */
-	if (an == 0)
-	{
-		PG_FREE_IF_COPY(a, 0);
-		PG_RETURN_UINT64(result + seed);
-	}
-
-	while (an > 0)
-	{
-		uint64		levelHash = DatumGetUInt64(hash_any_extended((unsigned char *) al->name, al->len, seed));
-
-		result = (result << 5) - result + levelHash;
-
-		an--;
-		al = LEVEL_NEXT(al);
-	}
-
-	PG_FREE_IF_COPY(a, 0);
-	PG_RETURN_UINT64(result);
 }
 
 Datum
@@ -353,15 +246,23 @@ subpath(PG_FUNCTION_ARGS)
 	int32		end;
 	ltree	   *res;
 
+	end = start + len;
+
 	if (start < 0)
+	{
 		start = t->numlevel + start;
+		end = start + len;
+	}
+	if (start < 0)
+	{							/* start > t->numlevel */
+		start = t->numlevel + start;
+		end = start + len;
+	}
 
 	if (len < 0)
 		end = t->numlevel + len;
 	else if (len == 0)
-		end = (fcinfo->nargs == 3) ? start : LTREE_MAX_LEVELS;
-	else
-		end = start + len;
+		end = (fcinfo->nargs == 3) ? start : 0xffff;
 
 	res = inner_subltree(t, start, end);
 
@@ -603,7 +504,7 @@ lca(PG_FUNCTION_ARGS)
 	ltree	  **a,
 			   *res;
 
-	a = palloc_array(ltree *, fcinfo->nargs);
+	a = (ltree **) palloc(sizeof(ltree *) * fcinfo->nargs);
 	for (i = 0; i < fcinfo->nargs; i++)
 		a[i] = PG_GETARG_LTREE_P(i);
 	res = lca_inner(a, (int) fcinfo->nargs);

@@ -17,7 +17,7 @@
  * any database access.
  *
  *
- * Copyright (c) 2006-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2006-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/cache/ts_cache.c
@@ -44,7 +44,6 @@
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc_hooks.h"
-#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -92,7 +91,7 @@ static Oid	TSCurrentConfigCache = InvalidOid;
  * table address as the "arg".
  */
 static void
-InvalidateTSCacheCallBack(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
+InvalidateTSCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 {
 	HTAB	   *hash = (HTAB *) DatumGetPointer(arg);
 	HASH_SEQ_STATUS status;
@@ -322,9 +321,7 @@ lookup_ts_dictionary_cache(Oid dictId)
 
 			/*
 			 * Init method runs in dictionary's private memory context, and we
-			 * make sure the options are stored there too.  This typically
-			 * results in a small amount of memory leakage, but it's not worth
-			 * complicating the API for tmplinit functions to avoid it.
+			 * make sure the options are stored there too
 			 */
 			oldcontext = MemoryContextSwitchTo(entry->dictCtx);
 

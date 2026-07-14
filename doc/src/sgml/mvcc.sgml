@@ -368,18 +368,6 @@
 
    <para>
     <command>INSERT</command> with an <literal>ON CONFLICT DO
-    SELECT</literal> clause behaves similarly to <literal>ON CONFLICT DO
-    UPDATE</literal>.  In Read Committed mode, each row proposed for insertion
-    is guaranteed to either insert or return the conflicting row (unless there are
-    unrelated errors).  If a conflict originates in another transaction whose
-    effects are not yet visible to the <command>INSERT</command>, the command
-    will wait for that transaction to commit or roll back, then return the
-    conflicting row if it was committed (even though that row was not visible
-    when the command started).
-   </para>
-
-   <para>
-    <command>INSERT</command> with an <literal>ON CONFLICT DO
     NOTHING</literal> clause may have insertion not proceed for a row due to
     the outcome of another transaction whose effects are not visible
     to the <command>INSERT</command> snapshot.  Again, this is only
@@ -406,14 +394,10 @@
     conditions for each action are re-evaluated on the updated version of
     the row, starting from the first action, even if the action that had
     originally matched appears later in the list of actions.
-    On the other hand, if the row is concurrently updated so that the join
-    condition fails, then <command>MERGE</command> will evaluate the
-    command's <literal>NOT MATCHED BY SOURCE</literal> and
-    <literal>NOT MATCHED [BY TARGET]</literal> actions next, and execute
-    the first one of each kind that succeeds.
-    If the row is concurrently deleted, then <command>MERGE</command>
-    will evaluate the command's <literal>NOT MATCHED [BY TARGET]</literal>
-    actions, and execute the first one that succeeds.
+    On the other hand, if the row is concurrently updated or deleted so
+    that the join condition fails, then <command>MERGE</command> will
+    evaluate the condition's <literal>NOT MATCHED</literal> actions next,
+    and execute the first one that succeeds.
     If <command>MERGE</command> attempts an <command>INSERT</command>
     and a unique index is present and a duplicate row is concurrently
     inserted, then a uniqueness violation error is raised;
@@ -429,8 +413,8 @@
     does not see effects of those commands on other rows in the database.
     This behavior makes Read Committed mode unsuitable for commands that
     involve complex search conditions; however, it is just right for simpler
-    cases.  For example, consider transferring $100 from one account
-    to another:
+    cases.  For example, consider updating bank balances with transactions
+    like:
 
 <screen>
 BEGIN;
@@ -439,8 +423,8 @@ UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 7534;
 COMMIT;
 </screen>
 
-    If another transaction concurrently tries to change the balance of account
-    7534, we clearly want the second statement to start with the updated
+    If two such transactions concurrently try to change the balance of account
+    12345, we clearly want the second transaction to start with the updated
     version of the account's row.  Because each command is affecting only a
     predetermined row, letting it see the updated version of the row does
     not create any troublesome inconsistency.
@@ -1248,44 +1232,6 @@ ERROR:  could not serialize access due to read/write dependencies among transact
       </tbody>
      </tgroup>
     </table>
-
-    <sect3 id="locking-tables-fast-path">
-     <title>Fast-Path Locking</title>
-
-     <indexterm zone="locking-tables-fast-path">
-      <primary>fast-path locking</primary>
-     </indexterm>
-
-     <para>
-      Internally, <productname>PostgreSQL</productname> can record some
-      table-level locks using a <firstterm>fast-path locking</firstterm>
-      mechanism instead of the main lock table. This reduces the overhead of
-      acquiring and releasing locks that rarely conflict. It is an
-      implementation optimization and does not change lock semantics.
-     </para>
-
-     <para>
-      Fast-path locking can be used only for eligible relation locks in the
-      weak table-level lock modes <literal>ACCESS SHARE</literal>
-      (<literal>AccessShareLock</literal>), <literal>ROW SHARE</literal>
-      (<literal>RowShareLock</literal>), and <literal>ROW EXCLUSIVE</literal>
-      (<literal>RowExclusiveLock</literal>). It does not apply to shared
-      relations (those visible across all databases, such as
-      <structname>pg_authid</structname>). Other lock types, and stronger
-      lock modes on relations, always go through the main lock table.  Even
-      for eligible locks, fast-path is used only when a per-backend slot is
-      available; the number of slots is derived from <xref
-      linkend="guc-max-locks-per-transaction"/>. When no slot is available,
-      the lock is acquired via the main lock table instead.
-     </para>
-
-     <para>
-      Acquiring a lock via the main lock table is considerably more
-      expensive than the fast path, and under heavy concurrent lock
-      activity can become a point of contention (observable as the
-      <literal>LockManager</literal> wait event).
-     </para>
-    </sect3>
    </sect2>
 
    <sect2 id="locking-rows">
@@ -1883,17 +1829,15 @@ SELECT pg_advisory_lock(q.id) FROM
    <title>Caveats</title>
 
    <para>
-    Some commands, currently only <link linkend="sql-truncate"><command>TRUNCATE</command></link>, the
-    table-rewriting forms of <link linkend="sql-altertable"><command>ALTER
-    TABLE</command></link> and <command>REPACK</command> with
-    the <literal>CONCURRENTLY</literal> option, are not
+    Some DDL commands, currently only <link linkend="sql-truncate"><command>TRUNCATE</command></link> and the
+    table-rewriting forms of <link linkend="sql-altertable"><command>ALTER TABLE</command></link>, are not
     MVCC-safe.  This means that after the truncation or rewrite commits, the
     table will appear empty to concurrent transactions, if they are using a
-    snapshot taken before the command committed.  This will only be an
+    snapshot taken before the DDL command committed.  This will only be an
     issue for a transaction that did not access the table in question
-    before the command started &mdash; any transaction that has done so
+    before the DDL command started &mdash; any transaction that has done so
     would hold at least an <literal>ACCESS SHARE</literal> table lock,
-    which would block the truncating or rewriting command until that transaction completes.
+    which would block the DDL command until that transaction completes.
     So these commands will not cause any apparent inconsistency in the
     table contents for successive queries on the target table, but they
     could cause visible inconsistency between the contents of the target

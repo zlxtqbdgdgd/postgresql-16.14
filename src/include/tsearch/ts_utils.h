@@ -3,7 +3,7 @@
  * ts_utils.h
  *	  helper utilities for tsearch
  *
- * Copyright (c) 1998-2026, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2023, PostgreSQL Global Development Group
  *
  * src/include/tsearch/ts_utils.h
  *
@@ -52,7 +52,7 @@ extern void close_tsvector_parser(TSVectorParseState state);
 struct TSQueryParserStateData;	/* private in backend/utils/adt/tsquery.c */
 typedef struct TSQueryParserStateData *TSQueryParserState;
 
-typedef void (*PushFunction) (void *opaque, TSQueryParserState state,
+typedef void (*PushFunction) (Datum opaque, TSQueryParserState state,
 							  char *token, int tokenlen,
 							  int16 tokenweights,	/* bitmap as described in
 													 * QueryOperand struct */
@@ -64,7 +64,7 @@ typedef void (*PushFunction) (void *opaque, TSQueryParserState state,
 
 extern TSQuery parse_tsquery(char *buf,
 							 PushFunction pushval,
-							 void *opaque,
+							 Datum opaque,
 							 int flags,
 							 Node *escontext);
 
@@ -79,10 +79,8 @@ extern void pushOperator(TSQueryParserState state, int8 oper, int16 distance);
  */
 typedef struct
 {
-	uint16		flags;			/* currently, only TSL_PREFIX */
 	uint16		len;
 	uint16		nvariant;
-	uint16		alen;
 	union
 	{
 		uint16		pos;
@@ -90,11 +88,13 @@ typedef struct
 		/*
 		 * When apos array is used, apos[0] is the number of elements in the
 		 * array (excluding apos[0]), and alen is the allocated size of the
-		 * array.  We do not allow more than MAXNUMPOS array elements.
+		 * array.
 		 */
 		uint16	   *apos;
 	}			pos;
+	uint16		flags;			/* currently, only TSL_PREFIX */
 	char	   *word;
+	uint32		alen;
 } ParsedWord;
 
 typedef struct
@@ -131,7 +131,7 @@ typedef enum
 {
 	TS_NO,						/* definitely no match */
 	TS_YES,						/* definitely does match */
-	TS_MAYBE,					/* can't verify match for lack of pos data */
+	TS_MAYBE					/* can't verify match for lack of pos data */
 } TSTernaryValue;
 
 /*

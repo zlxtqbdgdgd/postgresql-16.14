@@ -4,7 +4,7 @@
  *
  * Entrypoints of the hooks in PostgreSQL, and dispatches the callbacks.
  *
- * Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -25,10 +25,7 @@
 #include "utils/guc.h"
 #include "utils/queryenvironment.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "sepgsql",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /*
  * Declarations
@@ -53,7 +50,7 @@ typedef struct
 	 * command. Elsewhere (including the case of default) NULL.
 	 */
 	const char *createdb_dtemplate;
-} sepgsql_context_info_t;
+}			sepgsql_context_info_t;
 
 static sepgsql_context_info_t sepgsql_context_info;
 
@@ -397,7 +394,7 @@ sepgsql_utility_command(PlannedStmt *pstmt,
 }
 
 /*
- * Module load callback
+ * Module load/unload callback
  */
 void
 _PG_init(void)
@@ -409,7 +406,7 @@ _PG_init(void)
 	if (IsUnderPostmaster)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("sepgsql must be loaded via \"shared_preload_libraries\"")));
+				 errmsg("sepgsql must be loaded via shared_preload_libraries")));
 
 	/*
 	 * Check availability of SELinux on the platform. If disabled, we cannot

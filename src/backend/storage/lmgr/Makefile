@@ -18,23 +18,35 @@ OBJS = \
 	lmgr.o \
 	lock.o \
 	lwlock.o \
+	lwlocknames.o \
 	predicate.o \
 	proc.o \
 	s_lock.o \
+	spin.o
 
 include $(top_srcdir)/src/backend/common.mk
 
+ifdef TAS
+TASPATH = $(top_builddir)/src/backend/port/tas.o
+endif
+
 s_lock_test: s_lock.c $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DS_LOCK_TEST=1 $(srcdir)/s_lock.c \
-		-L $(top_builddir)/src/common -lpgcommon \
-		-L $(top_builddir)/src/port -lpgport -lm -o s_lock_test
+		$(TASPATH) -L $(top_builddir)/src/common -lpgcommon \
+		-L $(top_builddir)/src/port -lpgport -o s_lock_test
 
-lwlocknames.h: ../../../include/storage/lwlocklist.h ../../utils/activity/wait_event_names.txt generate-lwlocknames.pl
-	$(PERL) $(srcdir)/generate-lwlocknames.pl $^
+# see notes in src/backend/parser/Makefile
+lwlocknames.c: lwlocknames.h
+	touch $@
+
+lwlocknames.h: $(top_srcdir)/src/backend/storage/lmgr/lwlocknames.txt generate-lwlocknames.pl
+	$(PERL) $(srcdir)/generate-lwlocknames.pl $<
 
 check: s_lock_test
 	./s_lock_test
 
-clean:
+clean distclean:
 	rm -f s_lock_test
-	rm -f lwlocknames.h
+
+maintainer-clean: clean
+	rm -f lwlocknames.h lwlocknames.c

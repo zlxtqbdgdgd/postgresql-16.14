@@ -21,7 +21,6 @@ OBJS = \
 	guc_funcs.o \
 	guc_tables.o \
 	help_config.o \
-	injection_point.o \
 	pg_config.o \
 	pg_controldata.o \
 	pg_rusage.o \
@@ -29,7 +28,6 @@ OBJS = \
 	queryenvironment.o \
 	rls.o \
 	sampling.o \
-	stack_depth.o \
 	superuser.o \
 	timeout.o \
 	tzparser.o
@@ -40,10 +38,8 @@ ifdef krb_srvtab
 override CPPFLAGS += -DPG_KRB_SRVTAB='"$(krb_srvtab)"'
 endif
 
-# Force this dependency to be known even without dependency info built:
-guc_tables.o: guc_tables.c $(top_builddir)/src/backend/utils/guc_tables.inc.c
-
 include $(top_srcdir)/src/backend/common.mk
 
+# Note: guc-file.c is not deleted by 'make clean',
+# since we want to ship it in distribution tarballs.
 clean:
-	rm -f guc-file.c

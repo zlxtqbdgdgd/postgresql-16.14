@@ -4,7 +4,7 @@
  *	  XML data type support.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/utils/adt/xml.c
@@ -47,7 +47,6 @@
 
 #ifdef USE_LIBXML
 #include <libxml/chvalid.h>
-#include <libxml/entities.h>
 #include <libxml/parser.h>
 #include <libxml/parserInternals.h>
 #include <libxml/tree.h>
@@ -84,6 +83,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
+#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "executor/tablefunc.h"
 #include "fmgr.h"
@@ -99,6 +99,7 @@
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/xml.h"
@@ -221,14 +222,14 @@ static void XmlTableDestroyOpaque(struct TableFuncScanState *state);
 
 const TableFuncRoutine XmlTableRoutine =
 {
-	.InitOpaque = XmlTableInitOpaque,
-	.SetDocument = XmlTableSetDocument,
-	.SetNamespace = XmlTableSetNamespace,
-	.SetRowFilter = XmlTableSetRowFilter,
-	.SetColumnFilter = XmlTableSetColumnFilter,
-	.FetchRow = XmlTableFetchRow,
-	.GetValue = XmlTableGetValue,
-	.DestroyOpaque = XmlTableDestroyOpaque
+	XmlTableInitOpaque,
+	XmlTableSetDocument,
+	XmlTableSetNamespace,
+	XmlTableSetRowFilter,
+	XmlTableSetColumnFilter,
+	XmlTableFetchRow,
+	XmlTableGetValue,
+	XmlTableDestroyOpaque
 };
 
 #define NO_XML_SUPPORT() \
@@ -343,7 +344,7 @@ xml_out_internal(xmltype *x, pg_enc target_encoding)
 	}
 
 	ereport(WARNING,
-			errcode(ERRCODE_DATA_CORRUPTED),
+			errcode(ERRCODE_INTERNAL_ERROR),
 			errmsg_internal("could not parse XML declaration in stored value"),
 			errdetail_for_xml_code(res_code));
 #endif
@@ -372,7 +373,6 @@ xml_recv(PG_FUNCTION_ARGS)
 #ifdef USE_LIBXML
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	xmltype    *result;
-	const char *input;
 	char	   *str;
 	char	   *newstr;
 	int			nbytes;
@@ -386,7 +386,7 @@ xml_recv(PG_FUNCTION_ARGS)
 	 * parse that before converting to server encoding.
 	 */
 	nbytes = buf->len - buf->cursor;
-	input = pq_getmsgbytes(buf, nbytes);
+	str = (char *) pq_getmsgbytes(buf, nbytes);
 
 	/*
 	 * We need a null-terminated string to pass to parse_xml_decl().  Rather
@@ -395,7 +395,7 @@ xml_recv(PG_FUNCTION_ARGS)
 	 */
 	result = palloc(nbytes + 1 + VARHDRSZ);
 	SET_VARSIZE(result, nbytes + VARHDRSZ);
-	memcpy(VARDATA(result), input, nbytes);
+	memcpy(VARDATA(result), str, nbytes);
 	str = VARDATA(result);
 	str[nbytes] = '\0';
 
@@ -523,49 +523,6 @@ xmlcomment(PG_FUNCTION_ARGS)
 }
 
 
-Datum
-xmltext(PG_FUNCTION_ARGS)
-{
-#ifdef USE_LIBXML
-	text	   *arg = PG_GETARG_TEXT_PP(0);
-	text	   *result;
-	xmlChar    *volatile xmlbuf = NULL;
-	PgXmlErrorContext *xmlerrcxt;
-
-	/* First we gotta spin up some error handling. */
-	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
-
-	PG_TRY();
-	{
-		xmlbuf = xmlEncodeSpecialChars(NULL, xml_text2xmlChar(arg));
-
-		if (xmlbuf == NULL || xmlerrcxt->err_occurred)
-			xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
-						"could not allocate xmlChar");
-
-		result = cstring_to_text_with_len((const char *) xmlbuf,
-										  xmlStrlen(xmlbuf));
-	}
-	PG_CATCH();
-	{
-		if (xmlbuf)
-			xmlFree(xmlbuf);
-
-		pg_xml_done(xmlerrcxt, true);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	xmlFree(xmlbuf);
-	pg_xml_done(xmlerrcxt, false);
-
-	PG_RETURN_XML_P(result);
-#else
-	NO_XML_SUPPORT();
-	return 0;
-#endif							/* not USE_LIBXML */
-}
-
 
 /*
  * TODO: xmlconcat needs to merge the notations and unparsed entities
@@ -660,7 +617,7 @@ texttoxml(PG_FUNCTION_ARGS)
 {
 	text	   *data = PG_GETARG_TEXT_PP(0);
 
-	PG_RETURN_XML_P(xmlparse(data, xmloption, true, fcinfo->context));
+	PG_RETURN_XML_P(xmlparse(data, xmloption, true));
 }
 
 
@@ -769,7 +726,7 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 		{
 			/* If it's a document, saving is easy. */
 			if (xmlSaveDoc(ctxt, doc) == -1 || xmlerrcxt->err_occurred)
-				xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+				xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 							"could not save document to xmlBuffer");
 		}
 		else if (content_nodes != NULL)
@@ -797,10 +754,7 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 			if (oldroot != NULL)
 				xmlFreeNode(oldroot);
 
-			if (xmlAddChildList(root, content_nodes) == NULL ||
-				xmlerrcxt->err_occurred)
-				xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
-							"could not append xml node list");
+			xmlAddChildList(root, content_nodes);
 
 			/*
 			 * We use this node to insert newlines in the dump.  Note: in at
@@ -822,7 +776,7 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 					if (xmlSaveTree(ctxt, newline) == -1 || xmlerrcxt->err_occurred)
 					{
 						xmlFreeNode(newline);
-						xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+						xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 									"could not save newline to xmlBuffer");
 					}
 				}
@@ -830,7 +784,7 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 				if (xmlSaveTree(ctxt, node) == -1 || xmlerrcxt->err_occurred)
 				{
 					xmlFreeNode(newline);
-					xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+					xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 								"could not save content to xmlBuffer");
 				}
 			}
@@ -892,8 +846,8 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 
 xmltype *
 xmlelement(XmlExpr *xexpr,
-		   const Datum *named_argvalue, const bool *named_argnull,
-		   const Datum *argvalue, const bool *argnull)
+		   Datum *named_argvalue, bool *named_argnull,
+		   Datum *argvalue, bool *argnull)
 {
 #ifdef USE_LIBXML
 	xmltype    *result;
@@ -961,10 +915,7 @@ xmlelement(XmlExpr *xexpr,
 			xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
 						"could not allocate xmlTextWriter");
 
-		if (xmlTextWriterStartElement(writer, (xmlChar *) xexpr->name) < 0 ||
-			xmlerrcxt->err_occurred)
-			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
-						"could not start xml element");
+		xmlTextWriterStartElement(writer, (xmlChar *) xexpr->name);
 
 		forboth(arg, named_arg_strings, narg, xexpr->arg_names)
 		{
@@ -972,30 +923,19 @@ xmlelement(XmlExpr *xexpr,
 			char	   *argname = strVal(lfirst(narg));
 
 			if (str)
-			{
-				if (xmlTextWriterWriteAttribute(writer,
-												(xmlChar *) argname,
-												(xmlChar *) str) < 0 ||
-					xmlerrcxt->err_occurred)
-					xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
-								"could not write xml attribute");
-			}
+				xmlTextWriterWriteAttribute(writer,
+											(xmlChar *) argname,
+											(xmlChar *) str);
 		}
 
 		foreach(arg, arg_strings)
 		{
 			char	   *str = (char *) lfirst(arg);
 
-			if (xmlTextWriterWriteRaw(writer, (xmlChar *) str) < 0 ||
-				xmlerrcxt->err_occurred)
-				xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
-							"could not write raw xml text");
+			xmlTextWriterWriteRaw(writer, (xmlChar *) str);
 		}
 
-		if (xmlTextWriterEndElement(writer) < 0 ||
-			xmlerrcxt->err_occurred)
-			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
-						"could not end xml element");
+		xmlTextWriterEndElement(writer);
 
 		/* we MUST do this now to flush data out to the buffer ... */
 		xmlFreeTextWriter(writer);
@@ -1029,18 +969,14 @@ xmlelement(XmlExpr *xexpr,
 
 
 xmltype *
-xmlparse(text *data, XmlOptionType xmloption_arg, bool preserve_whitespace, Node *escontext)
+xmlparse(text *data, XmlOptionType xmloption_arg, bool preserve_whitespace)
 {
 #ifdef USE_LIBXML
 	xmlDocPtr	doc;
 
 	doc = xml_parse(data, xmloption_arg, preserve_whitespace,
-					GetDatabaseEncoding(), NULL, NULL, escontext);
-	if (doc)
-		xmlFreeDoc(doc);
-
-	if (SOFT_ERROR_OCCURRED(escontext))
-		return NULL;
+					GetDatabaseEncoding(), NULL, NULL, NULL);
+	xmlFreeDoc(doc);
 
 	return (xmltype *) data;
 #else
@@ -1059,7 +995,7 @@ xmlpi(const char *target, text *arg, bool arg_is_null, bool *result_is_null)
 
 	if (pg_strcasecmp(target, "xml") == 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_XML_PROCESSING_INSTRUCTION),
+				(errcode(ERRCODE_SYNTAX_ERROR), /* really */
 				 errmsg("invalid XML processing instruction"),
 				 errdetail("XML processing instruction target name cannot be \"%s\".", target)));
 
@@ -1260,7 +1196,7 @@ pg_xml_init(PgXmlStrictness strictness)
 	pg_xml_init_library();
 
 	/* Create error handling context structure */
-	errcxt = palloc_object(PgXmlErrorContext);
+	errcxt = (PgXmlErrorContext *) palloc(sizeof(PgXmlErrorContext));
 	errcxt->magic = ERRCXT_MAGIC;
 	errcxt->strictness = strictness;
 	errcxt->err_occurred = false;
@@ -1281,7 +1217,7 @@ pg_xml_init(PgXmlStrictness strictness)
 	errcxt->saved_errcxt = xmlGenericErrorContext;
 #endif
 
-	xmlSetStructuredErrorFunc(errcxt, xml_errorHandler);
+	xmlSetStructuredErrorFunc((void *) errcxt, xml_errorHandler);
 
 	/*
 	 * Verify that xmlSetStructuredErrorFunc set the context variable we
@@ -1303,7 +1239,7 @@ pg_xml_init(PgXmlStrictness strictness)
 	new_errcxt = xmlGenericErrorContext;
 #endif
 
-	if (new_errcxt != errcxt)
+	if (new_errcxt != (void *) errcxt)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("could not set up XML error handler"),
@@ -1357,7 +1293,7 @@ pg_xml_done(PgXmlErrorContext *errcxt, bool isError)
 	cur_errcxt = xmlGenericErrorContext;
 #endif
 
-	if (cur_errcxt != errcxt)
+	if (cur_errcxt != (void *) errcxt)
 		elog(WARNING, "libxml error handling state is out of sync with xml.c");
 
 	/* Restore the saved handlers */
@@ -2138,7 +2074,7 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 						   node->type == XML_ELEMENT_NODE) ? node->name : NULL;
 	int			domain = error->domain;
 	int			level = error->level;
-	StringInfoData errorBuf;
+	StringInfo	errorBuf;
 
 	/*
 	 * Defend against someone passing us a bogus context struct.
@@ -2191,7 +2127,7 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 			if (error->code == XML_ERR_NOT_WELL_BALANCED &&
 				xmlerrcxt->err_occurred)
 				return;
-			pg_fallthrough;
+			/* fall through */
 
 		case XML_FROM_NONE:
 		case XML_FROM_MEMORY:
@@ -2215,16 +2151,16 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	}
 
 	/* Prepare error message in errorBuf */
-	initStringInfo(&errorBuf);
+	errorBuf = makeStringInfo();
 
 	if (error->line > 0)
-		appendStringInfo(&errorBuf, "line %d: ", error->line);
+		appendStringInfo(errorBuf, "line %d: ", error->line);
 	if (name != NULL)
-		appendStringInfo(&errorBuf, "element %s: ", name);
+		appendStringInfo(errorBuf, "element %s: ", name);
 	if (error->message != NULL)
-		appendStringInfoString(&errorBuf, error->message);
+		appendStringInfoString(errorBuf, error->message);
 	else
-		appendStringInfoString(&errorBuf, "(no message provided)");
+		appendStringInfoString(errorBuf, "(no message provided)");
 
 	/*
 	 * Append context information to errorBuf.
@@ -2242,11 +2178,11 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 		xmlGenericErrorFunc errFuncSaved = xmlGenericError;
 		void	   *errCtxSaved = xmlGenericErrorContext;
 
-		xmlSetGenericErrorFunc(&errorBuf,
+		xmlSetGenericErrorFunc((void *) errorBuf,
 							   (xmlGenericErrorFunc) appendStringInfo);
 
 		/* Add context information to errorBuf */
-		appendStringInfoLineSeparator(&errorBuf);
+		appendStringInfoLineSeparator(errorBuf);
 
 		xmlParserPrintFileContext(input);
 
@@ -2255,7 +2191,7 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	}
 
 	/* Get rid of any trailing newlines in errorBuf */
-	chopStringInfoNewlines(&errorBuf);
+	chopStringInfoNewlines(errorBuf);
 
 	/*
 	 * Legacy error handling mode.  err_occurred is never set, we just add the
@@ -2268,10 +2204,11 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	if (xmlerrcxt->strictness == PG_XML_STRICTNESS_LEGACY)
 	{
 		appendStringInfoLineSeparator(&xmlerrcxt->err_buf);
-		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf.data,
-							   errorBuf.len);
+		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf->data,
+							   errorBuf->len);
 
-		pfree(errorBuf.data);
+		pfree(errorBuf->data);
+		pfree(errorBuf);
 		return;
 	}
 
@@ -2286,23 +2223,24 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	if (level >= XML_ERR_ERROR)
 	{
 		appendStringInfoLineSeparator(&xmlerrcxt->err_buf);
-		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf.data,
-							   errorBuf.len);
+		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf->data,
+							   errorBuf->len);
 
 		xmlerrcxt->err_occurred = true;
 	}
 	else if (level >= XML_ERR_WARNING)
 	{
 		ereport(WARNING,
-				(errmsg_internal("%s", errorBuf.data)));
+				(errmsg_internal("%s", errorBuf->data)));
 	}
 	else
 	{
 		ereport(NOTICE,
-				(errmsg_internal("%s", errorBuf.data)));
+				(errmsg_internal("%s", errorBuf->data)));
 	}
 
-	pfree(errorBuf.data);
+	pfree(errorBuf->data);
+	pfree(errorBuf);
 }
 
 
@@ -4199,9 +4137,7 @@ xml_xmlnodetoxmltype(xmlNodePtr cur, PgXmlErrorContext *xmlerrcxt)
 {
 	xmltype    *result = NULL;
 
-	if (cur->type != XML_ATTRIBUTE_NODE &&
-		cur->type != XML_TEXT_NODE &&
-		cur->type != XML_NAMESPACE_DECL)
+	if (cur->type != XML_ATTRIBUTE_NODE && cur->type != XML_TEXT_NODE)
 	{
 		void		(*volatile nodefree) (xmlNodePtr) = NULL;
 		volatile xmlBufferPtr buf = NULL;
@@ -4253,27 +4189,20 @@ xml_xmlnodetoxmltype(xmlNodePtr cur, PgXmlErrorContext *xmlerrcxt)
 	}
 	else
 	{
-		xmlChar    *volatile str = NULL;
+		xmlChar    *str;
 
+		str = xmlXPathCastNodeToString(cur);
 		PG_TRY();
 		{
-			char	   *escaped;
-
-			str = xmlXPathCastNodeToString(cur);
-			if (str == NULL || xmlerrcxt->err_occurred)
-				xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
-							"could not allocate xmlChar");
-
 			/* Here we rely on XML having the same representation as TEXT */
-			escaped = escape_xml((char *) str);
+			char	   *escaped = escape_xml((char *) str);
 
 			result = (xmltype *) cstring_to_text(escaped);
 			pfree(escaped);
 		}
 		PG_FINALLY();
 		{
-			if (str)
-				xmlFree(str);
+			xmlFree(str);
 		}
 		PG_END_TRY();
 	}
@@ -4436,7 +4365,7 @@ xpath_internal(text *xpath_expr_text, xmltype *data, ArrayType *namespaces,
 	xpath_len = VARSIZE_ANY_EXHDR(xpath_expr_text);
 	if (xpath_len == 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_XQUERY),
+				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("empty XPath expression")));
 
 	string = pg_xmlCharStrndup(datastr, len);
@@ -4509,7 +4438,7 @@ xpath_internal(text *xpath_expr_text, xmltype *data, ArrayType *namespaces,
 		 */
 		xpathcomp = xmlXPathCtxtCompile(xpathctx, xpath_expr);
 		if (xpathcomp == NULL || xmlerrcxt->err_occurred)
-			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 						"invalid XPath expression");
 
 		/*
@@ -4521,7 +4450,7 @@ xpath_internal(text *xpath_expr_text, xmltype *data, ArrayType *namespaces,
 		 */
 		xpathobj = xmlXPathCompiledEval(xpathcomp, xpathctx);
 		if (xpathobj == NULL || xmlerrcxt->err_occurred)
-			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+			xml_ereport(xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 						"could not create XPath object");
 
 		/*
@@ -4739,10 +4668,10 @@ XmlTableInitOpaque(TableFuncScanState *state, int natts)
 	XmlTableBuilderData *xtCxt;
 	PgXmlErrorContext *xmlerrcxt;
 
-	xtCxt = palloc0_object(XmlTableBuilderData);
+	xtCxt = palloc0(sizeof(XmlTableBuilderData));
 	xtCxt->magic = XMLTABLE_CONTEXT_MAGIC;
 	xtCxt->natts = natts;
-	xtCxt->xpathscomp = palloc0_array(xmlXPathCompExprPtr, natts);
+	xtCxt->xpathscomp = palloc0(sizeof(xmlXPathCompExprPtr) * natts);
 
 	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
 
@@ -4851,7 +4780,7 @@ XmlTableSetNamespace(TableFuncScanState *state, const char *name, const char *ur
 	if (xmlXPathRegisterNs(xtCxt->xpathcxt,
 						   pg_xmlCharStrndup(name, strlen(name)),
 						   pg_xmlCharStrndup(uri, strlen(uri))))
-		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_DATA_EXCEPTION,
 					"could not set XML namespace");
 #else
 	NO_XML_SUPPORT();
@@ -4873,7 +4802,7 @@ XmlTableSetRowFilter(TableFuncScanState *state, const char *path)
 
 	if (*path == '\0')
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_XQUERY),
+				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("row path filter must not be empty string")));
 
 	xstr = pg_xmlCharStrndup(path, strlen(path));
@@ -4883,7 +4812,7 @@ XmlTableSetRowFilter(TableFuncScanState *state, const char *path)
 
 	xtCxt->xpathcomp = xmlXPathCtxtCompile(xtCxt->xpathcxt, xstr);
 	if (xtCxt->xpathcomp == NULL || xtCxt->xmlerrcxt->err_occurred)
-		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_SYNTAX_ERROR,
 					"invalid XPath expression");
 #else
 	NO_XML_SUPPORT();
@@ -4901,13 +4830,13 @@ XmlTableSetColumnFilter(TableFuncScanState *state, const char *path, int colnum)
 	XmlTableBuilderData *xtCxt;
 	xmlChar    *xstr;
 
-	Assert(path);
+	Assert(PointerIsValid(path));
 
 	xtCxt = GetXmlTableBuilderPrivateData(state, "XmlTableSetColumnFilter");
 
 	if (*path == '\0')
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_XQUERY),
+				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("column path filter must not be empty string")));
 
 	xstr = pg_xmlCharStrndup(path, strlen(path));
@@ -4917,7 +4846,7 @@ XmlTableSetColumnFilter(TableFuncScanState *state, const char *path, int colnum)
 
 	xtCxt->xpathscomp[colnum] = xmlXPathCtxtCompile(xtCxt->xpathcxt, xstr);
 	if (xtCxt->xpathscomp[colnum] == NULL || xtCxt->xmlerrcxt->err_occurred)
-		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+		xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_DATA_EXCEPTION,
 					"invalid XPath expression");
 #else
 	NO_XML_SUPPORT();
@@ -4938,13 +4867,13 @@ XmlTableFetchRow(TableFuncScanState *state)
 	xtCxt = GetXmlTableBuilderPrivateData(state, "XmlTableFetchRow");
 
 	/* Propagate our own error context to libxml2 */
-	xmlSetStructuredErrorFunc(xtCxt->xmlerrcxt, xml_errorHandler);
+	xmlSetStructuredErrorFunc((void *) xtCxt->xmlerrcxt, xml_errorHandler);
 
 	if (xtCxt->xpathobj == NULL)
 	{
 		xtCxt->xpathobj = xmlXPathCompiledEval(xtCxt->xpathcomp, xtCxt->xpathcxt);
 		if (xtCxt->xpathobj == NULL || xtCxt->xmlerrcxt->err_occurred)
-			xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+			xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 						"could not create XPath object");
 
 		xtCxt->row_count = 0;
@@ -4979,8 +4908,10 @@ XmlTableGetValue(TableFuncScanState *state, int colnum,
 				 Oid typid, int32 typmod, bool *isnull)
 {
 #ifdef USE_LIBXML
-	Datum		result = (Datum) 0;
 	XmlTableBuilderData *xtCxt;
+	Datum		result = (Datum) 0;
+	xmlNodePtr	cur;
+	char	   *cstr = NULL;
 	volatile xmlXPathObjectPtr xpathobj = NULL;
 
 	xtCxt = GetXmlTableBuilderPrivateData(state, "XmlTableGetValue");
@@ -4990,25 +4921,23 @@ XmlTableGetValue(TableFuncScanState *state, int colnum,
 		   xtCxt->xpathobj->nodesetval != NULL);
 
 	/* Propagate our own error context to libxml2 */
-	xmlSetStructuredErrorFunc(xtCxt->xmlerrcxt, xml_errorHandler);
+	xmlSetStructuredErrorFunc((void *) xtCxt->xmlerrcxt, xml_errorHandler);
 
 	*isnull = false;
+
+	cur = xtCxt->xpathobj->nodesetval->nodeTab[xtCxt->row_count - 1];
 
 	Assert(xtCxt->xpathscomp[colnum] != NULL);
 
 	PG_TRY();
 	{
-		xmlNodePtr	cur;
-		char	   *cstr = NULL;
-
 		/* Set current node as entry point for XPath evaluation */
-		cur = xtCxt->xpathobj->nodesetval->nodeTab[xtCxt->row_count - 1];
 		xtCxt->xpathcxt->node = cur;
 
 		/* Evaluate column path */
 		xpathobj = xmlXPathCompiledEval(xtCxt->xpathscomp[colnum], xtCxt->xpathcxt);
 		if (xpathobj == NULL || xtCxt->xmlerrcxt->err_occurred)
-			xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
+			xml_ereport(xtCxt->xmlerrcxt, ERROR, ERRCODE_INTERNAL_ERROR,
 						"could not create XPath object");
 
 		/*
@@ -5135,7 +5064,7 @@ XmlTableDestroyOpaque(TableFuncScanState *state)
 	xtCxt = GetXmlTableBuilderPrivateData(state, "XmlTableDestroyOpaque");
 
 	/* Propagate our own error context to libxml2 */
-	xmlSetStructuredErrorFunc(xtCxt->xmlerrcxt, xml_errorHandler);
+	xmlSetStructuredErrorFunc((void *) xtCxt->xmlerrcxt, xml_errorHandler);
 
 	if (xtCxt->xpathscomp != NULL)
 	{

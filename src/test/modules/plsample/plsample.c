@@ -3,7 +3,7 @@
  * plsample.c
  *	  Handler for the PL/Sample procedural language
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,6 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -129,7 +128,7 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = TextDatumGetCString(ret);
+	source = DatumGetCString(DirectFunctionCall1(textout, ret));
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));
@@ -221,7 +220,8 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 		elog(ERROR, "not called by trigger manager");
 
 	/* Connect to the SPI manager */
-	SPI_connect();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI manager");
 
 	rc = SPI_register_trigger_data(trigdata);
 	Assert(rc >= 0);
@@ -245,7 +245,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = TextDatumGetCString(ret);
+	source = DatumGetCString(DirectFunctionCall1(textout, ret));
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));

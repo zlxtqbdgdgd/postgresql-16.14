@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * src/bin/psql/startup.c
  */
@@ -24,7 +24,6 @@
 #include "help.h"
 #include "input.h"
 #include "mainloop.h"
-#include "portability/instr_time.h"
 #include "settings.h"
 
 /*
@@ -48,7 +47,7 @@ enum _actions
 {
 	ACT_SINGLE_QUERY,
 	ACT_SINGLE_SLASH,
-	ACT_FILE,
+	ACT_FILE
 };
 
 typedef struct SimpleActionListCell
@@ -206,11 +205,6 @@ main(int argc, char *argv[])
 	SetVariable(pset.vars, "PROMPT3", DEFAULT_PROMPT3);
 	SetVariableBool(pset.vars, "SHOW_ALL_RESULTS");
 
-	/* Initialize pipeline variables */
-	SetVariable(pset.vars, "PIPELINE_SYNC_COUNT", "0");
-	SetVariable(pset.vars, "PIPELINE_COMMAND_COUNT", "0");
-	SetVariable(pset.vars, "PIPELINE_RESULT_COUNT", "0");
-
 	parse_psql_options(argc, argv, &options);
 
 	/*
@@ -276,8 +270,8 @@ main(int argc, char *argv[])
 
 		new_pass = false;
 		pset.db = PQconnectdbParams(keywords, values, true);
-		pg_free(keywords);
-		pg_free(values);
+		free(keywords);
+		free(values);
 
 		if (PQstatus(pset.db) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(pset.db) &&
@@ -300,7 +294,7 @@ main(int argc, char *argv[])
 			PQfinish(pset.db);
 
 			password = simple_prompt(password_prompt, false);
-			pfree(password_prompt);
+			free(password_prompt);
 			new_pass = true;
 		}
 	} while (new_pass);
@@ -327,9 +321,6 @@ main(int argc, char *argv[])
 #endif
 
 	PQsetNoticeProcessor(pset.db, NoticeProcessor, NULL);
-
-	/* initialize timing infrastructure (required for INSTR_* calls) */
-	pg_initialize_timing();
 
 	SyncVariables();
 
@@ -408,7 +399,7 @@ main(int argc, char *argv[])
 								cell->val, strlen(cell->val),
 								pset.encoding, standard_strings());
 				cond_stack = conditional_stack_create();
-				psql_scan_set_passthrough(scan_state, cond_stack);
+				psql_scan_set_passthrough(scan_state, (void *) cond_stack);
 
 				successResult = HandleSlashCmds(scan_state,
 												cond_stack,
@@ -620,7 +611,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 					if (!result)
 						pg_fatal("could not set printing parameter \"%s\"", value);
 
-					pg_free(value);
+					free(value);
 					break;
 				}
 			case 'q':
@@ -664,7 +655,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 							exit(EXIT_FAILURE); /* error already printed */
 					}
 
-					pg_free(value);
+					free(value);
 					break;
 				}
 			case 'V':
@@ -834,14 +825,13 @@ process_psqlrc_file(char *filename)
 	else if (access(filename, R_OK) == 0)
 		(void) process_file(filename, false);
 
-	pfree(psqlrc_minor);
-	pfree(psqlrc_major);
+	free(psqlrc_minor);
+	free(psqlrc_major);
 }
 
 
 
-/*
- * showVersion
+/* showVersion
  *
  * This output format is intended to match GNU standards.
  */
@@ -947,21 +937,6 @@ static bool
 histsize_hook(const char *newval)
 {
 	return ParseVariableNum(newval, "HISTSIZE", &pset.histsize);
-}
-
-static char *
-watch_interval_substitute_hook(char *newval)
-{
-	if (newval == NULL)
-		newval = pg_strdup(DEFAULT_WATCH_INTERVAL);
-	return newval;
-}
-
-static bool
-watch_interval_hook(const char *newval)
-{
-	return ParseVariableDouble(newval, "WATCH_INTERVAL", &pset.watch_interval,
-							   0, DEFAULT_WATCH_INTERVAL_MAX);
 }
 
 static char *
@@ -1290,7 +1265,4 @@ EstablishVariableSpace(void)
 	SetVariableHooks(pset.vars, "HIDE_TABLEAM",
 					 bool_substitute_hook,
 					 hide_tableam_hook);
-	SetVariableHooks(pset.vars, "WATCH_INTERVAL",
-					 watch_interval_substitute_hook,
-					 watch_interval_hook);
 }

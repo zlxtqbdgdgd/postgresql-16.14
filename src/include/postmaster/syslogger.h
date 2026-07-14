@@ -3,7 +3,7 @@
  * syslogger.h
  *	  Exports from postmaster/syslogger.c.
  *
- * Copyright (c) 2004-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2004-2023, PostgreSQL Global Development Group
  *
  * src/include/postmaster/syslogger.h
  *
@@ -46,7 +46,7 @@ typedef struct
 	char		nuls[2];		/* always \0\0 */
 	uint16		len;			/* size of this chunk (counts data only) */
 	int32		pid;			/* writer's pid */
-	uint8		flags;			/* bitmask of PIPE_PROTO_* */
+	bits8		flags;			/* bitmask of PIPE_PROTO_* */
 	char		data[FLEXIBLE_ARRAY_MEMBER];	/* data payload starts here */
 } PipeProtoHeader;
 
@@ -75,23 +75,20 @@ extern PGDLLIMPORT char *Log_filename;
 extern PGDLLIMPORT bool Log_truncate_on_rotation;
 extern PGDLLIMPORT int Log_file_mode;
 
-#ifdef EXEC_BACKEND
-extern PGDLLIMPORT pg_time_t first_syslogger_file_time;
-#endif
-
 #ifndef WIN32
 extern PGDLLIMPORT int syslogPipe[2];
 #else
 extern PGDLLIMPORT HANDLE syslogPipe[2];
 #endif
 
-extern bool syslogger_setup_done;
 
-extern int	SysLogger_Start(int child_slot);
+extern int	SysLogger_Start(void);
 
 extern void write_syslogger_file(const char *buffer, int count, int destination);
 
-pg_noreturn extern void SysLoggerMain(const void *startup_data, size_t startup_data_len);
+#ifdef EXEC_BACKEND
+extern void SysLoggerMain(int argc, char *argv[]) pg_attribute_noreturn();
+#endif
 
 extern bool CheckLogrotateSignal(void);
 extern void RemoveLogrotateSignalFiles(void);

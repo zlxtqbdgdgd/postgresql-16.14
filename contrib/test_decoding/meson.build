@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 test_decoding_sources = files(
   'test_decoding.c',
@@ -34,7 +34,6 @@ tests += {
       'replorigin',
       'time',
       'messages',
-      'repack',
       'spill',
       'slot',
       'truncate',
@@ -65,7 +64,6 @@ tests += {
       'slot_creation_error',
       'skip_snapshot_restore',
       'invalidation_distribution',
-      'parallel_session_origin',
     ],
     'regress_args': [
       '--temp-config', files('logical.conf'),

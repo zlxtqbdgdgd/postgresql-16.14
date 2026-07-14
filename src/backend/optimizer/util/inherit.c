@@ -3,7 +3,7 @@
  * inherit.c
  *	  Routines to process child relations in inheritance trees
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,8 +13,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include <limits.h>
 
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -337,6 +335,16 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	/* A partitioned table should always have a partition descriptor. */
 	Assert(partdesc);
 
+	/*
+	 * Note down whether any partition key cols are being updated. Though it's
+	 * the root partitioned table's updatedCols we are interested in,
+	 * parent_updatedCols provided by the caller contains the root partrel's
+	 * updatedCols translated to match the attribute ordering of parentrel.
+	 */
+	if (!root->partColsUpdated)
+		root->partColsUpdated =
+			has_partition_attrs(parentrel, parent_updatedCols, NULL);
+
 	/* Nothing further to do here if there are no partitions. */
 	if (partdesc->nparts == 0)
 		return;
@@ -457,7 +465,8 @@ expand_single_inheritance_child(PlannerInfo *root, RangeTblEntry *parentrte,
 								Index *childRTindex_p)
 {
 	Query	   *parse = root->parse;
-	Oid			parentOID = RelationGetRelid(parentrel);
+	Oid			parentOID PG_USED_FOR_ASSERTS_ONLY =
+		RelationGetRelid(parentrel);
 	Oid			childOID = RelationGetRelid(childrel);
 	RangeTblEntry *childrte;
 	Index		childRTindex;
@@ -502,13 +511,6 @@ expand_single_inheritance_child(PlannerInfo *root, RangeTblEntry *parentrte,
 	childRTindex = list_length(parse->rtable);
 	*childrte_p = childrte;
 	*childRTindex_p = childRTindex;
-
-	/*
-	 * Retrieve column not-null constraint information for the child relation
-	 * if its relation OID is different from the parent's.
-	 */
-	if (childOID != parentOID)
-		get_relation_notnullatts(root, childrel);
 
 	/*
 	 * Build an AppendRelInfo struct for each parent/child pair.
@@ -832,8 +834,7 @@ expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
  *
  * If any of the resulting clauses evaluate to constant false or NULL, we
  * return false and don't apply any quals.  Caller should mark the relation as
- * a dummy rel in this case, since it doesn't need to be scanned.  Constant
- * true quals are ignored.
+ * a dummy rel in this case, since it doesn't need to be scanned.
  */
 bool
 apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
@@ -882,7 +883,6 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 		{
 			Node	   *onecq = (Node *) lfirst(lc2);
 			bool		pseudoconstant;
-			RestrictInfo *childrinfo;
 
 			/* check for pseudoconstant (no Vars or volatile functions) */
 			pseudoconstant =
@@ -894,18 +894,17 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 				root->hasPseudoConstantQuals = true;
 			}
 			/* reconstitute RestrictInfo with appropriate properties */
-			childrinfo = make_restrictinfo(root,
-										   (Expr *) onecq,
-										   rinfo->is_pushed_down,
-										   rinfo->has_clone,
-										   rinfo->is_clone,
-										   pseudoconstant,
-										   rinfo->security_level,
-										   NULL, NULL, NULL);
-
-			childquals = lappend(childquals, childrinfo);
+			childquals = lappend(childquals,
+								 make_restrictinfo(root,
+												   (Expr *) onecq,
+												   rinfo->is_pushed_down,
+												   rinfo->has_clone,
+												   rinfo->is_clone,
+												   pseudoconstant,
+												   rinfo->security_level,
+												   NULL, NULL, NULL));
 			/* track minimum security level among child quals */
-			cq_min_security = Min(cq_min_security, childrinfo->security_level);
+			cq_min_security = Min(cq_min_security, rinfo->security_level);
 		}
 	}
 

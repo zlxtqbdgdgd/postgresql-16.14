@@ -454,7 +454,6 @@ dectoint(decimal *np, int *ip)
 {
 	int			ret;
 	numeric    *nres = PGTYPESnumeric_new();
-	int			errnum;
 
 	if (nres == NULL)
 		return ECPG_INFORMIX_OUT_OF_MEMORY;
@@ -465,12 +464,10 @@ dectoint(decimal *np, int *ip)
 		return ECPG_INFORMIX_OUT_OF_MEMORY;
 	}
 
-	errno = 0;
 	ret = PGTYPESnumeric_to_int(nres, ip);
-	errnum = errno;
 	PGTYPESnumeric_free(nres);
 
-	if (ret == -1 && errnum == PGTYPES_NUM_OVERFLOW)
+	if (ret == PGTYPES_NUM_OVERFLOW)
 		ret = ECPG_INFORMIX_NUM_OVERFLOW;
 
 	return ret;
@@ -481,7 +478,6 @@ dectolong(decimal *np, long *lngp)
 {
 	int			ret;
 	numeric    *nres = PGTYPESnumeric_new();
-	int			errnum;
 
 	if (nres == NULL)
 		return ECPG_INFORMIX_OUT_OF_MEMORY;
@@ -492,12 +488,10 @@ dectolong(decimal *np, long *lngp)
 		return ECPG_INFORMIX_OUT_OF_MEMORY;
 	}
 
-	errno = 0;
 	ret = PGTYPESnumeric_to_long(nres, lngp);
-	errnum = errno;
 	PGTYPESnumeric_free(nres);
 
-	if (ret == -1 && errnum == PGTYPES_NUM_OVERFLOW)
+	if (ret == PGTYPES_NUM_OVERFLOW)
 		ret = ECPG_INFORMIX_NUM_OVERFLOW;
 
 	return ret;
@@ -520,11 +514,11 @@ rdatestr(date d, char *str)
 }
 
 /*
- *
- * the input for this function is mmddyyyy and any non-numeric
- * character can be used as a separator
- *
- */
+*
+* the input for this function is mmddyyyy and any non-numeric
+* character can be used as a separator
+*
+*/
 int
 rstrdate(const char *str, date * d)
 {
@@ -807,10 +801,8 @@ rfmtlong(long lng_val, const char *fmt, char *outbuf)
 	if (strchr(fmt, (int) '(') && strchr(fmt, (int) ')'))
 		brackets_ok = 1;
 
-	/*
-	 * get position of the right-most dot in the format-string and fill the
-	 * temp-string with '0's up to there.
-	 */
+	/* get position of the right-most dot in the format-string */
+	/* and fill the temp-string wit '0's up to there. */
 	dotpos = getRightMostDot(fmt);
 
 	/* start to parse the format-string */
@@ -1037,7 +1029,7 @@ ECPG_informix_reset_sqlca(void)
 	if (sqlca == NULL)
 		return;
 
-	memcpy(sqlca, &sqlca_init, sizeof(struct sqlca_t));
+	memcpy((char *) sqlca, (char *) &sqlca_init, sizeof(struct sqlca_t));
 }
 
 int

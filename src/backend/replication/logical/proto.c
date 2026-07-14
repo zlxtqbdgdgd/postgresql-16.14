@@ -3,7 +3,7 @@
  * proto.c
  *		logical replication protocol functions
  *
- * Copyright (c) 2015-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/replication/logical/proto.c
@@ -30,17 +30,28 @@
 #define TRUNCATE_RESTART_SEQS	(1<<1)
 
 static void logicalrep_write_attrs(StringInfo out, Relation rel,
-								   Bitmapset *columns,
-								   PublishGencolsType include_gencols_type);
+								   Bitmapset *columns);
 static void logicalrep_write_tuple(StringInfo out, Relation rel,
 								   TupleTableSlot *slot,
-								   bool binary, Bitmapset *columns,
-								   PublishGencolsType include_gencols_type);
+								   bool binary, Bitmapset *columns);
 static void logicalrep_read_attrs(StringInfo in, LogicalRepRelation *rel);
 static void logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple);
 
 static void logicalrep_write_namespace(StringInfo out, Oid nspid);
 static const char *logicalrep_read_namespace(StringInfo in);
+
+/*
+ * Check if a column is covered by a column list.
+ *
+ * Need to be careful about NULL, which is treated as a column list covering
+ * all columns.
+ */
+static bool
+column_in_column_list(int attnum, Bitmapset *columns)
+{
+	return (columns == NULL || bms_is_member(attnum, columns));
+}
+
 
 /*
  * Write BEGIN to the output stream.
@@ -52,7 +63,7 @@ logicalrep_write_begin(StringInfo out, ReorderBufferTXN *txn)
 
 	/* fixed fields */
 	pq_sendint64(out, txn->final_lsn);
-	pq_sendint64(out, txn->commit_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
 	pq_sendint32(out, txn->xid);
 }
 
@@ -64,7 +75,7 @@ logicalrep_read_begin(StringInfo in, LogicalRepBeginData *begin_data)
 {
 	/* read fields */
 	begin_data->final_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(begin_data->final_lsn))
+	if (begin_data->final_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "final_lsn not set in begin message");
 	begin_data->committime = pq_getmsgint64(in);
 	begin_data->xid = pq_getmsgint(in, 4);
@@ -88,7 +99,7 @@ logicalrep_write_commit(StringInfo out, ReorderBufferTXN *txn,
 	/* send fields */
 	pq_sendint64(out, commit_lsn);
 	pq_sendint64(out, txn->end_lsn);
-	pq_sendint64(out, txn->commit_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
 }
 
 /*
@@ -120,7 +131,7 @@ logicalrep_write_begin_prepare(StringInfo out, ReorderBufferTXN *txn)
 	/* fixed fields */
 	pq_sendint64(out, txn->final_lsn);
 	pq_sendint64(out, txn->end_lsn);
-	pq_sendint64(out, txn->prepare_time);
+	pq_sendint64(out, txn->xact_time.prepare_time);
 	pq_sendint32(out, txn->xid);
 
 	/* send gid */
@@ -135,10 +146,10 @@ logicalrep_read_begin_prepare(StringInfo in, LogicalRepPreparedTxnData *begin_da
 {
 	/* read fields */
 	begin_data->prepare_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(begin_data->prepare_lsn))
+	if (begin_data->prepare_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "prepare_lsn not set in begin prepare message");
 	begin_data->end_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(begin_data->end_lsn))
+	if (begin_data->end_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "end_lsn not set in begin prepare message");
 	begin_data->prepare_time = pq_getmsgint64(in);
 	begin_data->xid = pq_getmsgint(in, 4);
@@ -164,7 +175,7 @@ logicalrep_write_prepare_common(StringInfo out, LogicalRepMsgType type,
 	 * which case we expect to have a valid GID.
 	 */
 	Assert(txn->gid != NULL);
-	Assert(rbtxn_is_prepared(txn));
+	Assert(rbtxn_prepared(txn));
 	Assert(TransactionIdIsValid(txn->xid));
 
 	/* send the flags field */
@@ -173,7 +184,7 @@ logicalrep_write_prepare_common(StringInfo out, LogicalRepMsgType type,
 	/* send fields */
 	pq_sendint64(out, prepare_lsn);
 	pq_sendint64(out, txn->end_lsn);
-	pq_sendint64(out, txn->prepare_time);
+	pq_sendint64(out, txn->xact_time.prepare_time);
 	pq_sendint32(out, txn->xid);
 
 	/* send gid */
@@ -207,10 +218,10 @@ logicalrep_read_prepare_common(StringInfo in, char *msgtype,
 
 	/* read fields */
 	prepare_data->prepare_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(prepare_data->prepare_lsn))
+	if (prepare_data->prepare_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "prepare_lsn is not set in %s message", msgtype);
 	prepare_data->end_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(prepare_data->end_lsn))
+	if (prepare_data->end_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "end_lsn is not set in %s message", msgtype);
 	prepare_data->prepare_time = pq_getmsgint64(in);
 	prepare_data->xid = pq_getmsgint(in, 4);
@@ -253,7 +264,7 @@ logicalrep_write_commit_prepared(StringInfo out, ReorderBufferTXN *txn,
 	/* send fields */
 	pq_sendint64(out, commit_lsn);
 	pq_sendint64(out, txn->end_lsn);
-	pq_sendint64(out, txn->commit_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
 	pq_sendint32(out, txn->xid);
 
 	/* send gid */
@@ -274,10 +285,10 @@ logicalrep_read_commit_prepared(StringInfo in, LogicalRepCommitPreparedTxnData *
 
 	/* read fields */
 	prepare_data->commit_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(prepare_data->commit_lsn))
+	if (prepare_data->commit_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "commit_lsn is not set in commit prepared message");
 	prepare_data->end_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(prepare_data->end_lsn))
+	if (prepare_data->end_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "end_lsn is not set in commit prepared message");
 	prepare_data->commit_time = pq_getmsgint64(in);
 	prepare_data->xid = pq_getmsgint(in, 4);
@@ -311,7 +322,7 @@ logicalrep_write_rollback_prepared(StringInfo out, ReorderBufferTXN *txn,
 	pq_sendint64(out, prepare_end_lsn);
 	pq_sendint64(out, txn->end_lsn);
 	pq_sendint64(out, prepare_time);
-	pq_sendint64(out, txn->commit_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
 	pq_sendint32(out, txn->xid);
 
 	/* send gid */
@@ -333,10 +344,10 @@ logicalrep_read_rollback_prepared(StringInfo in,
 
 	/* read fields */
 	rollback_data->prepare_end_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(rollback_data->prepare_end_lsn))
+	if (rollback_data->prepare_end_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "prepare_end_lsn is not set in rollback prepared message");
 	rollback_data->rollback_end_lsn = pq_getmsgint64(in);
-	if (!XLogRecPtrIsValid(rollback_data->rollback_end_lsn))
+	if (rollback_data->rollback_end_lsn == InvalidXLogRecPtr)
 		elog(ERROR, "rollback_end_lsn is not set in rollback prepared message");
 	rollback_data->prepare_time = pq_getmsgint64(in);
 	rollback_data->rollback_time = pq_getmsgint64(in);
@@ -401,9 +412,7 @@ logicalrep_read_origin(StringInfo in, XLogRecPtr *origin_lsn)
  */
 void
 logicalrep_write_insert(StringInfo out, TransactionId xid, Relation rel,
-						TupleTableSlot *newslot, bool binary,
-						Bitmapset *columns,
-						PublishGencolsType include_gencols_type)
+						TupleTableSlot *newslot, bool binary, Bitmapset *columns)
 {
 	pq_sendbyte(out, LOGICAL_REP_MSG_INSERT);
 
@@ -415,8 +424,7 @@ logicalrep_write_insert(StringInfo out, TransactionId xid, Relation rel,
 	pq_sendint32(out, RelationGetRelid(rel));
 
 	pq_sendbyte(out, 'N');		/* new tuple follows */
-	logicalrep_write_tuple(out, rel, newslot, binary, columns,
-						   include_gencols_type);
+	logicalrep_write_tuple(out, rel, newslot, binary, columns);
 }
 
 /*
@@ -449,8 +457,7 @@ logicalrep_read_insert(StringInfo in, LogicalRepTupleData *newtup)
 void
 logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 						TupleTableSlot *oldslot, TupleTableSlot *newslot,
-						bool binary, Bitmapset *columns,
-						PublishGencolsType include_gencols_type)
+						bool binary, Bitmapset *columns)
 {
 	pq_sendbyte(out, LOGICAL_REP_MSG_UPDATE);
 
@@ -471,13 +478,11 @@ logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 			pq_sendbyte(out, 'O');	/* old tuple follows */
 		else
 			pq_sendbyte(out, 'K');	/* old key follows */
-		logicalrep_write_tuple(out, rel, oldslot, binary, columns,
-							   include_gencols_type);
+		logicalrep_write_tuple(out, rel, oldslot, binary, columns);
 	}
 
 	pq_sendbyte(out, 'N');		/* new tuple follows */
-	logicalrep_write_tuple(out, rel, newslot, binary, columns,
-						   include_gencols_type);
+	logicalrep_write_tuple(out, rel, newslot, binary, columns);
 }
 
 /*
@@ -527,8 +532,7 @@ logicalrep_read_update(StringInfo in, bool *has_oldtuple,
 void
 logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 						TupleTableSlot *oldslot, bool binary,
-						Bitmapset *columns,
-						PublishGencolsType include_gencols_type)
+						Bitmapset *columns)
 {
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
@@ -548,8 +552,7 @@ logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 	else
 		pq_sendbyte(out, 'K');	/* old key follows */
 
-	logicalrep_write_tuple(out, rel, oldslot, binary, columns,
-						   include_gencols_type);
+	logicalrep_write_tuple(out, rel, oldslot, binary, columns);
 }
 
 /*
@@ -665,8 +668,7 @@ logicalrep_write_message(StringInfo out, TransactionId xid, XLogRecPtr lsn,
  */
 void
 logicalrep_write_rel(StringInfo out, TransactionId xid, Relation rel,
-					 Bitmapset *columns,
-					 PublishGencolsType include_gencols_type)
+					 Bitmapset *columns)
 {
 	char	   *relname;
 
@@ -688,7 +690,7 @@ logicalrep_write_rel(StringInfo out, TransactionId xid, Relation rel,
 	pq_sendbyte(out, rel->rd_rel->relreplident);
 
 	/* send the attribute info */
-	logicalrep_write_attrs(out, rel, columns, include_gencols_type);
+	logicalrep_write_attrs(out, rel, columns);
 }
 
 /*
@@ -697,7 +699,7 @@ logicalrep_write_rel(StringInfo out, TransactionId xid, Relation rel,
 LogicalRepRelation *
 logicalrep_read_rel(StringInfo in)
 {
-	LogicalRepRelation *rel = palloc_object(LogicalRepRelation);
+	LogicalRepRelation *rel = palloc(sizeof(LogicalRepRelation));
 
 	rel->remoteid = pq_getmsgint(in, 4);
 
@@ -707,9 +709,6 @@ logicalrep_read_rel(StringInfo in)
 
 	/* Read the replica identity. */
 	rel->replident = pq_getmsgbyte(in);
-
-	/* relkind is not sent */
-	rel->relkind = 0;
 
 	/* Get attribute description */
 	logicalrep_read_attrs(in, rel);
@@ -740,7 +739,7 @@ logicalrep_write_typ(StringInfo out, TransactionId xid, Oid typoid)
 		elog(ERROR, "cache lookup failed for type %u", basetypoid);
 	typtup = (Form_pg_type) GETSTRUCT(tup);
 
-	/* use Oid as type identifier */
+	/* use Oid as relation identifier */
 	pq_sendint32(out, typoid);
 
 	/* send qualified type name */
@@ -768,8 +767,7 @@ logicalrep_read_typ(StringInfo in, LogicalRepTyp *ltyp)
  */
 static void
 logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
-					   bool binary, Bitmapset *columns,
-					   PublishGencolsType include_gencols_type)
+					   bool binary, Bitmapset *columns)
 {
 	TupleDesc	desc;
 	Datum	   *values;
@@ -783,8 +781,10 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
-		if (!logicalrep_should_publish_column(att, columns,
-											  include_gencols_type))
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
+		if (!column_in_column_list(att->attnum, columns))
 			continue;
 
 		nliveatts++;
@@ -802,8 +802,10 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 		Form_pg_type typclass;
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
-		if (!logicalrep_should_publish_column(att, columns,
-											  include_gencols_type))
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
+		if (!column_in_column_list(att->attnum, columns))
 			continue;
 
 		if (isnull[i])
@@ -812,7 +814,7 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 			continue;
 		}
 
-		if (att->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(values[i])))
+		if (att->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(values[i]))
 		{
 			/*
 			 * Unchanged toasted datum.  (Note that we don't promise to detect
@@ -849,7 +851,7 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 
 			pq_sendbyte(out, LOGICALREP_COLUMN_TEXT);
 			outputstr = OidOutputFunctionCall(typclass->typoutput, values[i]);
-			pq_sendcountedtext(out, outputstr, strlen(outputstr));
+			pq_sendcountedtext(out, outputstr, strlen(outputstr), false);
 			pfree(outputstr);
 		}
 
@@ -870,14 +872,13 @@ logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple)
 	natts = pq_getmsgint(in, 2);
 
 	/* Allocate space for per-column values; zero out unused StringInfoDatas */
-	tuple->colvalues = palloc0_array(StringInfoData, natts);
-	tuple->colstatus = palloc_array(char, natts);
+	tuple->colvalues = (StringInfoData *) palloc0(natts * sizeof(StringInfoData));
+	tuple->colstatus = (char *) palloc(natts * sizeof(char));
 	tuple->ncols = natts;
 
 	/* Read the data */
 	for (i = 0; i < natts; i++)
 	{
-		char	   *buff;
 		char		kind;
 		int			len;
 		StringInfo	value = &tuple->colvalues[i];
@@ -898,18 +899,19 @@ logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple)
 				len = pq_getmsgint(in, 4);	/* read length */
 
 				/* and data */
-				buff = palloc(len + 1);
-				pq_copymsgbytes(in, buff, len);
+				value->data = palloc(len + 1);
+				pq_copymsgbytes(in, value->data, len);
 
 				/*
-				 * NUL termination is required for LOGICALREP_COLUMN_TEXT mode
-				 * as input functions require that.  For
-				 * LOGICALREP_COLUMN_BINARY it's not technically required, but
-				 * it's harmless.
+				 * Not strictly necessary for LOGICALREP_COLUMN_BINARY, but
+				 * per StringInfo practice.
 				 */
-				buff[len] = '\0';
+				value->data[len] = '\0';
 
-				initStringInfoFromString(value, buff, len);
+				/* make StringInfo fully valid */
+				value->len = len;
+				value->cursor = 0;
+				value->maxlen = len;
 				break;
 			default:
 				elog(ERROR, "unrecognized data representation type '%c'", kind);
@@ -921,8 +923,7 @@ logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple)
  * Write relation attribute metadata to the stream.
  */
 static void
-logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns,
-					   PublishGencolsType include_gencols_type)
+logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns)
 {
 	TupleDesc	desc;
 	int			i;
@@ -937,8 +938,10 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns,
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
-		if (!logicalrep_should_publish_column(att, columns,
-											  include_gencols_type))
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
+		if (!column_in_column_list(att->attnum, columns))
 			continue;
 
 		nliveatts++;
@@ -956,8 +959,10 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns,
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 		uint8		flags = 0;
 
-		if (!logicalrep_should_publish_column(att, columns,
-											  include_gencols_type))
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
+		if (!column_in_column_list(att->attnum, columns))
 			continue;
 
 		/* REPLICA IDENTITY FULL means all columns are sent as part of key. */
@@ -994,8 +999,8 @@ logicalrep_read_attrs(StringInfo in, LogicalRepRelation *rel)
 	Bitmapset  *attkeys = NULL;
 
 	natts = pq_getmsgint(in, 2);
-	attnames = palloc_array(char *, natts);
-	atttyps = palloc_array(Oid, natts);
+	attnames = palloc(natts * sizeof(char *));
+	atttyps = palloc(natts * sizeof(Oid));
 
 	/* read the attributes */
 	for (i = 0; i < natts; i++)
@@ -1122,7 +1127,7 @@ logicalrep_write_stream_commit(StringInfo out, ReorderBufferTXN *txn,
 	/* send fields */
 	pq_sendint64(out, commit_lsn);
 	pq_sendint64(out, txn->end_lsn);
-	pq_sendint64(out, txn->commit_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
 }
 
 /*
@@ -1211,7 +1216,7 @@ logicalrep_read_stream_abort(StringInfo in,
 const char *
 logicalrep_message_type(LogicalRepMsgType action)
 {
-	static char err_unknown[20];
+	static char	err_unknown[20];
 
 	switch (action)
 	{
@@ -1263,42 +1268,4 @@ logicalrep_message_type(LogicalRepMsgType action)
 	snprintf(err_unknown, sizeof(err_unknown), "??? (%d)", action);
 
 	return err_unknown;
-}
-
-/*
- * Check if the column 'att' of a table should be published.
- *
- * 'columns' represents the publication column list (if any) for that table.
- *
- * 'include_gencols_type' value indicates whether generated columns should be
- * published when there is no column list. Typically, this will have the same
- * value as the 'publish_generated_columns' publication parameter.
- *
- * Note that generated columns can be published only when present in a
- * publication column list, or when include_gencols_type is
- * PUBLISH_GENCOLS_STORED.
- */
-bool
-logicalrep_should_publish_column(Form_pg_attribute att, Bitmapset *columns,
-								 PublishGencolsType include_gencols_type)
-{
-	if (att->attisdropped)
-		return false;
-
-	/* If a column list is provided, publish only the cols in that list. */
-	if (columns)
-		return bms_is_member(att->attnum, columns);
-
-	/* All non-generated columns are always published. */
-	if (!att->attgenerated)
-		return true;
-
-	/*
-	 * Stored generated columns are only published when the user sets
-	 * publish_generated_columns as stored.
-	 */
-	if (att->attgenerated == ATTRIBUTE_GENERATED_STORED)
-		return include_gencols_type == PUBLISH_GENCOLS_STORED;
-
-	return false;
 }

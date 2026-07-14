@@ -9,13 +9,12 @@
 *-------------------------------------------------------------------------
 */
 
-/*
- * contributed by:
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
- * *  Martin Utesch				 * Institute of Automatic Control	   *
- * =							 = University of Mining and Technology =
- * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
- * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/* contributed by:
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+   *  Martin Utesch				 * Institute of Automatic Control	   *
+   =							 = University of Mining and Technology =
+   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* this is adopted from Genitor : */
@@ -33,12 +32,10 @@
 /*************************************************************/
 
 #include "postgres.h"
-#include "optimizer/geqo.h"
-
-#if defined(CX)					/* currently used only in CX mode */
-
 #include "optimizer/geqo_mutation.h"
 #include "optimizer/geqo_random.h"
+
+#if defined(CX)					/* currently used only in CX mode */
 
 void
 geqo_mutation(PlannerInfo *root, Gene *tour, int num_gene)

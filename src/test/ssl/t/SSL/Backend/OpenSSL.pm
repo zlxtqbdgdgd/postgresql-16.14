@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 =pod
 
@@ -25,7 +25,7 @@ for a PostgreSQL cluster compiled against OpenSSL.
 package SSL::Backend::OpenSSL;
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 use PostgreSQL::Test::Utils;
 use File::Basename;
 use File::Copy;
@@ -72,7 +72,6 @@ sub init
 	chmod(0600, glob "$pgdata/server-*.key")
 	  or die "failed to change permissions on server keys: $!";
 	_copy_files("ssl/root+client_ca.crt", $pgdata);
-	_copy_files("ssl/root+server_ca.crt", $pgdata);
 	_copy_files("ssl/root_ca.crt", $pgdata);
 	_copy_files("ssl/root+client.crl", $pgdata);
 	mkdir("$pgdata/root+client-crldir")
@@ -147,8 +146,7 @@ following parameters are supported:
 =item cafile => B<value>
 
 The CA certificate file to use for the C<ssl_ca_file> GUC. If omitted it will
-default to 'root+client_ca.crt'. If empty, no C<ssl_ca_file> configuration
-parameter will be set.
+default to 'root+client_ca.crt'.
 
 =item certfile => B<value>
 
@@ -183,18 +181,10 @@ sub set_server_cert
 	  unless defined $params->{keyfile};
 
 	my $sslconf =
-		"ssl_cert_file='$params->{certfile}.crt'\n"
+		"ssl_ca_file='$params->{cafile}.crt'\n"
+	  . "ssl_cert_file='$params->{certfile}.crt'\n"
 	  . "ssl_key_file='$params->{keyfile}.key'\n"
 	  . "ssl_crl_file='$params->{crlfile}'\n";
-	if ($params->{cafile} ne "")
-	{
-		$sslconf .= "ssl_ca_file='$params->{cafile}.crt'\n";
-	}
-	else
-	{
-		$sslconf .= "ssl_ca_file=''\n";
-	}
-
 	$sslconf .= "ssl_crl_dir='$params->{crldir}'\n"
 	  if defined $params->{crldir};
 
@@ -229,6 +219,8 @@ sub library_is_libressl
 	my ($self) = @_;
 
 	# The HAVE_SSL_CTX_SET_CERT_CB macro isn't defined for LibreSSL.
+	# (Nor for OpenSSL 1.0.1, but that's old enough that accommodating it
+	# isn't worth the cost.)
 	# We may eventually need a less-bogus heuristic.
 	return not check_pg_config("#define HAVE_SSL_CTX_SET_CERT_CB 1");
 }

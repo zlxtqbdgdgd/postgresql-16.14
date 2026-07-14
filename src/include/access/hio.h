@@ -4,7 +4,7 @@
  *	  POSTGRES heap access method input/output definitions.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/hio.h
@@ -54,7 +54,7 @@ typedef struct BulkInsertStateData
 extern void RelationPutHeapTuple(Relation relation, Buffer buffer,
 								 HeapTuple tuple, bool token);
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
-										Buffer otherBuffer, uint32 options,
+										Buffer otherBuffer, int options,
 										BulkInsertStateData *bistate,
 										Buffer *vmbuffer, Buffer *vmbuffer_other,
 										int num_pages);

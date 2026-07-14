@@ -10,7 +10,7 @@
  * before the lock is released (see notes in README).
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,7 @@
 #include "postgres.h"
 
 #include "storage/buf_internals.h"
-#include "storage/subsystems.h"
+#include "storage/bufmgr.h"
 
 /* entry for buffer lookup hashtable */
 typedef struct
@@ -33,42 +33,37 @@ typedef struct
 
 static HTAB *SharedBufHash;
 
-static void BufTableShmemRequest(void *arg);
-
-const ShmemCallbacks BufTableShmemCallbacks = {
-	.request_fn = BufTableShmemRequest,
-	/* no special initialization needed, the hash table will start empty */
-};
 
 /*
- * Register shmem hash table for mapping buffers.
+ * Estimate space needed for mapping hashtable
+ *		size is the desired hash table size (possibly more than NBuffers)
+ */
+Size
+BufTableShmemSize(int size)
+{
+	return hash_estimate_size(size, sizeof(BufferLookupEnt));
+}
+
+/*
+ * Initialize shmem hash table for mapping buffers
  *		size is the desired hash table size (possibly more than NBuffers)
  */
 void
-BufTableShmemRequest(void *arg)
+InitBufTable(int size)
 {
-	int			size;
+	HASHCTL		info;
 
-	/*
-	 * Request the shared buffer lookup hashtable.
-	 *
-	 * Since we can't tolerate running out of lookup table entries, we must be
-	 * sure to specify an adequate table size here.  The maximum steady-state
-	 * usage is of course NBuffers entries, but BufferAlloc() tries to insert
-	 * a new entry before deleting the old.  In principle this could be
-	 * happening in each partition concurrently, so we could need as many as
-	 * NBuffers + NUM_BUFFER_PARTITIONS entries.
-	 */
-	size = NBuffers + NUM_BUFFER_PARTITIONS;
+	/* assume no locking is needed yet */
 
-	ShmemRequestHash(.name = "Shared Buffer Lookup Table",
-					 .nelems = size,
-					 .ptr = &SharedBufHash,
-					 .hash_info.keysize = sizeof(BufferTag),
-					 .hash_info.entrysize = sizeof(BufferLookupEnt),
-					 .hash_info.num_partitions = NUM_BUFFER_PARTITIONS,
-					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_PARTITION | HASH_FIXED_SIZE,
-		);
+	/* BufferTag maps to Buffer */
+	info.keysize = sizeof(BufferTag);
+	info.entrysize = sizeof(BufferLookupEnt);
+	info.num_partitions = NUM_BUFFER_PARTITIONS;
+
+	SharedBufHash = ShmemInitHash("Shared Buffer Lookup Table",
+								  size, size,
+								  &info,
+								  HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
 }
 
 /*
@@ -83,7 +78,7 @@ BufTableShmemRequest(void *arg)
 uint32
 BufTableHashCode(BufferTag *tagPtr)
 {
-	return get_hash_value(SharedBufHash, tagPtr);
+	return get_hash_value(SharedBufHash, (void *) tagPtr);
 }
 
 /*

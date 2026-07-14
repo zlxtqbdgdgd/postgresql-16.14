@@ -4,7 +4,7 @@
  *	  internal structures for hash joins
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/hashjoin.h
@@ -19,8 +19,6 @@
 #include "storage/barrier.h"
 #include "storage/buffile.h"
 #include "storage/lwlock.h"
-#include "utils/dsa.h"
-#include "utils/sharedtuplestore.h"
 
 /* ----------------------------------------------------------------
  *				hash-join hash table structures
@@ -70,15 +68,6 @@
  * inner batch file.  Subsequently, while reading either inner or outer batch
  * files, we might find tuples that no longer belong to the current batch;
  * if so, we just dump them out to the correct batch file.
- *
- * If an input tuple has a null join key, then it cannot match anything from
- * the other side of the join.  Normally we can just discard such a tuple
- * immediately, but if it comes from the outer side of an outer join then we
- * must emit it with null-extension of the other side.  For various reasons
- * it's not convenient to do that immediately on seeing the tuple, so we dump
- * the tuple into a tuplestore and emit it later.  (In the unlikely but
- * supported case of a non-strict join operator, we treat null keys as normal
- * data.)
  * ----------------------------------------------------------------
  */
 
@@ -158,7 +147,7 @@ typedef struct HashMemoryChunkData
 
 typedef struct HashMemoryChunkData *HashMemoryChunk;
 
-#define HASH_CHUNK_SIZE			((Size) (32 * 1024))
+#define HASH_CHUNK_SIZE			(32 * 1024L)
 #define HASH_CHUNK_HEADER_SIZE	MAXALIGN(sizeof(HashMemoryChunkData))
 #define HASH_CHUNK_DATA(hc)		(((char *) (hc)) + HASH_CHUNK_HEADER_SIZE)
 /* tuples exceeding HASH_CHUNK_THRESHOLD bytes are put in their own chunk */
@@ -247,7 +236,7 @@ typedef enum ParallelHashGrowth
 	/* The memory budget would be exhausted, so we need to repartition. */
 	PHJ_GROWTH_NEED_MORE_BATCHES,
 	/* Repartitioning didn't help last time, so don't try to do that again. */
-	PHJ_GROWTH_DISABLED,
+	PHJ_GROWTH_DISABLED
 } ParallelHashGrowth;
 
 /*
@@ -324,6 +313,8 @@ typedef struct HashJoinTableData
 		dsa_pointer_atomic *shared;
 	}			buckets;
 
+	bool		keepNulls;		/* true to store unmatchable NULL tuples */
+
 	bool		skewEnabled;	/* are we using skew optimization? */
 	HashSkewBucket **skewBucket;	/* hashtable of skew buckets */
 	int			skewBucketLen;	/* size of skewBucket array (a power of 2!) */
@@ -338,16 +329,9 @@ typedef struct HashJoinTableData
 
 	bool		growEnabled;	/* flag to shut off nbatch increases */
 
-	/*
-	 * totalTuples is the running total of tuples inserted into either the
-	 * main or skew hash tables.  reportTuples is the number of tuples that we
-	 * want EXPLAIN to show as output from the Hash node (this includes saved
-	 * null-keyed tuples as well as those inserted into the hash tables).
-	 * skewTuples is the number of tuples present in the skew hash table.
-	 */
-	double		totalTuples;
-	double		reportTuples;
-	double		skewTuples;
+	double		totalTuples;	/* # tuples obtained from inner plan */
+	double		partialTuples;	/* # tuples obtained from inner plan by me */
+	double		skewTuples;		/* # tuples inserted into skew tuples */
 
 	/*
 	 * These arrays are allocated for the life of the hash join, but only if
@@ -358,6 +342,16 @@ typedef struct HashJoinTableData
 	 */
 	BufFile   **innerBatchFile; /* buffered virtual temp file per batch */
 	BufFile   **outerBatchFile; /* buffered virtual temp file per batch */
+
+	/*
+	 * Info about the datatype-specific hash functions for the datatypes being
+	 * hashed. These are arrays of the same length as the number of hash join
+	 * clauses (hash keys).
+	 */
+	FmgrInfo   *outer_hashfunctions;	/* lookup data for hash functions */
+	FmgrInfo   *inner_hashfunctions;	/* lookup data for hash functions */
+	bool	   *hashStrict;		/* is each hash join operator strict? */
+	Oid		   *collations;
 
 	Size		spaceUsed;		/* memory space currently used by tuples */
 	Size		spaceAllowed;	/* upper limit for space used */

@@ -3,7 +3,7 @@
  * win32_sema.c
  *	  Microsoft Windows Win32 Semaphores Emulation
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32_sema.c
@@ -25,16 +25,17 @@ static void ReleaseSemaphores(int code, Datum arg);
 
 
 /*
- * Request shared memory needed for semaphores
+ * Report amount of shared memory needed for semaphores
  */
-void
-PGSemaphoreShmemRequest(int maxSemas)
+Size
+PGSemaphoreShmemSize(int maxSemas)
 {
 	/* No shared memory needed on Windows */
+	return 0;
 }
 
 /*
- * PGSemaphoreInit --- initialize semaphore support
+ * PGReserveSemaphores --- initialize semaphore support
  *
  * In the Win32 implementation, we acquire semaphores on-demand; the
  * maxSemas parameter is just used to size the array that keeps track of
@@ -43,7 +44,7 @@ PGSemaphoreShmemRequest(int maxSemas)
  * process exits.
  */
 void
-PGSemaphoreInit(int maxSemas)
+PGReserveSemaphores(int maxSemas)
 {
 	mySemSet = (HANDLE *) malloc(maxSemas * sizeof(HANDLE));
 	if (mySemSet == NULL)

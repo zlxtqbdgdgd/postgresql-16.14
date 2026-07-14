@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,10 +23,12 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/session.h"
+#include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -38,31 +40,25 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "port/pg_bitutils.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
-#include "replication/slotsync.h"
 #include "replication/walsender.h"
-#include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/procnumber.h"
 #include "storage/procsignal.h"
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
-#include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc_hooks.h"
-#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/portal.h"
@@ -70,19 +66,6 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
-
-/* has this backend called EmitConnectionWarnings()? */
-static bool ConnectionWarningsEmitted;
-
-typedef struct ConnectionWarning
-{
-	char	   *message;
-	char	   *detail;
-	ConnectionWarningFilter filter;
-} ConnectionWarning;
-
-/* warnings to send via EmitConnectionWarnings() */
-static List *ConnectionWarnings;
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -92,14 +75,12 @@ static void ShutdownPostgres(int code, Datum arg);
 static void StatementTimeoutHandler(void);
 static void LockTimeoutHandler(void);
 static void IdleInTransactionSessionTimeoutHandler(void);
-static void TransactionTimeoutHandler(void);
 static void IdleSessionTimeoutHandler(void);
 static void IdleStatsUpdateTimeoutHandler(void);
 static void ClientCheckTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
-static void EmitConnectionWarnings(void);
 
 
 /*** InitPostgres support ***/
@@ -251,9 +232,6 @@ PerformAuthentication(Port *port)
 	}
 #endif
 
-	/* Capture authentication start time for logging */
-	conn_timing.auth_start = GetCurrentTimestamp();
-
 	/*
 	 * Set up a timeout in case a buggy or malicious client fails to respond
 	 * during authentication.  Since we're inside a transaction and might do
@@ -272,10 +250,7 @@ PerformAuthentication(Port *port)
 	 */
 	disable_timeout(STATEMENT_TIMEOUT, false);
 
-	/* Capture authentication end time for logging */
-	conn_timing.auth_end = GetCurrentTimestamp();
-
-	if (log_connections & LOG_CONNECTION_AUTHORIZATION)
+	if (Log_connections)
 	{
 		StringInfoData logmsg;
 
@@ -343,6 +318,7 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	bool		isnull;
 	char	   *collate;
 	char	   *ctype;
+	char	   *iculocale;
 
 	/* Fetch our pg_database row normally, via syscache */
 	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
@@ -432,11 +408,12 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datctype);
 	ctype = TextDatumGetCString(datum);
 
-	/*
-	 * Historically, we set LC_COLLATE from datcollate, as well. That's no
-	 * longer necessary because all collation behavior is handled through
-	 * pg_locale_t.
-	 */
+	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
+		ereport(FATAL,
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_COLLATE \"%s\", "
+						   " which is not recognized by setlocale().", collate),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
 
 	if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
 		ereport(FATAL,
@@ -445,7 +422,36 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 						   " which is not recognized by setlocale().", ctype),
 				 errhint("Recreate the database with another locale or install the missing locale.")));
 
-	init_database_collation();
+	if (strcmp(ctype, "C") == 0 ||
+		strcmp(ctype, "POSIX") == 0)
+		database_ctype_is_c = true;
+
+	if (dbform->datlocprovider == COLLPROVIDER_ICU)
+	{
+		char	   *icurules;
+
+		datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_daticulocale);
+		iculocale = TextDatumGetCString(datum);
+
+		datum = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_daticurules, &isnull);
+		if (!isnull)
+			icurules = TextDatumGetCString(datum);
+		else
+			icurules = NULL;
+
+		make_icu_collator(iculocale, icurules, &default_locale);
+	}
+	else
+		iculocale = NULL;
+
+	default_locale.provider = dbform->datlocprovider;
+
+	/*
+	 * Default locale is currently always deterministic.  Nondeterministic
+	 * locales currently don't support pattern matching, which would break a
+	 * lot of things if applied globally.
+	 */
+	default_locale.deterministic = true;
 
 	/*
 	 * Check collation version.  See similar code in
@@ -458,19 +464,10 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	{
 		char	   *actual_versionstr;
 		char	   *collversionstr;
-		char	   *locale;
 
 		collversionstr = TextDatumGetCString(datum);
 
-		if (dbform->datlocprovider == COLLPROVIDER_LIBC)
-			locale = collate;
-		else
-		{
-			datum = SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datlocale);
-			locale = TextDatumGetCString(datum);
-		}
-
-		actual_versionstr = get_collation_actual_version(dbform->datlocprovider, locale);
+		actual_versionstr = get_collation_actual_version(dbform->datlocprovider, dbform->datlocprovider == COLLPROVIDER_ICU ? iculocale : collate);
 		if (!actual_versionstr)
 			/* should not happen */
 			elog(WARNING,
@@ -566,48 +563,61 @@ InitializeMaxBackends(void)
 {
 	Assert(MaxBackends == 0);
 
-	/* Note that this does not include "auxiliary" processes */
-	MaxBackends = MaxConnections + autovacuum_worker_slots +
-		max_worker_processes + max_wal_senders + NUM_SPECIAL_WORKER_PROCS;
+	/* the extra unit accounts for the autovacuum launcher */
+	MaxBackends = MaxConnections + autovacuum_max_workers + 1 +
+		max_worker_processes + max_wal_senders;
 
+	/* internal error because the values were all checked previously */
 	if (MaxBackends > MAX_BACKENDS)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("too many server processes configured"),
-				 errdetail("\"max_connections\" (%d) plus \"autovacuum_worker_slots\" (%d) plus \"max_worker_processes\" (%d) plus \"max_wal_senders\" (%d) must be less than %d.",
-						   MaxConnections, autovacuum_worker_slots,
-						   max_worker_processes, max_wal_senders,
-						   MAX_BACKENDS - (NUM_SPECIAL_WORKER_PROCS - 1))));
+		elog(ERROR, "too many backends configured");
 }
 
 /*
- * Initialize the number of fast-path lock slots in PGPROC.
- *
- * This must be called after modules have had the chance to alter GUCs in
- * shared_preload_libraries and before shared memory size is determined.
+ * GUC check_hook for max_connections
  */
-void
-InitializeFastPathLocks(void)
+bool
+check_max_connections(int *newval, void **extra, GucSource source)
 {
-	/* Should be initialized only once. */
-	Assert(FastPathLockGroupsPerBackend == 0);
+	if (*newval + autovacuum_max_workers + 1 +
+		max_worker_processes + max_wal_senders > MAX_BACKENDS)
+		return false;
+	return true;
+}
 
-	/*
-	 * Based on the max_locks_per_transaction GUC, as that's a good indicator
-	 * of the expected number of locks, figure out the value for
-	 * FastPathLockGroupsPerBackend.  This must be a power-of-two.  We cap the
-	 * value at FP_LOCK_GROUPS_PER_BACKEND_MAX and insist the value is at
-	 * least 1.
-	 *
-	 * The default max_locks_per_transaction = 128 means 8 groups by default.
-	 */
-	FastPathLockGroupsPerBackend =
-		Max(Min(pg_nextpower2_32(max_locks_per_xact) / FP_LOCK_SLOTS_PER_GROUP,
-				FP_LOCK_GROUPS_PER_BACKEND_MAX), 1);
+/*
+ * GUC check_hook for autovacuum_max_workers
+ */
+bool
+check_autovacuum_max_workers(int *newval, void **extra, GucSource source)
+{
+	if (MaxConnections + *newval + 1 +
+		max_worker_processes + max_wal_senders > MAX_BACKENDS)
+		return false;
+	return true;
+}
 
-	/* Validate we did get a power-of-two */
-	Assert(FastPathLockGroupsPerBackend ==
-		   pg_nextpower2_32(FastPathLockGroupsPerBackend));
+/*
+ * GUC check_hook for max_worker_processes
+ */
+bool
+check_max_worker_processes(int *newval, void **extra, GucSource source)
+{
+	if (MaxConnections + autovacuum_max_workers + 1 +
+		*newval + max_wal_senders > MAX_BACKENDS)
+		return false;
+	return true;
+}
+
+/*
+ * GUC check_hook for max_wal_senders
+ */
+bool
+check_max_wal_senders(int *newval, void **extra, GucSource source)
+{
+	if (MaxConnections + autovacuum_max_workers + 1 +
+		max_worker_processes + *newval > MAX_BACKENDS)
+		return false;
+	return true;
 }
 
 /*
@@ -642,16 +652,10 @@ BaseInit(void)
 	 */
 	pgstat_initialize();
 
-	/*
-	 * Initialize AIO before infrastructure that might need to actually
-	 * execute AIO.
-	 */
-	pgaio_init_backend();
-
 	/* Do local initialization of storage and buffer managers */
 	InitSync();
 	smgrinit();
-	InitBufferManagerAccess();
+	InitBufferPoolAccess();
 
 	/*
 	 * Initialize temporary file access after pgstat, so that the temporary
@@ -664,9 +668,6 @@ BaseInit(void)
 	 * try to insert XLOG.
 	 */
 	InitXLogInsert();
-
-	/* Initialize lock manager's local structs */
-	InitLockManagerAccess();
 
 	/*
 	 * Initialize replication slots after pgstat. The exit hook might need to
@@ -683,10 +684,8 @@ BaseInit(void)
  * Parameters:
  *	in_dbname, dboid: specify database to connect to, as described below
  *	username, useroid: specify role to connect as, as described below
- *	flags:
- *	  - INIT_PG_LOAD_SESSION_LIBS to honor [session|local]_preload_libraries.
- *	  - INIT_PG_OVERRIDE_ALLOW_CONNS to connect despite !datallowconn.
- *	  - INIT_PG_OVERRIDE_ROLE_LOGIN to connect despite !rolcanlogin.
+ *	load_session_libraries: TRUE to honor [session|local]_preload_libraries
+ *	override_allow_connections: TRUE to connect despite !datallowconn
  *	out_dbname: optional output parameter, see below; pass NULL if not used
  *
  * The database can be specified by name, using the in_dbname parameter, or by
@@ -705,8 +704,8 @@ BaseInit(void)
  * database but not a username; conversely, a physical walsender specifies
  * username but not database.
  *
- * By convention, INIT_PG_LOAD_SESSION_LIBS should be passed in "flags" in
- * "interactive" sessions (including standalone backends), but not in
+ * By convention, load_session_libraries should be passed as true in
+ * "interactive" sessions (including standalone backends), but false in
  * background processes such as autovacuum.  Note in particular that it
  * shouldn't be true in parallel worker processes; those have another
  * mechanism for replicating their leader's set of loaded libraries.
@@ -721,7 +720,8 @@ BaseInit(void)
 void
 InitPostgres(const char *in_dbname, Oid dboid,
 			 const char *username, Oid useroid,
-			 uint32 flags,
+			 bool load_session_libraries,
+			 bool override_allow_connections,
 			 char *out_dbname)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
@@ -739,55 +739,21 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	InitProcessPhase2();
 
-	/* Initialize status reporting */
-	pgstat_beinit();
-
-	/*
-	 * And initialize an entry in the PgBackendStatus array.  That way, if
-	 * LWLocks or third-party authentication should happen to hang, it is
-	 * possible to retrieve some information about what is going on.
-	 */
-	if (!bootstrap)
-	{
-		pgstat_bestart_initial();
-		INJECTION_POINT("init-pre-auth", NULL);
-	}
-
 	/*
 	 * Initialize my entry in the shared-invalidation manager's array of
 	 * per-backend data.
+	 *
+	 * Sets up MyBackendId, a unique backend identifier.
 	 */
+	MyBackendId = InvalidBackendId;
+
 	SharedInvalBackendInit(false);
 
-	/*
-	 * Prevent consuming interrupts between setting ProcSignalInit and setting
-	 * the initial local data checksum value.  If a barrier is emitted, and
-	 * absorbed, before local cached state is initialized the state transition
-	 * can be invalid.
-	 */
-	HOLD_INTERRUPTS();
+	if (MyBackendId > MaxBackends || MyBackendId <= 0)
+		elog(FATAL, "bad backend ID: %d", MyBackendId);
 
-	ProcSignalInit(MyCancelKey, MyCancelKeyLength);
-
-	/*
-	 * Initialize a local cache of the data_checksum_version, to be updated by
-	 * the procsignal-based barriers.
-	 *
-	 * This intentionally happens after initializing the procsignal, otherwise
-	 * we might miss a state change. This means we can get a barrier for the
-	 * state we've just initialized.
-	 *
-	 * The postmaster (which is what gets forked into the new child process)
-	 * does not handle barriers, therefore it may not have the current value
-	 * of LocalDataChecksumState value (it'll have the value read from the
-	 * control file, which may be arbitrarily old).
-	 *
-	 * NB: Even if the postmaster handled barriers, the value might still be
-	 * stale, as it might have changed after this process forked.
-	 */
-	InitLocalDataChecksumState();
-
-	RESUME_INTERRUPTS();
+	/* Now that we have a BackendId, we can participate in ProcSignal */
+	ProcSignalInit(MyBackendId);
 
 	/*
 	 * Also set up timeout handlers needed for backend operation.  We need
@@ -800,7 +766,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
 		RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
 						IdleInTransactionSessionTimeoutHandler);
-		RegisterTimeout(TRANSACTION_TIMEOUT, TransactionTimeoutHandler);
 		RegisterTimeout(IDLE_SESSION_TIMEOUT, IdleSessionTimeoutHandler);
 		RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
 		RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
@@ -837,16 +802,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	}
 
 	/*
-	 * Initialize the process-local logical info WAL logging state.
-	 *
-	 * This must be called after ProcSignalInit() so that the process can
-	 * participate in procsignal-based barriers that update this state.
-	 * Furthermore, in !IsUnderPostmaster cases, this must occur after
-	 * StartupXLOG() where the shared state is first established.
-	 */
-	InitializeProcessXLogLogicalInfo();
-
-	/*
 	 * Initialize the relation cache and the system catalog caches.  Note that
 	 * no catalog access happens here; we only set up the hashtable structure.
 	 * We must do this before starting a transaction because transaction abort
@@ -859,6 +814,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* Initialize portal manager */
 	EnablePortalManager();
 
+	/* Initialize status reporting */
+	pgstat_beinit();
+
 	/*
 	 * Load relcache entries for the shared system catalogs.  This must create
 	 * at least entries for pg_database and catalogs used for authentication.
@@ -866,9 +824,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	RelationCacheInitializePhase2();
 
 	/*
-	 * Set up process-exit callback to do pre-shutdown cleanup.  This is one
-	 * of the first before_shmem_exit callbacks we register; thus, this will
-	 * be one of the last things we do before low-level modules like the
+	 * Set up process-exit callback to do pre-shutdown cleanup.  This is the
+	 * one of the first before_shmem_exit callbacks we register; thus, this
+	 * will be one the last things we do before low-level modules like the
 	 * buffer manager begin to close down.  We need to have this in place
 	 * before we begin our first transaction --- if we fail during the
 	 * initialization transaction, as is entirely possible, we need the
@@ -877,16 +835,25 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	before_shmem_exit(ShutdownPostgres, 0);
 
 	/* The autovacuum launcher is done here */
-	if (AmAutoVacuumLauncherProcess())
+	if (IsAutoVacuumLauncherProcess())
 	{
-		/* fill in the remainder of this entry in the PgBackendStatus array */
-		pgstat_bestart_final();
+		/* report this backend in the PgBackendStatus array */
+		pgstat_bestart();
 
 		return;
 	}
 
 	/*
-	 * Start a new transaction here before first access to db.
+	 * Start a new transaction here before first access to db, and get a
+	 * snapshot.  We don't have a use for the snapshot itself, but we're
+	 * interested in the secondary effect that it sets RecentGlobalXmin. (This
+	 * is critical for anything that reads heap pages, because HOT may decide
+	 * to prune them even if the process doesn't attempt to modify any
+	 * tuples.)
+	 *
+	 * FIXME: This comment is inaccurate / the code buggy. A snapshot that is
+	 * not pushed/active does not reliably prevent HOT pruning (->xmin could
+	 * e.g. be cleared when cache invalidations are processed).
 	 */
 	if (!bootstrap)
 	{
@@ -901,17 +868,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		 * Fortunately, "read committed" is plenty good enough.
 		 */
 		XactIsoLevel = XACT_READ_COMMITTED;
+
+		(void) GetTransactionSnapshot();
 	}
 
 	/*
 	 * Perform client authentication if necessary, then figure out our
 	 * postgres user ID, and see if we are a superuser.
 	 *
-	 * In standalone mode, autovacuum worker processes and slot sync worker
-	 * process, we use a fixed ID, otherwise we figure it out from the
-	 * authenticated user name.
+	 * In standalone mode and in autovacuum worker processes, we use a fixed
+	 * ID, otherwise we figure it out from the authenticated user name.
 	 */
-	if (bootstrap || AmAutoVacuumWorkerProcess() || AmLogicalSlotSyncWorkerProcess())
+	if (bootstrap || IsAutoVacuumWorkerProcess())
 	{
 		InitializeSessionUserIdStandalone();
 		am_superuser = true;
@@ -927,7 +895,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
 							 username != NULL ? username : "postgres")));
 	}
-	else if (AmBackgroundWorkerProcess() || AmDataChecksumsWorkerProcess())
+	else if (IsBackgroundWorker)
 	{
 		if (username == NULL && !OidIsValid(useroid))
 		{
@@ -936,8 +904,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		}
 		else
 		{
-			InitializeSessionUserId(username, useroid,
-									(flags & INIT_PG_OVERRIDE_ROLE_LOGIN) != 0);
+			InitializeSessionUserId(username, useroid);
 			am_superuser = superuser();
 		}
 	}
@@ -946,20 +913,12 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		/* normal multiuser case */
 		Assert(MyProcPort != NULL);
 		PerformAuthentication(MyProcPort);
-		InitializeSessionUserId(username, useroid, false);
+		InitializeSessionUserId(username, useroid);
 		/* ensure that auth_method is actually valid, aka authn_id is not NULL */
 		if (MyClientConnectionInfo.authn_id)
 			InitializeSystemUser(MyClientConnectionInfo.authn_id,
 								 hba_authname(MyClientConnectionInfo.auth_method));
 		am_superuser = superuser();
-	}
-
-	/* Report any SSL/GSS details for the session. */
-	if (MyProcPort != NULL)
-	{
-		Assert(!bootstrap);
-
-		pgstat_bestart_security();
 	}
 
 	/*
@@ -1031,14 +990,11 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		/* initialize client encoding */
 		InitializeClientEncoding();
 
-		/* fill in the remainder of this entry in the PgBackendStatus array */
-		pgstat_bestart_final();
+		/* report this backend in the PgBackendStatus array */
+		pgstat_bestart();
 
 		/* close the transaction we started above */
 		CommitTransactionCommand();
-
-		/* send any WARNINGs we've accumulated during initialization */
-		EmitConnectionWarnings();
 
 		return;
 	}
@@ -1078,7 +1034,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		 */
 		if (!bootstrap)
 		{
-			pgstat_bestart_final();
+			pgstat_bestart();
 			CommitTransactionCommand();
 		}
 		return;
@@ -1147,7 +1103,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		}
 
 		MyDatabaseTableSpace = datform->dattablespace;
-		MyDatabaseHasLoginEventTriggers = datform->dathasloginevt;
 		/* pass the database name back to the caller */
 		if (out_dbname)
 			strcpy(out_dbname, dbname);
@@ -1236,8 +1191,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * user is a superuser, so the above stuff has to happen first.)
 	 */
 	if (!bootstrap)
-		CheckMyDatabase(dbname, am_superuser,
-						(flags & INIT_PG_OVERRIDE_ALLOW_CONNS) != 0);
+		CheckMyDatabase(dbname, am_superuser, override_allow_connections);
 
 	/*
 	 * Now process any command-line switches and any additional GUC variable
@@ -1275,19 +1229,16 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * during the initial transaction in case anything that requires database
 	 * access needs to be done.
 	 */
-	if ((flags & INIT_PG_LOAD_SESSION_LIBS) != 0)
+	if (load_session_libraries)
 		process_session_preload_libraries();
 
-	/* fill in the remainder of this entry in the PgBackendStatus array */
+	/* report this backend in the PgBackendStatus array */
 	if (!bootstrap)
-		pgstat_bestart_final();
+		pgstat_bestart();
 
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
-
-	/* send any WARNINGs we've accumulated during initialization */
-	EmitConnectionWarnings();
 }
 
 /*
@@ -1319,7 +1270,7 @@ process_startup_options(Port *port, bool am_superuser)
 
 		maxac = 2 + (strlen(port->cmdline_options) + 1) / 2;
 
-		av = palloc_array(char *, maxac);
+		av = (char **) palloc(maxac * sizeof(char *));
 		ac = 0;
 
 		av[ac++] = "postgres";
@@ -1443,14 +1394,6 @@ LockTimeoutHandler(void)
 }
 
 static void
-TransactionTimeoutHandler(void)
-{
-	TransactionTimeoutPending = true;
-	InterruptPending = true;
-	SetLatch(MyLatch);
-}
-
-static void
 IdleInTransactionSessionTimeoutHandler(void)
 {
 	IdleInTransactionSessionTimeoutPending = true;
@@ -1501,67 +1444,4 @@ ThereIsAtLeastOneRole(void)
 	table_close(pg_authid_rel, AccessShareLock);
 
 	return result;
-}
-
-/*
- * Stores a warning message to be sent later via EmitConnectionWarnings().
- * Both msg and detail must be non-NULL.  If filter is non-NULL, it is called
- * just before the warning is emitted, after startup and role/database settings
- * have been applied.
- *
- * NB: Caller should ensure the strings are palloc'd in a long-lived context
- * like TopMemoryContext.  This function takes ownership of the strings, which
- * will be pfree'd in EmitConnectionWarnings().
- */
-void
-StoreConnectionWarning(char *msg, char *detail, ConnectionWarningFilter filter)
-{
-	MemoryContext oldcontext;
-	ConnectionWarning *warning;
-
-	Assert(msg);
-	Assert(detail);
-
-	if (ConnectionWarningsEmitted)
-		elog(ERROR, "StoreConnectionWarning() called after EmitConnectionWarnings()");
-
-	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
-	warning = palloc_object(ConnectionWarning);
-	warning->message = msg;
-	warning->detail = detail;
-	warning->filter = filter;
-	ConnectionWarnings = lappend(ConnectionWarnings, warning);
-
-	MemoryContextSwitchTo(oldcontext);
-}
-
-/*
- * Sends the warning messages saved via StoreConnectionWarning() and frees the
- * strings and lists.
- *
- * NB: This can only be called once per backend.
- */
-static void
-EmitConnectionWarnings(void)
-{
-	if (ConnectionWarningsEmitted)
-		elog(ERROR, "EmitConnectionWarnings() called more than once");
-	else
-		ConnectionWarningsEmitted = true;
-
-	foreach_ptr(ConnectionWarning, warning, ConnectionWarnings)
-	{
-		if (warning->filter == NULL || warning->filter())
-			ereport(WARNING,
-					(errmsg("%s", warning->message),
-					 errdetail("%s", warning->detail)));
-
-		pfree(warning->message);
-		pfree(warning->detail);
-		pfree(warning);
-	}
-
-	list_free(ConnectionWarnings);
-	ConnectionWarnings = NIL;
 }

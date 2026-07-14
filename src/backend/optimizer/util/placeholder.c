@@ -4,7 +4,7 @@
  *	  PlaceHolderVar and PlaceHolderInfo manipulation routines
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,8 +35,6 @@ static void find_placeholders_recurse(PlannerInfo *root, Node *jtnode);
 static void find_placeholders_in_expr(PlannerInfo *root, Node *expr);
 static bool contain_placeholder_references_walker(Node *node,
 												  contain_placeholder_references_context *context);
-static bool contain_noop_phv_walker(Node *node, void *context);
-static Node *strip_noop_phvs_mutator(Node *node, void *context);
 
 
 /*
@@ -317,33 +315,6 @@ fix_placeholder_input_needed_levels(PlannerInfo *root)
 }
 
 /*
- * rebuild_placeholder_attr_needed
- *	  Put back attr_needed bits for Vars/PHVs needed in PlaceHolderVars.
- *
- * This is used to rebuild attr_needed/ph_needed sets after removal of a
- * useless outer join.  It should match what
- * fix_placeholder_input_needed_levels did, except that we call
- * add_vars_to_attr_needed not add_vars_to_targetlist.
- */
-void
-rebuild_placeholder_attr_needed(PlannerInfo *root)
-{
-	ListCell   *lc;
-
-	foreach(lc, root->placeholder_list)
-	{
-		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
-		List	   *vars = pull_var_clause((Node *) phinfo->ph_var->phexpr,
-										   PVC_RECURSE_AGGREGATES |
-										   PVC_RECURSE_WINDOWFUNCS |
-										   PVC_INCLUDE_PLACEHOLDERS);
-
-		add_vars_to_attr_needed(root, vars, phinfo->ph_eval_at);
-		list_free(vars);
-	}
-}
-
-/*
  * add_placeholders_to_base_rels
  *		Add any required PlaceHolderVars to base rels' targetlists.
  *
@@ -404,7 +375,6 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 							SpecialJoinInfo *sjinfo)
 {
 	Relids		relids = joinrel->relids;
-	int64		tuple_width = joinrel->reltarget->width;
 	ListCell   *lc;
 
 	foreach(lc, root->placeholder_list)
@@ -449,7 +419,7 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 					cost_qual_eval_node(&cost, (Node *) phv->phexpr, root);
 					joinrel->reltarget->cost.startup += cost.startup;
 					joinrel->reltarget->cost.per_tuple += cost.per_tuple;
-					tuple_width += phinfo->ph_width;
+					joinrel->reltarget->width += phinfo->ph_width;
 				}
 			}
 
@@ -473,8 +443,6 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 								phinfo->ph_lateral);
 		}
 	}
-
-	joinrel->reltarget->width = clamp_width_est(tuple_width);
 }
 
 /*
@@ -546,133 +514,4 @@ contain_placeholder_references_walker(Node *node,
 	}
 	return expression_tree_walker(node, contain_placeholder_references_walker,
 								  context);
-}
-
-/*
- * Compute the set of outer-join relids that can null a placeholder.
- *
- * This is analogous to RelOptInfo.nulling_relids for Vars, but we compute it
- * on-the-fly rather than saving it somewhere.  Currently the value is needed
- * at most once per query, so there's little value in doing otherwise.  If it
- * ever gains more widespread use, perhaps we should cache the result in
- * PlaceHolderInfo.
- */
-Relids
-get_placeholder_nulling_relids(PlannerInfo *root, PlaceHolderInfo *phinfo)
-{
-	Relids		result = NULL;
-	int			relid = -1;
-
-	/*
-	 * Form the union of all potential nulling OJs for each baserel included
-	 * in ph_eval_at.
-	 */
-	while ((relid = bms_next_member(phinfo->ph_eval_at, relid)) > 0)
-	{
-		RelOptInfo *rel = root->simple_rel_array[relid];
-
-		/* ignore the RTE_GROUP RTE */
-		if (relid == root->group_rtindex)
-			continue;
-
-		if (rel == NULL)		/* must be an outer join */
-		{
-			Assert(bms_is_member(relid, root->outer_join_rels));
-			continue;
-		}
-		result = bms_add_members(result, rel->nulling_relids);
-	}
-
-	/* Now remove any OJs already included in ph_eval_at, and we're done. */
-	result = bms_del_members(result, phinfo->ph_eval_at);
-	return result;
-}
-
-/*
- * strip_noop_phvs
- *	  Strip no-op PlaceHolderVar nodes from the given expression tree.
- *
- * A PlaceHolderVar that is not marked as nullable (i.e., its phnullingrels
- * is empty) is effectively a no-op when it appears in a relation-scan-level
- * expression.  This function strips such PlaceHolderVars, which is useful
- * for matching expressions to index keys or partition keys in cases where
- * the expression has been wrapped in PlaceHolderVars during subquery pullup.
- *
- * IMPORTANT: the caller must ensure that the expression is a scan-level
- * expression, so that non-nullable PlaceHolderVars in it are indeed no-ops.
- *
- * The removal is performed recursively because PlaceHolderVars can be nested
- * or interleaved with other node types.  We must peel back all layers to
- * expose the base expression.
- *
- * As a performance optimization, we first use a lightweight walker to check
- * for the presence of strippable PlaceHolderVars.  The expensive mutator is
- * invoked only if a candidate is found, avoiding unnecessary memory allocation
- * and tree copying in the common case where no PlaceHolderVars are present.
- */
-Node *
-strip_noop_phvs(Node *node)
-{
-	/* Don't mutate/copy if no target PHVs exist */
-	if (!contain_noop_phv_walker(node, NULL))
-		return node;
-
-	return strip_noop_phvs_mutator(node, NULL);
-}
-
-/*
- * contain_noop_phv_walker
- *	  Detect if there are any PlaceHolderVars in the tree that are candidates
- *	  for stripping.
- *
- * We identify a PlaceHolderVar as strippable only if its phnullingrels is
- * empty.
- */
-static bool
-contain_noop_phv_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-
-	if (IsA(node, PlaceHolderVar))
-	{
-		PlaceHolderVar *phv = (PlaceHolderVar *) node;
-
-		if (bms_is_empty(phv->phnullingrels))
-			return true;
-	}
-
-	return expression_tree_walker(node, contain_noop_phv_walker,
-								  context);
-}
-
-/*
- * strip_noop_phvs_mutator
- *	  Recursively remove PlaceHolderVars that are not marked nullable.
- *
- * We strip a PlaceHolderVar only if its phnullingrels is empty, replacing it
- * with its contained expression.
- */
-static Node *
-strip_noop_phvs_mutator(Node *node, void *context)
-{
-	if (node == NULL)
-		return NULL;
-
-	if (IsA(node, PlaceHolderVar))
-	{
-		PlaceHolderVar *phv = (PlaceHolderVar *) node;
-
-		if (bms_is_empty(phv->phnullingrels))
-		{
-			/* Recurse on its contained expression */
-			return strip_noop_phvs_mutator((Node *) phv->phexpr,
-										   context);
-		}
-
-		/* Otherwise, keep this PHV but check its contained expression */
-	}
-
-	return expression_tree_mutator(node, strip_noop_phvs_mutator,
-								   context);
 }

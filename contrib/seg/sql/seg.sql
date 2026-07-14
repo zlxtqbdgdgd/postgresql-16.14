@@ -63,22 +63,13 @@ SELECT '12.34567890123456'::seg AS seg;
 -- Same, with a very long input
 SELECT '12.3456789012345600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::seg AS seg;
 
--- Numbers and ranges with certainty indicators.  Certainty indicators
--- are stored and preserved on output, but ignored by operators.
+-- Numbers with certainty indicators
 SELECT '~6.5'::seg AS seg;
 SELECT '<6.5'::seg AS seg;
 SELECT '>6.5'::seg AS seg;
 SELECT '~ 6.5'::seg AS seg;
 SELECT '< 6.5'::seg AS seg;
 SELECT '> 6.5'::seg AS seg;
-
-SELECT '~1.5 .. 2.5'::seg AS seg;
-SELECT '1.5 .. ~2.5'::seg AS seg;
-SELECT '~1.5 .. ~2.5'::seg AS seg;
-SELECT '<1.5 .. 2.5'::seg AS seg;
-SELECT '1.5 .. <2.5'::seg AS seg;
-SELECT '>1.5 .. 2.5'::seg AS seg;
-SELECT '1.5 .. >2.5'::seg AS seg;
 
 -- Open intervals
 SELECT '0..'::seg AS seg;

@@ -3,7 +3,7 @@
  * walsender.h
  *	  Exports from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender.h
  *
@@ -12,7 +12,7 @@
 #ifndef _WALSENDER_H
 #define _WALSENDER_H
 
-#include "access/xlogdefs.h"
+#include <signal.h>
 
 /*
  * What to do with a snapshot in create replication slot command.
@@ -21,7 +21,7 @@ typedef enum
 {
 	CRS_EXPORT_SNAPSHOT,
 	CRS_NOEXPORT_SNAPSHOT,
-	CRS_USE_SNAPSHOT,
+	CRS_USE_SNAPSHOT
 } CRSSnapshotAction;
 
 /* global state */
@@ -33,15 +33,15 @@ extern PGDLLIMPORT bool wake_wal_senders;
 /* user-settable parameters */
 extern PGDLLIMPORT int max_wal_senders;
 extern PGDLLIMPORT int wal_sender_timeout;
-extern PGDLLIMPORT int wal_sender_shutdown_timeout;
 extern PGDLLIMPORT bool log_replication_commands;
 
 extern void InitWalSender(void);
 extern bool exec_replication_command(const char *cmd_string);
 extern void WalSndErrorCleanup(void);
-extern void PhysicalWakeupLogicalWalSnd(void);
-extern XLogRecPtr GetStandbyFlushRecPtr(TimeLineID *tli);
+extern void WalSndResourceCleanup(bool isCommit);
 extern void WalSndSignals(void);
+extern Size WalSndShmemSize(void);
+extern void WalSndShmemInit(void);
 extern void WalSndWakeup(bool physical, bool logical);
 extern void WalSndInitStopping(void);
 extern void WalSndWaitStopping(void);

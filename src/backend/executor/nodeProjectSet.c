@@ -11,7 +11,7 @@
  *		can't be inside more-complex expressions.  If that'd otherwise be
  *		the case, the planner adds additional ProjectSet nodes.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,6 +26,7 @@
 #include "executor/nodeProjectSet.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "utils/memutils.h"
 
 
 static TupleTableSlot *ExecProjectSRF(ProjectSetState *node, bool continuing);
@@ -267,8 +268,10 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 
 	/* Create workspace for per-tlist-entry expr state & SRF-is-done state */
 	state->nelems = list_length(node->plan.targetlist);
-	state->elems = palloc_array(Node *, state->nelems);
-	state->elemdone = palloc_array(ExprDoneCond, state->nelems);
+	state->elems = (Node **)
+		palloc(sizeof(Node *) * state->nelems);
+	state->elemdone = (ExprDoneCond *)
+		palloc(sizeof(ExprDoneCond) * state->nelems);
 
 	/*
 	 * Build expressions to evaluate targetlist.  We can't use
@@ -325,6 +328,16 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 void
 ExecEndProjectSet(ProjectSetState *node)
 {
+	/*
+	 * Free the exprcontext
+	 */
+	ExecFreeExprContext(&node->ps);
+
+	/*
+	 * clean out the tuple table
+	 */
+	ExecClearTuple(node->ps.ps_ResultTupleSlot);
+
 	/*
 	 * shut down subplans
 	 */

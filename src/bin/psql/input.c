@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * src/bin/psql/input.c
  */
@@ -88,7 +88,8 @@ gets_interactive(const char *prompt, PQExpBuffer query_buf)
 		/* Enable SIGINT to longjmp to sigint_interrupt_jmp */
 		sigint_interrupt_enabled = true;
 
-		result = readline(prompt);
+		/* On some platforms, readline is declared as readline(char *) */
+		result = readline((char *) prompt);
 
 		/* Disable SIGINT again */
 		sigint_interrupt_enabled = false;
@@ -157,7 +158,7 @@ pg_send_history(PQExpBuffer history_buf)
 		else
 		{
 			/* Save each previous line for ignoredups processing */
-			pg_free(prev_hist);
+			free(prev_hist);
 			prev_hist = pg_strdup(s);
 			/* And send it to readline */
 			add_history(s);

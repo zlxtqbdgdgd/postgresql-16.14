@@ -4,7 +4,7 @@
  *	  routines to manage scans of inverted index relations
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,7 +16,6 @@
 
 #include "access/gin_private.h"
 #include "access/relscan.h"
-#include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -34,7 +33,7 @@ ginbeginscan(Relation rel, int nkeys, int norderbys)
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
 	/* allocate private workspace */
-	so = (GinScanOpaque) palloc_object(GinScanOpaqueData);
+	so = (GinScanOpaque) palloc(sizeof(GinScanOpaqueData));
 	so->keys = NULL;
 	so->nkeys = 0;
 	so->tempCtx = AllocSetContextCreate(CurrentMemoryContext,
@@ -99,7 +98,7 @@ ginFillScanEntry(GinScanOpaque so, OffsetNumber attnum,
 	}
 
 	/* Nope, create a new entry */
-	scanEntry = palloc_object(GinScanEntryData);
+	scanEntry = (GinScanEntry) palloc(sizeof(GinScanEntryData));
 	scanEntry->queryKey = queryKey;
 	scanEntry->queryCategory = queryCategory;
 	scanEntry->isPartialMatch = isPartialMatch;
@@ -112,8 +111,7 @@ ginFillScanEntry(GinScanOpaque so, OffsetNumber attnum,
 	ItemPointerSetMin(&scanEntry->curItem);
 	scanEntry->matchBitmap = NULL;
 	scanEntry->matchIterator = NULL;
-	scanEntry->matchResult.blockno = InvalidBlockNumber;
-	scanEntry->matchNtuples = -1;
+	scanEntry->matchResult = NULL;
 	scanEntry->list = NULL;
 	scanEntry->nlist = 0;
 	scanEntry->offset = InvalidOffsetNumber;
@@ -124,7 +122,8 @@ ginFillScanEntry(GinScanOpaque so, OffsetNumber attnum,
 	if (so->totalentries >= so->allocentries)
 	{
 		so->allocentries *= 2;
-		so->entries = repalloc_array(so->entries, GinScanEntry, so->allocentries);
+		so->entries = (GinScanEntry *)
+			repalloc(so->entries, so->allocentries * sizeof(GinScanEntry));
 	}
 	so->entries[so->totalentries++] = scanEntry;
 
@@ -170,8 +169,10 @@ ginFillScanKey(GinScanOpaque so, OffsetNumber attnum,
 	key->nuserentries = nQueryValues;
 
 	/* Allocate one extra array slot for possible "hidden" entry */
-	key->scanEntry = palloc_array(GinScanEntry, nQueryValues + 1);
-	key->entryRes = palloc0_array(GinTernaryValue, nQueryValues + 1);
+	key->scanEntry = (GinScanEntry *) palloc(sizeof(GinScanEntry) *
+											 (nQueryValues + 1));
+	key->entryRes = (GinTernaryValue *) palloc0(sizeof(GinTernaryValue) *
+												(nQueryValues + 1));
 
 	key->query = query;
 	key->queryValues = queryValues;
@@ -250,12 +251,12 @@ ginFreeScanKeys(GinScanOpaque so)
 		if (entry->list)
 			pfree(entry->list);
 		if (entry->matchIterator)
-			tbm_end_private_iterate(entry->matchIterator);
+			tbm_end_iterate(entry->matchIterator);
 		if (entry->matchBitmap)
 			tbm_free(entry->matchBitmap);
 	}
 
-	MemoryContextReset(so->keyCtx);
+	MemoryContextResetAndDeleteChildren(so->keyCtx);
 
 	so->keys = NULL;
 	so->nkeys = 0;
@@ -483,8 +484,6 @@ ginNewScanKey(IndexScanDesc scan)
 	MemoryContextSwitchTo(oldCtx);
 
 	pgstat_count_index_scan(scan->indexRelation);
-	if (scan->instrument)
-		scan->instrument->nsearches++;
 }
 
 void
@@ -496,7 +495,10 @@ ginrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	ginFreeScanKeys(so);
 
 	if (scankey && scan->numberOfKeys > 0)
-		memcpy(scan->keyData, scankey, scan->numberOfKeys * sizeof(ScanKeyData));
+	{
+		memmove(scan->keyData, scankey,
+				scan->numberOfKeys * sizeof(ScanKeyData));
+	}
 }
 
 

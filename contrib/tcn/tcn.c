@@ -3,7 +3,7 @@
  * tcn.c
  *	  triggered change notification support for PostgreSQL
  *
- * Portions Copyright (c) 2011-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2011-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,10 +23,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "tcn",
-					.version = PG_VERSION
-);
+PG_MODULE_MAGIC;
 
 /*
  * Copy from s (for source) to r (for result), wrapping with q (quote)
@@ -66,13 +63,12 @@ triggered_change_notification(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	char	   *channel;
 	char		operation;
-	StringInfoData payload;
+	StringInfo	payload = makeStringInfo();
 	bool		foundPK;
 
 	List	   *indexoidlist;
 	ListCell   *indexoidscan;
 
-	initStringInfo(&payload);
 	/* make sure it's called as a trigger */
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -150,22 +146,22 @@ triggered_change_notification(PG_FUNCTION_ARGS)
 
 				foundPK = true;
 
-				strcpy_quoted(&payload, RelationGetRelationName(rel), '"');
-				appendStringInfoCharMacro(&payload, ',');
-				appendStringInfoCharMacro(&payload, operation);
+				strcpy_quoted(payload, RelationGetRelationName(rel), '"');
+				appendStringInfoCharMacro(payload, ',');
+				appendStringInfoCharMacro(payload, operation);
 
 				for (i = 0; i < indnkeyatts; i++)
 				{
 					int			colno = index->indkey.values[i];
 					Form_pg_attribute attr = TupleDescAttr(tupdesc, colno - 1);
 
-					appendStringInfoCharMacro(&payload, ',');
-					strcpy_quoted(&payload, NameStr(attr->attname), '"');
-					appendStringInfoCharMacro(&payload, '=');
-					strcpy_quoted(&payload, SPI_getvalue(trigtuple, tupdesc, colno), '\'');
+					appendStringInfoCharMacro(payload, ',');
+					strcpy_quoted(payload, NameStr(attr->attname), '"');
+					appendStringInfoCharMacro(payload, '=');
+					strcpy_quoted(payload, SPI_getvalue(trigtuple, tupdesc, colno), '\'');
 				}
 
-				Async_Notify(channel, payload.data);
+				Async_Notify(channel, payload->data);
 			}
 			ReleaseSysCache(indexTuple);
 			break;

@@ -16,7 +16,7 @@
  * dropped while shut down, which is addressed by not restoring stats for
  * slots that cannot be found by name when starting up.
  *
- * Copyright (c) 2001-2026, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_replslot.c
@@ -26,10 +26,11 @@
 #include "postgres.h"
 
 #include "replication/slot.h"
+#include "utils/builtins.h"		/* for namestrcpy() */
 #include "utils/pgstat_internal.h"
 
 
-static int	get_replslot_index(const char *name, bool need_lock);
+static int	get_replslot_index(const char *name);
 
 
 /*
@@ -45,10 +46,9 @@ pgstat_reset_replslot(const char *name)
 
 	Assert(name != NULL);
 
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	/* Check if the slot exits with the given name. */
+	slot = SearchNamedReplicationSlot(name, true);
 
-	/* Check if the slot exists with the given name. */
-	slot = SearchNamedReplicationSlot(name, false);
 	if (!slot)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -56,14 +56,15 @@ pgstat_reset_replslot(const char *name)
 						name)));
 
 	/*
-	 * Reset stats if it is a logical slot. Nothing to do for physical slots
-	 * as we collect stats only for logical slots.
+	 * Nothing to do for physical slots as we collect stats only for logical
+	 * slots.
 	 */
-	if (SlotIsLogical(slot))
-		pgstat_reset(PGSTAT_KIND_REPLSLOT, InvalidOid,
-					 ReplicationSlotIndex(slot));
+	if (SlotIsPhysical(slot))
+		return;
 
-	LWLockRelease(ReplicationSlotControlLock);
+	/* reset this one entry */
+	pgstat_reset(PGSTAT_KIND_REPLSLOT, InvalidOid,
+				 ReplicationSlotIndex(slot));
 }
 
 /*
@@ -93,40 +94,9 @@ pgstat_report_replslot(ReplicationSlot *slot, const PgStat_StatReplSlotEntry *re
 	REPLSLOT_ACC(stream_txns);
 	REPLSLOT_ACC(stream_count);
 	REPLSLOT_ACC(stream_bytes);
-	REPLSLOT_ACC(mem_exceeded_count);
 	REPLSLOT_ACC(total_txns);
 	REPLSLOT_ACC(total_bytes);
 #undef REPLSLOT_ACC
-
-	pgstat_unlock_entry(entry_ref);
-}
-
-/*
- * Report replication slot sync skip statistics.
- *
- * Similar to pgstat_report_replslot(), we can rely on the stats for the
- * slot to exist and to belong to this slot.
- */
-void
-pgstat_report_replslotsync(ReplicationSlot *slot)
-{
-	PgStat_EntryRef *entry_ref;
-	PgStatShared_ReplSlot *shstatent;
-	PgStat_StatReplSlotEntry *statent;
-
-	/* Slot sync stats are valid only for synced logical slots on standby. */
-	Assert(slot->data.synced);
-	Assert(RecoveryInProgress());
-
-	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_REPLSLOT, InvalidOid,
-											ReplicationSlotIndex(slot), false);
-	Assert(entry_ref != NULL);
-
-	shstatent = (PgStatShared_ReplSlot *) entry_ref->shared_stats;
-	statent = &shstatent->stats;
-
-	statent->slotsync_skip_count += 1;
-	statent->slotsync_last_skip = GetCurrentTimestamp();
 
 	pgstat_unlock_entry(entry_ref);
 }
@@ -142,8 +112,6 @@ pgstat_create_replslot(ReplicationSlot *slot)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_ReplSlot *shstatent;
-
-	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_REPLSLOT, InvalidOid,
 											ReplicationSlotIndex(slot), false);
@@ -162,7 +130,7 @@ pgstat_create_replslot(ReplicationSlot *slot)
  * Report replication slot has been acquired.
  *
  * This guarantees that a stats entry exists during later
- * pgstat_report_replslot() or pgstat_report_replslotsync() calls.
+ * pgstat_report_replslot() calls.
  *
  * If we previously crashed, no stats data exists. But if we did not crash,
  * the stats do belong to this slot:
@@ -185,10 +153,8 @@ pgstat_acquire_replslot(ReplicationSlot *slot)
 void
 pgstat_drop_replslot(ReplicationSlot *slot)
 {
-	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
-
 	if (!pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
-						   ReplicationSlotIndex(slot), false))
+						   ReplicationSlotIndex(slot)))
 		pgstat_request_entry_refs_gc();
 }
 
@@ -199,21 +165,13 @@ pgstat_drop_replslot(ReplicationSlot *slot)
 PgStat_StatReplSlotEntry *
 pgstat_fetch_replslot(NameData slotname)
 {
-	int			idx;
-	PgStat_StatReplSlotEntry *slotentry = NULL;
+	int			idx = get_replslot_index(NameStr(slotname));
 
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	if (idx == -1)
+		return NULL;
 
-	idx = get_replslot_index(NameStr(slotname), false);
-
-	if (idx != -1)
-		slotentry = (PgStat_StatReplSlotEntry *) pgstat_fetch_entry(PGSTAT_KIND_REPLSLOT,
-																	InvalidOid, idx,
-																	NULL);
-
-	LWLockRelease(ReplicationSlotControlLock);
-
-	return slotentry;
+	return (PgStat_StatReplSlotEntry *)
+		pgstat_fetch_entry(PGSTAT_KIND_REPLSLOT, InvalidOid, idx);
 }
 
 void
@@ -224,15 +182,15 @@ pgstat_replslot_to_serialized_name_cb(const PgStat_HashKey *key, const PgStatSha
 	 * isn't allowed to change at this point, we can assume that a slot exists
 	 * at the offset.
 	 */
-	if (!ReplicationSlotName(key->objid, name))
-		elog(ERROR, "could not find name for replication slot index %" PRIu64,
-			 key->objid);
+	if (!ReplicationSlotName(key->objoid, name))
+		elog(ERROR, "could not find name for replication slot index %u",
+			 key->objoid);
 }
 
 bool
 pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *key)
 {
-	int			idx = get_replslot_index(NameStr(*name), true);
+	int			idx = get_replslot_index(NameStr(*name));
 
 	/* slot might have been deleted */
 	if (idx == -1)
@@ -240,7 +198,7 @@ pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *ke
 
 	key->kind = PGSTAT_KIND_REPLSLOT;
 	key->dboid = InvalidOid;
-	key->objid = idx;
+	key->objoid = idx;
 
 	return true;
 }
@@ -252,13 +210,13 @@ pgstat_replslot_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 }
 
 static int
-get_replslot_index(const char *name, bool need_lock)
+get_replslot_index(const char *name)
 {
 	ReplicationSlot *slot;
 
 	Assert(name != NULL);
 
-	slot = SearchNamedReplicationSlot(name, need_lock);
+	slot = SearchNamedReplicationSlot(name, true);
 
 	if (!slot)
 		return -1;

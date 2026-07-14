@@ -120,14 +120,14 @@ step s2_del_a {
     WHERE
         noisy_oper('upd', key, '=', 'key-a') AND
         noisy_oper('upk', data, '<>', 'mismatch')
-    RETURNING *, data = old.data AS check_old;
+    RETURNING *
 }
 step s2_upd_a_data {
     UPDATE trigtest SET data = data || '-ups2'
     WHERE
         noisy_oper('upd', key, '=', 'key-a') AND
         noisy_oper('upk', data, '<>', 'mismatch')
-    RETURNING *, new.data = old.data || '-ups2' AS check_old_and_new;
+    RETURNING *;
 }
 step s2_upd_b_data {
     UPDATE trigtest SET data = data || '-ups2'
@@ -141,7 +141,7 @@ step s2_upd_all_data {
     WHERE
         noisy_oper('upd', key, '<>', 'mismatch') AND
         noisy_oper('upk', data, '<>', 'mismatch')
-    RETURNING *, new.data = old.data || '-ups2' AS check_old_and_new;
+    RETURNING *;
 }
 step s2_upsert_a_data {
     INSERT INTO trigtest VALUES ('key-a', 'val-a-upss2')
@@ -150,7 +150,7 @@ step s2_upsert_a_data {
         WHERE
             noisy_oper('upd', trigtest.key, '=', 'key-a') AND
             noisy_oper('upk', trigtest.data, '<>', 'mismatch')
-    RETURNING *, new.data = old.data || '-upserts2' AS check_old_and_new;
+    RETURNING *;
 }
 
 session s3
@@ -336,7 +336,7 @@ permutation s1_trig_rep_b_u s1_trig_rep_a_u
     s1_ins_a s1_ins_c s1_b_rc s2_b_rc
     s1_upd_a_tob s2_upd_all_data s1_c s2_c
     s0_rep
-# s1 deletes, s2 updates, s1 commits, EPQ failure should lead to no update
+# s1 deletes, s2 updates, s1 committs, EPQ failure should lead to no update
 permutation s1_trig_rep_b_d s1_trig_rep_b_u s1_trig_rep_a_d s1_trig_rep_a_u
     s1_ins_a s1_ins_c s1_b_rc s2_b_rc
     s1_del_a s2_upd_a_data s1_c s2_c
@@ -346,7 +346,7 @@ permutation s1_trig_rep_b_d s1_trig_rep_b_u s1_trig_rep_a_d s1_trig_rep_a_u
     s1_ins_a s1_ins_c s1_b_rc s2_b_rc
     s1_del_a s2_upd_a_data s1_r s2_c
     s0_rep
-# s1 deletes, s2 deletes, s1 commits, EPQ failure should lead to no delete
+# s1 deletes, s2 deletes, s1 committs, EPQ failure should lead to no delete
 permutation s1_trig_rep_b_d s1_trig_rep_a_d
     s1_ins_a s1_ins_c s1_b_rc s2_b_rc
     s1_del_a s2_del_a s1_c s2_c

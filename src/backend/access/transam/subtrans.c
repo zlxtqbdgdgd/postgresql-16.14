@@ -19,7 +19,7 @@
  * data across crashes.  During database startup, we simply force the
  * currently-active page of SUBTRANS to zeroes.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/subtrans.c
@@ -31,10 +31,7 @@
 #include "access/slru.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
-#include "miscadmin.h"
 #include "pg_trace.h"
-#include "storage/subsystems.h"
-#include "utils/guc_hooks.h"
 #include "utils/snapmgr.h"
 
 
@@ -54,35 +51,20 @@
 /* We need four bytes per xact */
 #define SUBTRANS_XACTS_PER_PAGE (BLCKSZ / sizeof(TransactionId))
 
-/*
- * Although we return an int64 the actual value can't currently exceed
- * 0xFFFFFFFF/SUBTRANS_XACTS_PER_PAGE.
- */
-static inline int64
-TransactionIdToPage(TransactionId xid)
-{
-	return xid / (int64) SUBTRANS_XACTS_PER_PAGE;
-}
-
+#define TransactionIdToPage(xid) ((xid) / (TransactionId) SUBTRANS_XACTS_PER_PAGE)
 #define TransactionIdToEntry(xid) ((xid) % (TransactionId) SUBTRANS_XACTS_PER_PAGE)
 
-
-static void SUBTRANSShmemRequest(void *arg);
-static void SUBTRANSShmemInit(void *arg);
-static bool SubTransPagePrecedes(int64 page1, int64 page2);
-static int	subtrans_errdetail_for_io_error(const void *opaque_data);
-
-const ShmemCallbacks SUBTRANSShmemCallbacks = {
-	.request_fn = SUBTRANSShmemRequest,
-	.init_fn = SUBTRANSShmemInit,
-};
 
 /*
  * Link to shared-memory data structures for SUBTRANS control
  */
-static SlruDesc SubTransSlruDesc;
+static SlruCtlData SubTransCtlData;
 
-#define SubTransCtl  (&SubTransSlruDesc)
+#define SubTransCtl  (&SubTransCtlData)
+
+
+static int	ZeroSUBTRANSPage(int pageno);
+static bool SubTransPagePrecedes(int page1, int page2);
 
 
 /*
@@ -91,19 +73,17 @@ static SlruDesc SubTransSlruDesc;
 void
 SubTransSetParent(TransactionId xid, TransactionId parent)
 {
-	int64		pageno = TransactionIdToPage(xid);
+	int			pageno = TransactionIdToPage(xid);
 	int			entryno = TransactionIdToEntry(xid);
 	int			slotno;
-	LWLock	   *lock;
 	TransactionId *ptr;
 
 	Assert(TransactionIdIsValid(parent));
 	Assert(TransactionIdFollows(xid, parent));
 
-	lock = SimpleLruGetBankLock(SubTransCtl, pageno);
-	LWLockAcquire(lock, LW_EXCLUSIVE);
+	LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
 
-	slotno = SimpleLruReadPage(SubTransCtl, pageno, true, &xid);
+	slotno = SimpleLruReadPage(SubTransCtl, pageno, true, xid);
 	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 
@@ -119,7 +99,7 @@ SubTransSetParent(TransactionId xid, TransactionId parent)
 		SubTransCtl->shared->page_dirty[slotno] = true;
 	}
 
-	LWLockRelease(lock);
+	LWLockRelease(SubtransSLRULock);
 }
 
 /*
@@ -128,7 +108,7 @@ SubTransSetParent(TransactionId xid, TransactionId parent)
 TransactionId
 SubTransGetParent(TransactionId xid)
 {
-	int64		pageno = TransactionIdToPage(xid);
+	int			pageno = TransactionIdToPage(xid);
 	int			entryno = TransactionIdToEntry(xid);
 	int			slotno;
 	TransactionId *ptr;
@@ -143,13 +123,13 @@ SubTransGetParent(TransactionId xid)
 
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 
-	slotno = SimpleLruReadPage_ReadOnly(SubTransCtl, pageno, &xid);
+	slotno = SimpleLruReadPage_ReadOnly(SubTransCtl, pageno, xid);
 	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 
 	parent = *ptr;
 
-	LWLockRelease(SimpleLruGetBankLock(SubTransCtl, pageno));
+	LWLockRelease(SubtransSLRULock);
 
 	return parent;
 }
@@ -197,81 +177,24 @@ SubTransGetTopmostTransaction(TransactionId xid)
 	return previousXid;
 }
 
-/*
- * Number of shared SUBTRANS buffers.
- *
- * If asked to autotune, use 2MB for every 1GB of shared buffers, up to 8MB.
- * Otherwise just cap the configured amount to be between 16 and the maximum
- * allowed.
- */
-static int
-SUBTRANSShmemBuffers(void)
-{
-	/* auto-tune based on shared buffers */
-	if (subtransaction_buffers == 0)
-		return SimpleLruAutotuneBuffers(512, 1024);
-
-	return Min(Max(16, subtransaction_buffers), SLRU_MAX_ALLOWED_BUFFERS);
-}
-
-
 
 /*
- * Register shared memory for SUBTRANS
+ * Initialization of shared memory for SUBTRANS
  */
-static void
-SUBTRANSShmemRequest(void *arg)
+Size
+SUBTRANSShmemSize(void)
 {
-	/* If auto-tuning is requested, now is the time to do it */
-	if (subtransaction_buffers == 0)
-	{
-		char		buf[32];
-
-		snprintf(buf, sizeof(buf), "%d", SUBTRANSShmemBuffers());
-		SetConfigOption("subtransaction_buffers", buf, PGC_POSTMASTER,
-						PGC_S_DYNAMIC_DEFAULT);
-
-		/*
-		 * We prefer to report this value's source as PGC_S_DYNAMIC_DEFAULT.
-		 * However, if the DBA explicitly set subtransaction_buffers = 0 in
-		 * the config file, then PGC_S_DYNAMIC_DEFAULT will fail to override
-		 * that and we must force the matter with PGC_S_OVERRIDE.
-		 */
-		if (subtransaction_buffers == 0)	/* failed to apply it? */
-			SetConfigOption("subtransaction_buffers", buf, PGC_POSTMASTER,
-							PGC_S_OVERRIDE);
-	}
-	Assert(subtransaction_buffers != 0);
-
-	SimpleLruRequest(.desc = &SubTransSlruDesc,
-					 .name = "subtransaction",
-					 .Dir = "pg_subtrans",
-					 .long_segment_names = false,
-
-					 .nslots = SUBTRANSShmemBuffers(),
-
-					 .sync_handler = SYNC_HANDLER_NONE,
-					 .PagePrecedes = SubTransPagePrecedes,
-					 .errdetail_for_io_error = subtrans_errdetail_for_io_error,
-
-					 .buffer_tranche_id = LWTRANCHE_SUBTRANS_BUFFER,
-					 .bank_tranche_id = LWTRANCHE_SUBTRANS_SLRU,
-		);
+	return SimpleLruShmemSize(NUM_SUBTRANS_BUFFERS, 0);
 }
 
-static void
-SUBTRANSShmemInit(void *arg)
+void
+SUBTRANSShmemInit(void)
 {
+	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
+	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0,
+				  SubtransSLRULock, "pg_subtrans",
+				  LWTRANCHE_SUBTRANS_BUFFER, SYNC_HANDLER_NONE);
 	SlruPagePrecedesUnitTests(SubTransCtl, SUBTRANS_XACTS_PER_PAGE);
-}
-
-/*
- * GUC check_hook for subtransaction_buffers
- */
-bool
-check_subtrans_buffers(int *newval, void **extra, GucSource source)
-{
-	return check_slru_buffers("subtransaction_buffers", newval);
 }
 
 /*
@@ -287,13 +210,37 @@ check_subtrans_buffers(int *newval, void **extra, GucSource source)
 void
 BootStrapSUBTRANS(void)
 {
-	/* Zero the initial page and flush it to disk */
-	SimpleLruZeroAndWritePage(SubTransCtl, 0);
+	int			slotno;
+
+	LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
+
+	/* Create and zero the first page of the subtrans log */
+	slotno = ZeroSUBTRANSPage(0);
+
+	/* Make sure it's written out */
+	SimpleLruWritePage(SubTransCtl, slotno);
+	Assert(!SubTransCtl->shared->page_dirty[slotno]);
+
+	LWLockRelease(SubtransSLRULock);
+}
+
+/*
+ * Initialize (or reinitialize) a page of SUBTRANS to zeroes.
+ *
+ * The page is not actually written, just set up in shared memory.
+ * The slot number of the new page is returned.
+ *
+ * Control lock must be held at entry, and will be held at exit.
+ */
+static int
+ZeroSUBTRANSPage(int pageno)
+{
+	return SimpleLruZeroPage(SubTransCtl, pageno);
 }
 
 /*
  * This must be called ONCE during postmaster or standalone-backend startup,
- * after StartupXLOG has initialized TransamVariables->nextXid.
+ * after StartupXLOG has initialized ShmemVariableCache->nextXid.
  *
  * oldestActiveXID is the oldest XID of any prepared transaction, or nextXid
  * if there are none.
@@ -302,10 +249,8 @@ void
 StartupSUBTRANS(TransactionId oldestActiveXID)
 {
 	FullTransactionId nextXid;
-	int64		startPage;
-	int64		endPage;
-	LWLock	   *prevlock = NULL;
-	LWLock	   *lock;
+	int			startPage;
+	int			endPage;
 
 	/*
 	 * Since we don't expect pg_subtrans to be valid across crashes, we
@@ -313,32 +258,23 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 	 * Whenever we advance into a new page, ExtendSUBTRANS will likewise zero
 	 * the new page without regard to whatever was previously on disk.
 	 */
+	LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
+
 	startPage = TransactionIdToPage(oldestActiveXID);
-	nextXid = TransamVariables->nextXid;
+	nextXid = ShmemVariableCache->nextXid;
 	endPage = TransactionIdToPage(XidFromFullTransactionId(nextXid));
 
-	for (;;)
+	while (startPage != endPage)
 	{
-		lock = SimpleLruGetBankLock(SubTransCtl, startPage);
-		if (prevlock != lock)
-		{
-			if (prevlock)
-				LWLockRelease(prevlock);
-			LWLockAcquire(lock, LW_EXCLUSIVE);
-			prevlock = lock;
-		}
-
-		(void) SimpleLruZeroPage(SubTransCtl, startPage);
-		if (startPage == endPage)
-			break;
-
+		(void) ZeroSUBTRANSPage(startPage);
 		startPage++;
 		/* must account for wraparound */
 		if (startPage > TransactionIdToPage(MaxTransactionId))
 			startPage = 0;
 	}
+	(void) ZeroSUBTRANSPage(startPage);
 
-	LWLockRelease(lock);
+	LWLockRelease(SubtransSLRULock);
 }
 
 /*
@@ -371,8 +307,7 @@ CheckPointSUBTRANS(void)
 void
 ExtendSUBTRANS(TransactionId newestXact)
 {
-	int64		pageno;
-	LWLock	   *lock;
+	int			pageno;
 
 	/*
 	 * No work except at first XID of a page.  But beware: just after
@@ -384,13 +319,12 @@ ExtendSUBTRANS(TransactionId newestXact)
 
 	pageno = TransactionIdToPage(newestXact);
 
-	lock = SimpleLruGetBankLock(SubTransCtl, pageno);
-	LWLockAcquire(lock, LW_EXCLUSIVE);
+	LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
 
 	/* Zero the page */
-	SimpleLruZeroPage(SubTransCtl, pageno);
+	ZeroSUBTRANSPage(pageno);
 
-	LWLockRelease(lock);
+	LWLockRelease(SubtransSLRULock);
 }
 
 
@@ -403,7 +337,7 @@ ExtendSUBTRANS(TransactionId newestXact)
 void
 TruncateSUBTRANS(TransactionId oldestXact)
 {
-	int64		cutoffPage;
+	int			cutoffPage;
 
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We
@@ -425,7 +359,7 @@ TruncateSUBTRANS(TransactionId oldestXact)
  * Analogous to CLOGPagePrecedes().
  */
 static bool
-SubTransPagePrecedes(int64 page1, int64 page2)
+SubTransPagePrecedes(int page1, int page2)
 {
 	TransactionId xid1;
 	TransactionId xid2;
@@ -437,12 +371,4 @@ SubTransPagePrecedes(int64 page1, int64 page2)
 
 	return (TransactionIdPrecedes(xid1, xid2) &&
 			TransactionIdPrecedes(xid1, xid2 + SUBTRANS_XACTS_PER_PAGE - 1));
-}
-
-static int
-subtrans_errdetail_for_io_error(const void *opaque_data)
-{
-	TransactionId xid = *(const TransactionId *) opaque_data;
-
-	return errdetail("Could not access subtransaction status of transaction %u.", xid);
 }

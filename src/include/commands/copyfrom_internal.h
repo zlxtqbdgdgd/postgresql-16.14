@@ -4,7 +4,7 @@
  *	  Internal definitions for COPY FROM command.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/copyfrom_internal.h
@@ -16,7 +16,6 @@
 
 #include "commands/copy.h"
 #include "commands/trigger.h"
-#include "nodes/miscnodes.h"
 
 /*
  * Represents the different source cases we need to worry about at
@@ -26,7 +25,7 @@ typedef enum CopySource
 {
 	COPY_FILE,					/* from file (or a piped program) */
 	COPY_FRONTEND,				/* from frontend */
-	COPY_CALLBACK,				/* from callback function */
+	COPY_CALLBACK				/* from callback function */
 } CopySource;
 
 /*
@@ -37,7 +36,7 @@ typedef enum EolType
 	EOL_UNKNOWN,
 	EOL_NL,
 	EOL_CR,
-	EOL_CRNL,
+	EOL_CRNL
 } EolType;
 
 /*
@@ -48,7 +47,7 @@ typedef enum CopyInsertMethod
 	CIM_SINGLE,					/* use table_tuple_insert or ExecForeignInsert */
 	CIM_MULTI,					/* always use table_multi_insert or
 								 * ExecForeignBatchInsert */
-	CIM_MULTI_CONDITIONAL,		/* use table_multi_insert or
+	CIM_MULTI_CONDITIONAL		/* use table_multi_insert or
 								 * ExecForeignBatchInsert only if valid */
 } CopyInsertMethod;
 
@@ -58,9 +57,6 @@ typedef enum CopyInsertMethod
  */
 typedef struct CopyFromStateData
 {
-	/* format routine */
-	const struct CopyFromRoutine *routine;
-
 	/* low-level state data */
 	CopySource	copy_src;		/* type of copy source */
 	FILE	   *copy_file;		/* used if copy_src == COPY_FILE */
@@ -98,24 +94,12 @@ typedef struct CopyFromStateData
 								 * default value */
 	FmgrInfo   *in_functions;	/* array of input functions for each attrs */
 	Oid		   *typioparams;	/* array of element types for in_functions */
-	ErrorSaveContext *escontext;	/* soft error trapped during in_functions
-									 * execution */
-	uint64		num_errors;		/* total number of rows which contained soft
-								 * errors */
 	int		   *defmap;			/* array of default att numbers related to
 								 * missing att */
 	ExprState **defexprs;		/* array of default att expressions for all
 								 * att */
 	bool	   *defaults;		/* if DEFAULT marker was found for
 								 * corresponding att */
-	bool		simd_enabled;	/* use SIMD to scan for special chars? */
-
-	/*
-	 * True if the corresponding attribute's is a constrained domain. This
-	 * will be populated only when ON_ERROR is SET_NULL, otherwise NULL.
-	 */
-	bool	   *domain_with_constraint;
-
 	bool		volatile_defexprs;	/* is any of defexprs volatile? */
 	List	   *range_table;	/* single element list of RangeTblEntry */
 	List	   *rteperminfos;	/* single element list of RTEPermissionInfo */
@@ -193,13 +177,5 @@ typedef struct CopyFromStateData
 
 extern void ReceiveCopyBegin(CopyFromState cstate);
 extern void ReceiveCopyBinaryHeader(CopyFromState cstate);
-
-/* One-row callbacks for built-in formats defined in copyfromparse.c */
-extern bool CopyFromTextOneRow(CopyFromState cstate, ExprContext *econtext,
-							   Datum *values, bool *nulls);
-extern bool CopyFromCSVOneRow(CopyFromState cstate, ExprContext *econtext,
-							  Datum *values, bool *nulls);
-extern bool CopyFromBinaryOneRow(CopyFromState cstate, ExprContext *econtext,
-								 Datum *values, bool *nulls);
 
 #endif							/* COPYFROM_INTERNAL_H */

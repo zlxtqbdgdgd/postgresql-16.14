@@ -57,7 +57,7 @@ static void warn(void)
    should be fixed-length, blank-padded, then null-terminated.
    Conforms to the ANSI Fixed Character type. */
 
-int main(void) {
+int main() {
 
   /* exec sql whenever sql_warning  do warn ( ) ; */
 #line 22 "char_array.pgc"

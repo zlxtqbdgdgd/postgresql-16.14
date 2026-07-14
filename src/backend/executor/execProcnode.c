@@ -7,7 +7,7 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -73,7 +73,6 @@
 #include "postgres.h"
 
 #include "executor/executor.h"
-#include "executor/instrument.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeAppend.h"
 #include "executor/nodeBitmapAnd.h"
@@ -121,6 +120,7 @@
 #include "nodes/nodeFuncs.h"
 
 static TupleTableSlot *ExecProcNodeFirst(PlanState *node);
+static TupleTableSlot *ExecProcNodeInstr(PlanState *node);
 static bool ExecShutdownNode_walker(PlanState *node, void *context);
 
 
@@ -393,10 +393,6 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	/*
 	 * Initialize any initPlans present in this node.  The planner put them in
 	 * a separate list for us.
-	 *
-	 * The defining characteristic of initplans is that they don't have
-	 * arguments, so we don't need to evaluate them (in contrast to
-	 * ExecInitSubPlanExpr()).
 	 */
 	subps = NIL;
 	foreach(l, node->initPlan)
@@ -405,7 +401,6 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		SubPlanState *sstate;
 
 		Assert(IsA(subplan, SubPlan));
-		Assert(subplan->args == NIL);
 		sstate = ExecInitSubPlan(subplan, result);
 		subps = lappend(subps, sstate);
 	}
@@ -413,8 +408,8 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 
 	/* Set up instrumentation for this node if requested */
 	if (estate->es_instrument)
-		result->instrument = InstrAllocNode(estate->es_instrument,
-											result->async_capable);
+		result->instrument = InstrAlloc(1, estate->es_instrument,
+										result->async_capable);
 
 	return result;
 }
@@ -469,6 +464,25 @@ ExecProcNodeFirst(PlanState *node)
 	return node->ExecProcNode(node);
 }
 
+
+/*
+ * ExecProcNode wrapper that performs instrumentation calls.  By keeping
+ * this a separate function, we avoid overhead in the normal case where
+ * no instrumentation is wanted.
+ */
+static TupleTableSlot *
+ExecProcNodeInstr(PlanState *node)
+{
+	TupleTableSlot *result;
+
+	InstrStartNode(node->instrument);
+
+	result = node->ExecProcNodeReal(node);
+
+	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+
+	return result;
+}
 
 
 /* ----------------------------------------------------------------
@@ -653,8 +667,20 @@ ExecEndNode(PlanState *node)
 			ExecEndTableFuncScan((TableFuncScanState *) node);
 			break;
 
+		case T_ValuesScanState:
+			ExecEndValuesScan((ValuesScanState *) node);
+			break;
+
 		case T_CteScanState:
 			ExecEndCteScan((CteScanState *) node);
+			break;
+
+		case T_NamedTuplestoreScanState:
+			ExecEndNamedTuplestoreScan((NamedTuplestoreScanState *) node);
+			break;
+
+		case T_WorkTableScanState:
+			ExecEndWorkTableScan((WorkTableScanState *) node);
 			break;
 
 		case T_ForeignScanState:
@@ -729,12 +755,6 @@ ExecEndNode(PlanState *node)
 
 		case T_LimitState:
 			ExecEndLimit((LimitState *) node);
-			break;
-
-			/* No clean up actions for these nodes. */
-		case T_ValuesScanState:
-		case T_NamedTuplestoreScanState:
-		case T_WorkTableScanState:
 			break;
 
 		default:

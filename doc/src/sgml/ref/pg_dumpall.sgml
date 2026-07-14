@@ -91,7 +91,7 @@ PostgreSQL documentation
       <term><option>--data-only</option></term>
       <listitem>
        <para>
-        Dump only the data, not the schema (data definitions) or statistics.
+        Dump only the data, not the schema (data definitions).
        </para>
       </listitem>
      </varlistentry>
@@ -286,7 +286,7 @@ PostgreSQL documentation
       <term><option>--disable-triggers</option></term>
       <listitem>
        <para>
-        This option is relevant only when creating a dump with data and without schema.
+        This option is relevant only when creating a data-only dump.
         It instructs <application>pg_dumpall</application> to include commands
         to temporarily disable triggers on the target tables while
         the data is restored.  Use this if you have referential
@@ -330,37 +330,6 @@ PostgreSQL documentation
         floating-point data, instead of the maximum available precision.
         Routine dumps made for backup purposes should not use this option.
        </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--filter=<replaceable class="parameter">filename</replaceable></option></term>
-      <listitem>
-       <para>
-        Specify a filename from which to read patterns for databases excluded
-        from the dump. The patterns are interpreted according to the same rules
-        as <option>--exclude-database</option>.
-        To read from <literal>STDIN</literal>, use <filename>-</filename> as the
-        filename.  The <option>--filter</option> option can be specified in
-        conjunction with <option>--exclude-database</option> for excluding
-        databases, and can also be specified more than once for multiple filter
-        files.
-       </para>
-
-       <para>
-        The file lists one database pattern per row, with the following format:
-<synopsis>
-exclude database <replaceable class="parameter">PATTERN</replaceable>
-</synopsis>
-       </para>
-
-       <para>
-        Lines starting with <literal>#</literal> are considered comments and
-        ignored. Comments can be placed after an object pattern row as well.
-        Blank lines are also ignored. See <xref linkend="app-psql-patterns"/>
-        for how to perform quoting in patterns.
-       </para>
-
       </listitem>
      </varlistentry>
 
@@ -427,25 +396,7 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
       <term><option>--no-comments</option></term>
       <listitem>
        <para>
-        Do not dump <command>COMMENT</command> commands.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--no-data</option></term>
-      <listitem>
-       <para>
-        Do not dump data.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--no-policies</option></term>
-      <listitem>
-       <para>
-        Do not dump row security policies.
+        Do not dump comments.
        </para>
       </listitem>
      </varlistentry>
@@ -476,28 +427,10 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
      </varlistentry>
 
      <varlistentry>
-      <term><option>--no-schema</option></term>
-      <listitem>
-       <para>
-        Do not dump schema (data definitions).
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
       <term><option>--no-security-labels</option></term>
       <listitem>
        <para>
         Do not dump security labels.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--no-statistics</option></term>
-      <listitem>
-       <para>
-        Do not dump statistics. This is the default.
        </para>
       </listitem>
      </varlistentry>
@@ -631,37 +564,6 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
         number greater than zero.  Any error during restoring will cause only
         rows that are part of the problematic <command>INSERT</command> to be
         lost, rather than the entire table contents.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--statistics</option></term>
-      <listitem>
-       <para>
-        Dump optimizer statistics.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--statistics-only</option></term>
-      <listitem>
-       <para>
-        Dump only the statistics, not the schema (data definitions) or data.
-        Optimizer statistics for tables, materialized views, foreign tables,
-        and indexes are dumped.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--sequence-data</option></term>
-      <listitem>
-       <para>
-        Include sequence data in the dump.  This is the default behavior except
-        when <option>--no-data</option>, <option>--schema-only</option>, or
-        <option>--statistics-only</option> is specified.
        </para>
       </listitem>
      </varlistentry>
@@ -890,14 +792,10 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
   </para>
 
   <para>
-   When <option>--statistics</option> is specified,
-   <command>pg_dumpall</command> will include most optimizer statistics in the
-   resulting dump file. This does not include all statistics, such as
-   custom statistics added by an extension, or statistics collected by the
-   cumulative statistics system.  Therefore, it may still be useful to
-   run <command>ANALYZE</command> on each database after restoring from a dump
-   file to ensure optimal performance.  You can also run <command>vacuumdb -a
-   -z</command> to analyze all databases.
+   Once restored, it is wise to run <command>ANALYZE</command> on each
+   database so the optimizer has useful statistics. You
+   can also run <command>vacuumdb -a -z</command> to analyze all
+   databases.
   </para>
 
   <para>

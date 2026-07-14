@@ -17,15 +17,15 @@ msgstr ""
 "Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
 "n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
 
-#: connect.c:226
+#: connect.c:248
 msgid "empty message text"
 msgstr "пустое сообщение"
 
-#: connect.c:391 connect.c:653
+#: connect.c:415 connect.c:680
 msgid "<DEFAULT>"
 msgstr "<ПО_УМОЛЧАНИЮ>"
 
-#: descriptor.c:483 descriptor.c:874 misc.c:88
+#: descriptor.c:490 descriptor.c:884 misc.c:119
 msgid "NULL"
 msgstr "NULL"
 
@@ -196,7 +196,7 @@ msgstr "подключение к серверу потеряно"
 msgid "SQL error: %s\n"
 msgstr "ошибка SQL: %s\n"
 
-#: execute.c:2189 execute.c:2196
+#: execute.c:2188 execute.c:2195
 msgid "<empty>"
 msgstr "<>"
 

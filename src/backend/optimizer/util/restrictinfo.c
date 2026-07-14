@@ -3,7 +3,7 @@
  * restrictinfo.c
  *	  RestrictInfo node manipulation routines.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,17 @@
 #include "optimizer/restrictinfo.h"
 
 
+static RestrictInfo *make_restrictinfo_internal(PlannerInfo *root,
+												Expr *clause,
+												Expr *orclause,
+												bool is_pushed_down,
+												bool has_clone,
+												bool is_clone,
+												bool pseudoconstant,
+												Index security_level,
+												Relids required_relids,
+												Relids incompatible_relids,
+												Relids outer_relids);
 static Expr *make_sub_restrictinfos(PlannerInfo *root,
 									Expr *clause,
 									bool is_pushed_down,
@@ -79,38 +90,36 @@ make_restrictinfo(PlannerInfo *root,
 	/* Shouldn't be an AND clause, else AND/OR flattening messed up */
 	Assert(!is_andclause(clause));
 
-	return make_plain_restrictinfo(root,
-								   clause,
-								   NULL,
-								   is_pushed_down,
-								   has_clone,
-								   is_clone,
-								   pseudoconstant,
-								   security_level,
-								   required_relids,
-								   incompatible_relids,
-								   outer_relids);
+	return make_restrictinfo_internal(root,
+									  clause,
+									  NULL,
+									  is_pushed_down,
+									  has_clone,
+									  is_clone,
+									  pseudoconstant,
+									  security_level,
+									  required_relids,
+									  incompatible_relids,
+									  outer_relids);
 }
 
 /*
- * make_plain_restrictinfo
+ * make_restrictinfo_internal
  *
- * Common code for the main entry points and the recursive cases.  Also,
- * useful while constructing RestrictInfos above OR clause, which already has
- * RestrictInfos above its subclauses.
+ * Common code for the main entry points and the recursive cases.
  */
-RestrictInfo *
-make_plain_restrictinfo(PlannerInfo *root,
-						Expr *clause,
-						Expr *orclause,
-						bool is_pushed_down,
-						bool has_clone,
-						bool is_clone,
-						bool pseudoconstant,
-						Index security_level,
-						Relids required_relids,
-						Relids incompatible_relids,
-						Relids outer_relids)
+static RestrictInfo *
+make_restrictinfo_internal(PlannerInfo *root,
+						   Expr *clause,
+						   Expr *orclause,
+						   bool is_pushed_down,
+						   bool has_clone,
+						   bool is_clone,
+						   bool pseudoconstant,
+						   Index security_level,
+						   Relids required_relids,
+						   Relids incompatible_relids,
+						   Relids outer_relids)
 {
 	RestrictInfo *restrictinfo = makeNode(RestrictInfo);
 	Relids		baserels;
@@ -287,17 +296,17 @@ make_sub_restrictinfos(PlannerInfo *root,
 													NULL,
 													incompatible_relids,
 													outer_relids));
-		return (Expr *) make_plain_restrictinfo(root,
-												clause,
-												make_orclause(orlist),
-												is_pushed_down,
-												has_clone,
-												is_clone,
-												pseudoconstant,
-												security_level,
-												required_relids,
-												incompatible_relids,
-												outer_relids);
+		return (Expr *) make_restrictinfo_internal(root,
+												   clause,
+												   make_orclause(orlist),
+												   is_pushed_down,
+												   has_clone,
+												   is_clone,
+												   pseudoconstant,
+												   security_level,
+												   required_relids,
+												   incompatible_relids,
+												   outer_relids);
 	}
 	else if (is_andclause(clause))
 	{
@@ -319,17 +328,17 @@ make_sub_restrictinfos(PlannerInfo *root,
 		return make_andclause(andlist);
 	}
 	else
-		return (Expr *) make_plain_restrictinfo(root,
-												clause,
-												NULL,
-												is_pushed_down,
-												has_clone,
-												is_clone,
-												pseudoconstant,
-												security_level,
-												required_relids,
-												incompatible_relids,
-												outer_relids);
+		return (Expr *) make_restrictinfo_internal(root,
+												   clause,
+												   NULL,
+												   is_pushed_down,
+												   has_clone,
+												   is_clone,
+												   pseudoconstant,
+												   security_level,
+												   required_relids,
+												   incompatible_relids,
+												   outer_relids);
 }
 
 /*
@@ -538,6 +547,36 @@ extract_actual_join_clauses(List *restrictinfo_list,
 				*joinquals = lappend(*joinquals, rinfo->clause);
 		}
 	}
+}
+
+/*
+ * has_pseudoconstant_clauses
+ *
+ * Returns true if 'restrictinfo_list' includes pseudoconstant clauses.
+ *
+ * This is used when we determine whether to allow extensions to consider
+ * pushing down joins in add_paths_to_joinrel().
+ */
+bool
+has_pseudoconstant_clauses(PlannerInfo *root,
+						   List *restrictinfo_list)
+{
+	ListCell   *l;
+
+	/* No need to look if we know there are no pseudoconstants */
+	if (!root->hasPseudoConstantQuals)
+		return false;
+
+	/* See if there are pseudoconstants in the RestrictInfo list */
+	foreach(l, restrictinfo_list)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+
+		if (rinfo->pseudoconstant &&
+			!rinfo_is_constant_true(rinfo))
+			return true;
+	}
+	return false;
 }
 
 /*

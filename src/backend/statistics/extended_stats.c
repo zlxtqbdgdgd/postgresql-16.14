@@ -6,7 +6,7 @@
  * Generic code supporting statistics objects created via CREATE STATISTICS.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,18 +21,19 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
+#include "executor/executor.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
-#include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
-#include "rewrite/rewriteHandler.h"
 #include "statistics/extended_stats_internal.h"
 #include "statistics/statistics.h"
 #include "utils/acl.h"
@@ -46,6 +47,7 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 /*
  * To avoid consuming too much memory during analysis and/or too much space
@@ -74,8 +76,8 @@ typedef struct StatExtEntry
 } StatExtEntry;
 
 
-static List *fetch_statentries_for_relation(Relation pg_statext, Relation rel);
-static VacAttrStats **lookup_var_attr_stats(Bitmapset *attrs, List *exprs,
+static List *fetch_statentries_for_relation(Relation pg_statext, Oid relid);
+static VacAttrStats **lookup_var_attr_stats(Relation rel, Bitmapset *attrs, List *exprs,
 											int nvacatts, VacAttrStats **vacatts);
 static void statext_store(Oid statOid, bool inh,
 						  MVNDistinct *ndistinct, MVDependencies *dependencies,
@@ -90,8 +92,9 @@ typedef struct AnlExprData
 	VacAttrStats *vacattrstat;	/* statistics attrs to analyze */
 } AnlExprData;
 
-static void compute_expr_stats(Relation onerel, AnlExprData *exprdata,
-							   int nexprs, HeapTuple *rows, int numrows);
+static void compute_expr_stats(Relation onerel, double totalrows,
+							   AnlExprData *exprdata, int nexprs,
+							   HeapTuple *rows, int numrows);
 static Datum serialize_expr_stats(AnlExprData *exprdata, int nexprs);
 static Datum expr_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static AnlExprData *build_expr_data(List *exprs, int stattarget);
@@ -126,7 +129,7 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 
 	/* the list of stats has to be allocated outside the memory context */
 	pg_stext = table_open(StatisticExtRelationId, RowExclusiveLock);
-	statslist = fetch_statentries_for_relation(pg_stext, onerel);
+	statslist = fetch_statentries_for_relation(pg_stext, RelationGetRelid(onerel));
 
 	/* memory context for building each statistics object */
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -166,11 +169,11 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 		 * Check if we can build these stats based on the column analyzed. If
 		 * not, report this fact (except in autovacuum) and move on.
 		 */
-		stats = lookup_var_attr_stats(stat->columns, stat->exprs,
+		stats = lookup_var_attr_stats(onerel, stat->columns, stat->exprs,
 									  natts, vacattrstats);
 		if (!stats)
 		{
-			if (!AmAutoVacuumWorkerProcess())
+			if (!IsAutoVacuumWorkerProcess())
 				ereport(WARNING,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("statistics object \"%s.%s\" could not be computed for relation \"%s.%s\"",
@@ -220,7 +223,9 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 				exprdata = build_expr_data(stat->exprs, stattarget);
 				nexprs = list_length(stat->exprs);
 
-				compute_expr_stats(onerel, exprdata, nexprs, rows, numrows);
+				compute_expr_stats(onerel, totalrows,
+								   exprdata, nexprs,
+								   rows, numrows);
 
 				exprstats = serialize_expr_stats(exprdata, nexprs);
 			}
@@ -244,40 +249,6 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 	list_free(statslist);
 
 	table_close(pg_stext, RowExclusiveLock);
-}
-
-/*
- * Test if the given relation has extended statistics objects.
- */
-bool
-HasRelationExtStatistics(Relation onerel)
-{
-	Relation	pg_statext;
-	SysScanDesc scan;
-	ScanKeyData skey;
-	bool		found;
-
-	pg_statext = table_open(StatisticExtRelationId, RowExclusiveLock);
-
-	/*
-	 * Prepare to scan pg_statistic_ext for entries having stxrelid = this
-	 * rel.
-	 */
-	ScanKeyInit(&skey,
-				Anum_pg_statistic_ext_stxrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(RelationGetRelid(onerel)));
-
-	scan = systable_beginscan(pg_statext, StatisticExtRelidIndexId, true,
-							  NULL, 1, &skey);
-
-	found = HeapTupleIsValid(systable_getnext(scan));
-
-	systable_endscan(scan);
-
-	table_close(pg_statext, RowExclusiveLock);
-
-	return found;
 }
 
 /*
@@ -314,7 +285,7 @@ ComputeExtStatisticsRows(Relation onerel,
 	oldcxt = MemoryContextSwitchTo(cxt);
 
 	pg_stext = table_open(StatisticExtRelationId, RowExclusiveLock);
-	lstats = fetch_statentries_for_relation(pg_stext, onerel);
+	lstats = fetch_statentries_for_relation(pg_stext, RelationGetRelid(onerel));
 
 	foreach(lc, lstats)
 	{
@@ -328,7 +299,7 @@ ComputeExtStatisticsRows(Relation onerel,
 		 * analyzed. If not, ignore it (don't report anything, we'll do that
 		 * during the actual build BuildRelationExtStatistics).
 		 */
-		stats = lookup_var_attr_stats(stat->columns, stat->exprs,
+		stats = lookup_var_attr_stats(onerel, stat->columns, stat->exprs,
 									  natts, vacattrstats);
 
 		if (!stats)
@@ -395,8 +366,8 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 	for (i = 0; i < nattrs; i++)
 	{
 		/* keep the maximum statistics target */
-		if (stats[i]->attstattarget > stattarget)
-			stattarget = stats[i]->attstattarget;
+		if (stats[i]->attr->attstattarget > stattarget)
+			stattarget = stats[i]->attr->attstattarget;
 	}
 
 	/*
@@ -408,7 +379,7 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 		stattarget = default_statistics_target;
 
 	/* As this point we should have a valid statistics target. */
-	Assert((stattarget >= 0) && (stattarget <= MAX_STATISTICS_TARGET));
+	Assert((stattarget >= 0) && (stattarget <= 10000));
 
 	return stattarget;
 }
@@ -451,13 +422,12 @@ statext_is_kind_built(HeapTuple htup, char type)
  * Return a list (of StatExtEntry) of statistics objects for the given relation.
  */
 static List *
-fetch_statentries_for_relation(Relation pg_statext, Relation rel)
+fetch_statentries_for_relation(Relation pg_statext, Oid relid)
 {
 	SysScanDesc scan;
 	ScanKeyData skey;
 	HeapTuple	htup;
 	List	   *result = NIL;
-	Oid			relid = RelationGetRelid(rel);
 
 	/*
 	 * Prepare to scan pg_statistic_ext for entries having stxrelid = this
@@ -482,19 +452,17 @@ fetch_statentries_for_relation(Relation pg_statext, Relation rel)
 		Form_pg_statistic_ext staForm;
 		List	   *exprs = NIL;
 
-		entry = palloc0_object(StatExtEntry);
+		entry = palloc0(sizeof(StatExtEntry));
 		staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
 		entry->statOid = staForm->oid;
 		entry->schema = get_namespace_name(staForm->stxnamespace);
 		entry->name = pstrdup(NameStr(staForm->stxname));
+		entry->stattarget = staForm->stxstattarget;
 		for (i = 0; i < staForm->stxkeys.dim1; i++)
 		{
 			entry->columns = bms_add_member(entry->columns,
 											staForm->stxkeys.values[i]);
 		}
-
-		datum = SysCacheGetAttr(STATEXTOID, htup, Anum_pg_statistic_ext_stxstattarget, &isnull);
-		entry->stattarget = isnull ? -1 : DatumGetInt16(datum);
 
 		/* decode the stxkind char array into a list of chars */
 		datum = SysCacheGetAttrNotNull(STATEXTOID, htup,
@@ -526,9 +494,6 @@ fetch_statentries_for_relation(Relation pg_statext, Relation rel)
 			exprs = (List *) stringToNode(exprsString);
 
 			pfree(exprsString);
-
-			/* Expand virtual generated columns in the expressions */
-			exprs = (List *) expand_generated_columns_in_expr((Node *) exprs, rel, 1);
 
 			/*
 			 * Run the expressions through eval_const_expressions. This is not
@@ -569,10 +534,14 @@ examine_attribute(Node *expr)
 	bool		ok;
 
 	/*
-	 * Create the VacAttrStats struct.
+	 * Create the VacAttrStats struct.  Note that we only have a copy of the
+	 * fixed fields of the pg_attribute tuple.
 	 */
-	stats = palloc0_object(VacAttrStats);
-	stats->attstattarget = -1;
+	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
+
+	/* fake the attribute */
+	stats->attr = (Form_pg_attribute) palloc0(ATTRIBUTE_FIXED_PART_SIZE);
+	stats->attr->attstattarget = -1;
 
 	/*
 	 * When analyzing an expression, believe the expression tree's type not
@@ -626,6 +595,7 @@ examine_attribute(Node *expr)
 	if (!ok || stats->compute_stats == NULL || stats->minrows <= 0)
 	{
 		heap_freetuple(typtuple);
+		pfree(stats->attr);
 		pfree(stats);
 		return NULL;
 	}
@@ -652,14 +622,7 @@ examine_expression(Node *expr, int stattarget)
 	/*
 	 * Create the VacAttrStats struct.
 	 */
-	stats = palloc0_object(VacAttrStats);
-
-	/*
-	 * We can't have statistics target specified for the expression, so we
-	 * could use either the default_statistics_target, or the target computed
-	 * for the extended statistics. The second option seems more reasonable.
-	 */
-	stats->attstattarget = stattarget;
+	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
 
 	/*
 	 * When analyzing an expression, believe the expression tree's type.
@@ -674,6 +637,25 @@ examine_expression(Node *expr, int stattarget)
 	 * which case exprCollation() does the right thing.
 	 */
 	stats->attrcollid = exprCollation(expr);
+
+	/*
+	 * We don't have any pg_attribute for expressions, so let's fake something
+	 * reasonable into attstattarget, which is the only thing std_typanalyze
+	 * needs.
+	 */
+	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_FIXED_PART_SIZE);
+
+	/*
+	 * We can't have statistics target specified for the expression, so we
+	 * could use either the default_statistics_target, or the target computed
+	 * for the extended statistics. The second option seems more reasonable.
+	 */
+	stats->attr->attstattarget = stattarget;
+
+	/* initialize some basic fields */
+	stats->attr->attrelid = InvalidOid;
+	stats->attr->attnum = InvalidAttrNumber;
+	stats->attr->atttypid = stats->attrtypid;
 
 	typtuple = SearchSysCacheCopy1(TYPEOID,
 								   ObjectIdGetDatum(stats->attrtypid));
@@ -726,7 +708,7 @@ examine_expression(Node *expr, int stattarget)
  * indicate to the caller that the stats should not be built.
  */
 static VacAttrStats **
-lookup_var_attr_stats(Bitmapset *attrs, List *exprs,
+lookup_var_attr_stats(Relation rel, Bitmapset *attrs, List *exprs,
 					  int nvacatts, VacAttrStats **vacatts)
 {
 	int			i = 0;
@@ -764,6 +746,12 @@ lookup_var_attr_stats(Bitmapset *attrs, List *exprs,
 			pfree(stats);
 			return NULL;
 		}
+
+		/*
+		 * Sanity check that the column is not dropped - stats should have
+		 * been removed in this case.
+		 */
+		Assert(!stats[i]->attr->attisdropped);
 
 		i++;
 	}
@@ -911,8 +899,8 @@ int
 multi_sort_compare(const void *a, const void *b, void *arg)
 {
 	MultiSortSupport mss = (MultiSortSupport) arg;
-	const SortItem *ia = a;
-	const SortItem *ib = b;
+	SortItem   *ia = (SortItem *) a;
+	SortItem   *ib = (SortItem *) b;
 	int			i;
 
 	for (i = 0; i < mss->ndims; i++)
@@ -964,8 +952,8 @@ multi_sort_compare_dims(int start, int end,
 int
 compare_scalars_simple(const void *a, const void *b, void *arg)
 {
-	return compare_datums_simple(*(const Datum *) a,
-								 *(const Datum *) b,
+	return compare_datums_simple(*(Datum *) a,
+								 *(Datum *) b,
 								 (SortSupport) arg);
 }
 
@@ -995,7 +983,7 @@ build_attnums_array(Bitmapset *attrs, int nexprs, int *numattrs)
 		*numattrs = num;
 
 	/* build attnums from the bitmapset */
-	attnums = palloc_array(AttrNumber, num);
+	attnums = (AttrNumber *) palloc(sizeof(AttrNumber) * num);
 	i = 0;
 	j = -1;
 	while ((j = bms_next_member(attrs, j)) >= 0)
@@ -1035,9 +1023,10 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 {
 	int			i,
 				j,
+				len,
 				nrows;
 	int			nvalues = data->numrows * numattrs;
-	Size		len;
+
 	SortItem   *items;
 	Datum	   *values;
 	bool	   *isnull;
@@ -1045,16 +1034,14 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 	int		   *typlen;
 
 	/* Compute the total amount of memory we need (both items and values). */
-	len = MAXALIGN(data->numrows * sizeof(SortItem)) +
-		nvalues * (sizeof(Datum) + sizeof(bool));
+	len = data->numrows * sizeof(SortItem) + nvalues * (sizeof(Datum) + sizeof(bool));
 
 	/* Allocate the memory and split it into the pieces. */
 	ptr = palloc0(len);
 
 	/* items to sort */
 	items = (SortItem *) ptr;
-	/* MAXALIGN ensures that the following Datums are suitably aligned */
-	ptr += MAXALIGN(data->numrows * sizeof(SortItem));
+	ptr += data->numrows * sizeof(SortItem);
 
 	/* values and null flags */
 	values = (Datum *) ptr;
@@ -1077,7 +1064,7 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 	}
 
 	/* build a local cache of typlen for all attributes */
-	typlen = palloc_array(int, data->nattnums);
+	typlen = (int *) palloc(sizeof(int) * data->nattnums);
 	for (i = 0; i < data->nattnums; i++)
 		typlen[i] = get_typlen(data->stats[i]->attrtypid);
 
@@ -1673,7 +1660,8 @@ statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 	 */
 	if (!leakproof)
 	{
-		Bitmapset  *clause_attnums;
+		Bitmapset  *clause_attnums = NULL;
+		int			attnum = -1;
 
 		/*
 		 * We have to check per-column privileges.  *attnums has the attnums
@@ -1684,8 +1672,13 @@ statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 		 * while attnums within *attnums aren't.  Convert *attnums to the
 		 * offset style so we can combine the results.
 		 */
-		clause_attnums = bms_offset_members(*attnums,
-											0 - FirstLowInvalidHeapAttributeNumber);
+		while ((attnum = bms_next_member(*attnums, attnum)) >= 0)
+		{
+			clause_attnums =
+				bms_add_member(clause_attnums,
+							   attnum - FirstLowInvalidHeapAttributeNumber);
+		}
+
 		/* Now merge attnums from *exprs into clause_attnums */
 		if (*exprs != NIL)
 			pull_varattnos((Node *) *exprs, relid, &clause_attnums);
@@ -1750,10 +1743,11 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 	if (!has_stats_of_kind(rel->statlist, STATS_EXT_MCV))
 		return sel;
 
-	list_attnums = palloc_array(Bitmapset *, list_length(clauses));
+	list_attnums = (Bitmapset **) palloc(sizeof(Bitmapset *) *
+										 list_length(clauses));
 
 	/* expressions extracted from complex expressions */
-	list_exprs = palloc_array(List *, list_length(clauses));
+	list_exprs = (List **) palloc(sizeof(Node *) * list_length(clauses));
 
 	/*
 	 * Pre-process the clauses list to extract the attnums and expressions
@@ -2096,13 +2090,13 @@ examine_opclause_args(List *args, Node **exprp, Const **cstp,
 
 	if (IsA(rightop, Const))
 	{
-		expr = leftop;
+		expr = (Node *) leftop;
 		cst = (Const *) rightop;
 		expronleft = true;
 	}
 	else if (IsA(leftop, Const))
 	{
-		expr = rightop;
+		expr = (Node *) rightop;
 		cst = (Const *) leftop;
 		expronleft = false;
 	}
@@ -2127,7 +2121,8 @@ examine_opclause_args(List *args, Node **exprp, Const **cstp,
  * Compute statistics about expressions of a relation.
  */
 static void
-compute_expr_stats(Relation onerel, AnlExprData *exprdata, int nexprs,
+compute_expr_stats(Relation onerel, double totalrows,
+				   AnlExprData *exprdata, int nexprs,
 				   HeapTuple *rows, int numrows)
 {
 	MemoryContext expr_context,
@@ -2232,7 +2227,8 @@ compute_expr_stats(Relation onerel, AnlExprData *exprdata, int nexprs,
 		if (tcnt > 0)
 		{
 			AttributeOpts *aopt =
-				get_attribute_options(onerel->rd_id, stats->tupattnum);
+				get_attribute_options(stats->attr->attrelid,
+									  stats->attr->attnum);
 
 			stats->exprvals = exprvals;
 			stats->exprnulls = exprnulls;
@@ -2255,7 +2251,7 @@ compute_expr_stats(Relation onerel, AnlExprData *exprdata, int nexprs,
 
 		ExecDropSingleTupleTableSlot(slot);
 		FreeExecutorState(estate);
-		MemoryContextReset(expr_context);
+		MemoryContextResetAndDeleteChildren(expr_context);
 	}
 
 	MemoryContextSwitchTo(old_context);
@@ -2651,7 +2647,7 @@ make_build_data(Relation rel, StatExtEntry *stat, int numrows, HeapTuple *rows,
 			}
 			else
 			{
-				result->values[idx][i] = datum;
+				result->values[idx][i] = (Datum) datum;
 				result->nulls[idx][i] = false;
 			}
 

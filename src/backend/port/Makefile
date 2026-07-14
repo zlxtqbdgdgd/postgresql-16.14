@@ -22,6 +22,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	$(TAS) \
 	atomics.o \
 	pg_sema.o \
 	pg_shmem.o
@@ -32,5 +33,16 @@ endif
 
 include $(top_srcdir)/src/backend/common.mk
 
-clean:
+tas.o: tas.s
+ifeq ($(SUN_STUDIO_CC), yes)
+# preprocess assembler file with cpp
+	$(CC) $(CFLAGS) -c -P $<
+	mv $*.i $*_cpp.s
+	$(CC) $(CFLAGS) -c $*_cpp.s -o $@
+else
+	$(CC) $(CFLAGS) -c $<
+endif
+
+distclean clean:
+	rm -f tas_cpp.s
 	$(MAKE) -C win32 clean

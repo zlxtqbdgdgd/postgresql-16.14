@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,9 +25,10 @@
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_proc_d.h"
 #include "catalog/pg_publication_d.h"
-#include "catalog/pg_subscription_d.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
+#include "fe_utils/string_utils.h"
+#include "pg_backup_archiver.h"
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 
@@ -46,8 +47,6 @@ static DumpId lastDumpId = 0;	/* Note: 0 is InvalidDumpId */
  * expects that it can move them around when resizing the table.  So we
  * cannot make the DumpableObjects be elements of the hash table directly;
  * instead, the hash table elements contain pointers to DumpableObjects.
- * This does have the advantage of letting us map multiple CatalogIds
- * to one DumpableObject, which is useful for blobs.
  *
  * It turns out to be convenient to also use this data structure to map
  * CatalogIds to owning extensions, if any.  Since extension membership
@@ -84,8 +83,7 @@ static catalogid_hash *catalogIdHash = NULL;
 static void flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						  InhInfo *inhinfo, int numInherits);
 static void flagInhIndexes(Archive *fout, TableInfo *tblinfo, int numTables);
-static void flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo,
-						 int numTables);
+static void flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
 static IndxInfo *findIndexByOid(Oid oid);
 
@@ -101,8 +99,31 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	ExtensionInfo *extinfo;
 	InhInfo    *inhinfo;
 	int			numTables;
+	int			numTypes;
+	int			numFuncs;
+	int			numOperators;
+	int			numCollations;
+	int			numNamespaces;
 	int			numExtensions;
+	int			numPublications;
+	int			numAggregates;
 	int			numInherits;
+	int			numRules;
+	int			numProcLangs;
+	int			numCasts;
+	int			numTransforms;
+	int			numAccessMethods;
+	int			numOpclasses;
+	int			numOpfamilies;
+	int			numConversions;
+	int			numTSParsers;
+	int			numTSTemplates;
+	int			numTSDicts;
+	int			numTSConfigs;
+	int			numForeignDataWrappers;
+	int			numForeignServers;
+	int			numDefaultACLs;
+	int			numEventTriggers;
 
 	/*
 	 * We must read extensions and extension membership info first, because
@@ -116,7 +137,7 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getExtensionMembership(fout, extinfo, numExtensions);
 
 	pg_log_info("reading schemas");
-	getNamespaces(fout);
+	(void) getNamespaces(fout, &numNamespaces);
 
 	/*
 	 * getTables should be done as soon as possible, so as to minimize the
@@ -130,69 +151,69 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getOwnedSeqs(fout, tblinfo, numTables);
 
 	pg_log_info("reading user-defined functions");
-	getFuncs(fout);
+	(void) getFuncs(fout, &numFuncs);
 
 	/* this must be after getTables and getFuncs */
 	pg_log_info("reading user-defined types");
-	getTypes(fout);
+	(void) getTypes(fout, &numTypes);
 
 	/* this must be after getFuncs, too */
 	pg_log_info("reading procedural languages");
-	getProcLangs(fout);
+	getProcLangs(fout, &numProcLangs);
 
 	pg_log_info("reading user-defined aggregate functions");
-	getAggregates(fout);
+	getAggregates(fout, &numAggregates);
 
 	pg_log_info("reading user-defined operators");
-	getOperators(fout);
+	(void) getOperators(fout, &numOperators);
 
 	pg_log_info("reading user-defined access methods");
-	getAccessMethods(fout);
+	getAccessMethods(fout, &numAccessMethods);
 
 	pg_log_info("reading user-defined operator classes");
-	getOpclasses(fout);
+	getOpclasses(fout, &numOpclasses);
 
 	pg_log_info("reading user-defined operator families");
-	getOpfamilies(fout);
+	getOpfamilies(fout, &numOpfamilies);
 
 	pg_log_info("reading user-defined text search parsers");
-	getTSParsers(fout);
+	getTSParsers(fout, &numTSParsers);
 
 	pg_log_info("reading user-defined text search templates");
-	getTSTemplates(fout);
+	getTSTemplates(fout, &numTSTemplates);
 
 	pg_log_info("reading user-defined text search dictionaries");
-	getTSDictionaries(fout);
+	getTSDictionaries(fout, &numTSDicts);
 
 	pg_log_info("reading user-defined text search configurations");
-	getTSConfigurations(fout);
+	getTSConfigurations(fout, &numTSConfigs);
 
 	pg_log_info("reading user-defined foreign-data wrappers");
-	getForeignDataWrappers(fout);
+	getForeignDataWrappers(fout, &numForeignDataWrappers);
 
 	pg_log_info("reading user-defined foreign servers");
-	getForeignServers(fout);
+	getForeignServers(fout, &numForeignServers);
 
 	pg_log_info("reading default privileges");
-	getDefaultACLs(fout);
+	getDefaultACLs(fout, &numDefaultACLs);
 
 	pg_log_info("reading user-defined collations");
-	getCollations(fout);
+	(void) getCollations(fout, &numCollations);
 
 	pg_log_info("reading user-defined conversions");
-	getConversions(fout);
+	getConversions(fout, &numConversions);
 
 	pg_log_info("reading type casts");
-	getCasts(fout);
+	getCasts(fout, &numCasts);
 
 	pg_log_info("reading transforms");
-	getTransforms(fout);
+	getTransforms(fout, &numTransforms);
 
 	pg_log_info("reading table inheritance information");
 	inhinfo = getInherits(fout, &numInherits);
 
 	pg_log_info("reading event triggers");
-	getEventTriggers(fout);
+	getEventTriggers(fout, &numEventTriggers);
 
 	/* Identify extension configuration tables that should be dumped */
 	pg_log_info("finding extension tables");
@@ -206,7 +227,7 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getTableAttrs(fout, tblinfo, numTables);
 
 	pg_log_info("flagging inherited columns in subtables");
-	flagInhAttrs(fout, fout->dopt, tblinfo, numTables);
+	flagInhAttrs(fout->dopt, tblinfo, numTables);
 
 	pg_log_info("reading partitioning data");
 	getPartitioningInfo(fout);
@@ -227,13 +248,13 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getTriggers(fout, tblinfo, numTables);
 
 	pg_log_info("reading rewrite rules");
-	getRules(fout);
+	getRules(fout, &numRules);
 
 	pg_log_info("reading policies");
 	getPolicies(fout, tblinfo, numTables);
 
 	pg_log_info("reading publications");
-	getPublications(fout);
+	(void) getPublications(fout, &numPublications);
 
 	pg_log_info("reading publication membership of tables");
 	getPublicationTables(fout, tblinfo, numTables);
@@ -244,17 +265,13 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
 
-	pg_log_info("reading subscription membership of relations");
-	getSubscriptionRelations(fout);
-
 	free(inhinfo);				/* not needed any longer */
 
 	*numTablesPtr = numTables;
 	return tblinfo;
 }
 
-/*
- * flagInhTables -
+/* flagInhTables -
  *	 Fill in parent link fields of tables for which we need that information,
  *	 mark parents of target tables as interesting, and create
  *	 TableAttachInfo objects for partitioned tables with appropriate
@@ -354,7 +371,7 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						 tblinfo[i].numParents,
 						 tblinfo[i].dobj.name);
 
-			attachinfo = palloc_object(TableAttachInfo);
+			attachinfo = (TableAttachInfo *) palloc(sizeof(TableAttachInfo));
 			attachinfo->dobj.objType = DO_TABLE_ATTACH;
 			attachinfo->dobj.catId.tableoid = 0;
 			attachinfo->dobj.catId.oid = 0;
@@ -449,15 +466,13 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	}
 }
 
-/*
- * flagInhAttrs -
+/* flagInhAttrs -
  *	 for each dumpable table in tblinfo, flag its inherited attributes
  *
  * What we need to do here is:
  *
  * - Detect child columns that inherit NOT NULL bits from their parents, so
- *   that we needn't specify that again for the child.  For versions 18 and
- *   up, this is needed when the parent is NOT VALID and the child isn't.
+ *   that we needn't specify that again for the child.
  *
  * - Detect child columns that have DEFAULT NULL when their parents had some
  *   non-null default.  In this case, we make up a dummy AttrDefInfo object so
@@ -477,7 +492,7 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
  * modifies tblinfo
  */
 static void
-flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 {
 	int			i,
 				j,
@@ -499,8 +514,7 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 		/* Some kinds never have parents */
 		if (tbinfo->relkind == RELKIND_SEQUENCE ||
 			tbinfo->relkind == RELKIND_VIEW ||
-			tbinfo->relkind == RELKIND_MATVIEW ||
-			tbinfo->relkind == RELKIND_PROPGRAPH)
+			tbinfo->relkind == RELKIND_MATVIEW)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -520,8 +534,6 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 			bool		foundDefault;	/* Found a default in a parent */
 			bool		foundSameGenerated; /* Found matching GENERATED */
 			bool		foundDiffGenerated; /* Found non-matching GENERATED */
-			bool		allNotNullsInvalid = true;	/* is NOT NULL NOT VALID
-													 * on all parents? */
 
 			/* no point in examining dropped columns */
 			if (tbinfo->attisdropped[j])
@@ -543,27 +555,7 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 				{
 					AttrDefInfo *parentDef = parent->attrdefs[inhAttrInd];
 
-					/*
-					 * Account for each parent having a not-null constraint.
-					 * In versions 18 and later, we don't need this (and those
-					 * didn't have NO INHERIT.)
-					 */
-					if (fout->remoteVersion < 180000 &&
-						parent->notnull_constrs[inhAttrInd] != NULL)
-						foundNotNull = true;
-
-					/*
-					 * Keep track of whether all the parents that have a
-					 * not-null constraint on this column have it as NOT
-					 * VALID; if they all are, arrange to have it printed for
-					 * this column.  If at least one parent has it as valid,
-					 * there's no need.
-					 */
-					if (fout->remoteVersion >= 180000 &&
-						parent->notnull_constrs[inhAttrInd] &&
-						!parent->notnull_invalid[inhAttrInd])
-						allNotNullsInvalid = false;
-
+					foundNotNull |= parent->notnull[inhAttrInd];
 					foundDefault |= (parentDef != NULL &&
 									 strcmp(parentDef->adef_expr, "NULL") != 0 &&
 									 !parent->attgenerated[inhAttrInd]);
@@ -581,21 +573,8 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 				}
 			}
 
-			/*
-			 * In versions < 18, for lack of a better system, we arbitrarily
-			 * decide that a not-null constraint is not locally defined if at
-			 * least one of the parents has it.
-			 */
-			if (fout->remoteVersion < 180000 && foundNotNull)
-				tbinfo->notnull_islocal[j] = false;
-
-			/*
-			 * For versions >18, we must print the not-null constraint locally
-			 * for this table even if it isn't really locally defined, but is
-			 * valid for the child and no parent has it as valid.
-			 */
-			if (fout->remoteVersion >= 180000 && allNotNullsInvalid)
-				tbinfo->notnull_islocal[j] = true;
+			/* Remember if we found inherited NOT NULL */
+			tbinfo->inhNotNull[j] = foundNotNull;
 
 			/*
 			 * Manufacture a DEFAULT NULL clause if necessary.  This breaks
@@ -712,30 +691,6 @@ AssignDumpId(DumpableObject *dobj)
 		Assert(entry->dobj == NULL);
 		entry->dobj = dobj;
 	}
-}
-
-/*
- * recordAdditionalCatalogID
- *	  Record an additional catalog ID for the given DumpableObject
- */
-void
-recordAdditionalCatalogID(CatalogId catId, DumpableObject *dobj)
-{
-	CatalogIdMapEntry *entry;
-	bool		found;
-
-	/* CatalogId hash table must exist, if we have a DumpableObject */
-	Assert(catalogIdHash != NULL);
-
-	/* Add reference to CatalogId hash */
-	entry = catalogid_insert(catalogIdHash, catId, &found);
-	if (!found)
-	{
-		entry->dobj = NULL;
-		entry->ext = NULL;
-	}
-	Assert(entry->dobj == NULL);
-	entry->dobj = dobj;
 }
 
 /*
@@ -1036,24 +991,6 @@ findPublicationByOid(Oid oid)
 	dobj = findObjectByCatalogId(catId);
 	Assert(dobj == NULL || dobj->objType == DO_PUBLICATION);
 	return (PublicationInfo *) dobj;
-}
-
-/*
- * findSubscriptionByOid
- *	  finds the DumpableObject for the subscription with the given oid
- *	  returns NULL if not found
- */
-SubscriptionInfo *
-findSubscriptionByOid(Oid oid)
-{
-	CatalogId	catId;
-	DumpableObject *dobj;
-
-	catId.tableoid = SubscriptionRelationId;
-	catId.oid = oid;
-	dobj = findObjectByCatalogId(catId);
-	Assert(dobj == NULL || dobj->objType == DO_SUBSCRIPTION);
-	return (SubscriptionInfo *) dobj;
 }
 
 

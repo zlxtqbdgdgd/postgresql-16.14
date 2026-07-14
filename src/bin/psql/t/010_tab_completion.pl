@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
-use warnings FATAL => 'all';
+use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -39,14 +39,12 @@ $node->start;
 
 # set up a few database objects
 $node->safe_psql('postgres',
-	"CREATE TABLE tab1 (c1 int primary key constraint foo not null, c2 text);\n"
+		"CREATE TABLE tab1 (c1 int primary key, c2 text);\n"
 	  . "CREATE TABLE mytab123 (f1 int, f2 text);\n"
 	  . "CREATE TABLE mytab246 (f1 int, f2 text);\n"
 	  . "CREATE TABLE \"mixedName\" (f1 int, f2 text);\n"
 	  . "CREATE TYPE enum1 AS ENUM ('foo', 'bar', 'baz', 'BLACK');\n"
-	  . "CREATE PUBLICATION some_publication;\n"
-	  . "CREATE TABLE fpo_test (id int4range, valid_at daterange, name text);\n"
-);
+	  . "CREATE PUBLICATION some_publication;\n");
 
 # In a VPATH build, we'll be started in the source directory, but we want
 # to run in the build directory so that we can use relative paths to
@@ -79,10 +77,8 @@ close $FH;
 # for possible debugging purposes.
 my $historyfile = "${PostgreSQL::Test::Utils::log_path}/010_psql_history.txt";
 
-# fire up an interactive psql session and configure it such that each query
-# restarts the timer
+# fire up an interactive psql session
 my $h = $node->interactive_psql('postgres', history_file => $historyfile);
-$h->set_query_timer_restart();
 
 # Simple test case: type something and see if psql responds as expected
 sub check_completion
@@ -91,6 +87,9 @@ sub check_completion
 
 	# report test failures from caller location
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
+
+	# restart per-command timer
+	$h->{timeout}->start($PostgreSQL::Test::Utils::timeout_default);
 
 	# send the data to be sent and wait for its result
 	my $out = $h->query_until($pattern, $send);
@@ -168,18 +167,26 @@ check_completion(
 	qr/"mytab123" +"mytab246"/,
 	"offer multiple quoted table choices");
 
-check_completion("2\t", qr/246" /,
+# note: broken versions of libedit want to backslash the closing quote;
+# not much we can do about that
+check_completion("2\t", qr/246\\?" /,
 	"finish completion of one of multiple quoted table choices");
 
-clear_query();
+# note: broken versions of libedit may leave us in a state where psql
+# thinks there's an unclosed double quote, so that we have to use
+# clear_line not clear_query here
+clear_line();
 
 # check handling of mixed-case names
+# note: broken versions of libedit want to backslash the closing quote;
+# not much we can do about that
 check_completion(
 	"select * from \"mi\t",
-	qr/"mixedName" /,
+	qr/"mixedName\\?" /,
 	"complete a mixed-case name");
 
-clear_query();
+# as above, must use clear_line not clear_query here
+clear_line();
 
 # check case folding
 check_completion("select * from TAB\t", qr/tab1 /, "automatically fold case");
@@ -191,7 +198,8 @@ clear_query();
 # differently, so just check that the replacement comes out correctly
 check_completion("\\DRD\t", qr/drds /, "complete \\DRD<tab> to \\drds");
 
-clear_query();
+# broken versions of libedit require clear_line not clear_query here
+clear_line();
 
 # check completion of a schema-qualified name
 check_completion("select * from pub\t",
@@ -210,21 +218,21 @@ clear_query();
 
 # check interpretation of referenced names
 check_completion(
-	"alter table tab1 drop constraint t\t",
+	"alter table tab1 drop constraint \t",
 	qr/tab1_pkey /,
 	"complete index name for referenced table");
 
 clear_query();
 
 check_completion(
-	"alter table TAB1 drop constraint t\t",
+	"alter table TAB1 drop constraint \t",
 	qr/tab1_pkey /,
 	"complete index name for referenced table, with downcasing");
 
 clear_query();
 
 check_completion(
-	"alter table public.\"tab1\" drop constraint t\t",
+	"alter table public.\"tab1\" drop constraint \t",
 	qr/tab1_pkey /,
 	"complete index name for referenced table, with schema and quoting");
 
@@ -253,16 +261,18 @@ check_completion(
 	qr|tab_comp_dir/af\a?ile|,
 	"filename completion with multiple possibilities");
 
-# here we are inside a string literal 'afile*', so must use clear_line().
+# broken versions of libedit require clear_line not clear_query here
 clear_line();
 
 # COPY requires quoting
+# note: broken versions of libedit want to backslash the closing quote;
+# not much we can do about that
 check_completion(
 	"COPY foo FROM tab_comp_dir/some\t",
-	qr|'tab_comp_dir/somefile' |,
+	qr|'tab_comp_dir/somefile\\?' |,
 	"quoted filename completion with one possibility");
 
-clear_query();
+clear_line();
 
 check_completion(
 	"COPY foo FROM tab_comp_dir/af\t",
@@ -403,14 +413,6 @@ check_completion(
 
 clear_query();
 
-# check completion for psql variable test
-check_completion(
-	"\\echo :{?VERB\t",
-	qr/:\{\?VERBOSITY} /,
-	"complete a psql variable test");
-
-clear_query();
-
 # check no-completions code path
 check_completion("blarg \t\t", qr//, "check completion failure path");
 
@@ -423,42 +425,6 @@ check_completion(
 	"COPY FROM with DEFAULT completion");
 
 clear_line();
-
-# check tab completion for DELETE ... FOR PORTION OF
-check_completion(
-	"DELETE FROM fpo_test F\t",
-	qr/FOR /,
-	"complete DELETE FROM <table> F<tab> to FOR");
-
-check_completion("P\t", qr/PORTION /, "complete FOR P<tab> to PORTION");
-
-check_completion("O\t", qr/OF /, "complete PORTION O<tab> to OF");
-
-check_completion("v\t", qr/valid_at /,
-	"complete FOR PORTION OF offers column names");
-
-check_completion("FR\t", qr/FROM /,
-	"complete FOR PORTION OF <col> FR<tab> to FROM");
-
-clear_query();
-
-# check tab completion for UPDATE ... FOR PORTION OF
-check_completion(
-	"UPDATE fpo_test F\t",
-	qr/FOR /,
-	"complete UPDATE <table> F<tab> to FOR");
-
-check_completion("P\t", qr/PORTION /, "complete FOR P<tab> to PORTION");
-
-check_completion("O\t", qr/OF /, "complete PORTION O<tab> to OF");
-
-check_completion("v\t", qr/valid_at /,
-	"complete FOR PORTION OF offers column names");
-
-check_completion("FR\t", qr/FROM /,
-	"complete FOR PORTION OF <col> FR<tab> to FROM");
-
-clear_query();
 
 # send psql an explicit \q to shut it down, else pty won't close properly
 $h->quit or die "psql returned $?";

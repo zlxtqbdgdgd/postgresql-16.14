@@ -14,12 +14,15 @@
 locale_t	ecpg_clocale = (locale_t) 0;
 #endif
 
+#ifdef ENABLE_THREAD_SAFETY
 static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t actual_connection_key;
 static pthread_once_t actual_connection_key_once = PTHREAD_ONCE_INIT;
+#endif
 static struct connection *actual_connection = NULL;
 static struct connection *all_connections = NULL;
 
+#ifdef ENABLE_THREAD_SAFETY
 static void
 ecpg_actual_connection_init(void)
 {
@@ -31,6 +34,7 @@ ecpg_pthreads_init(void)
 {
 	pthread_once(&actual_connection_key_once, ecpg_actual_connection_init);
 }
+#endif
 
 static struct connection *
 ecpg_get_connection_nr(const char *connection_name)
@@ -39,6 +43,7 @@ ecpg_get_connection_nr(const char *connection_name)
 
 	if ((connection_name == NULL) || (strcmp(connection_name, "CURRENT") == 0))
 	{
+#ifdef ENABLE_THREAD_SAFETY
 		ecpg_pthreads_init();	/* ensure actual_connection_key is valid */
 
 		ret = pthread_getspecific(actual_connection_key);
@@ -51,6 +56,9 @@ ecpg_get_connection_nr(const char *connection_name)
 		if (ret == NULL)
 			/* no TSD connection, going for global */
 			ret = actual_connection;
+#else
+		ret = actual_connection;
+#endif
 	}
 	else
 	{
@@ -79,6 +87,7 @@ ecpg_get_connection(const char *connection_name)
 
 	if ((connection_name == NULL) || (strcmp(connection_name, "CURRENT") == 0))
 	{
+#ifdef ENABLE_THREAD_SAFETY
 		ecpg_pthreads_init();	/* ensure actual_connection_key is valid */
 
 		ret = pthread_getspecific(actual_connection_key);
@@ -91,14 +100,21 @@ ecpg_get_connection(const char *connection_name)
 		if (ret == NULL)
 			/* no TSD connection here either, using global */
 			ret = actual_connection;
+#else
+		ret = actual_connection;
+#endif
 	}
 	else
 	{
+#ifdef ENABLE_THREAD_SAFETY
 		pthread_mutex_lock(&connections_mutex);
+#endif
 
 		ret = ecpg_get_connection_nr(connection_name);
 
+#ifdef ENABLE_THREAD_SAFETY
 		pthread_mutex_unlock(&connections_mutex);
+#endif
 	}
 
 	return ret;
@@ -132,8 +148,10 @@ ecpg_finish(struct connection *act)
 				con->next = act->next;
 		}
 
+#ifdef ENABLE_THREAD_SAFETY
 		if (pthread_getspecific(actual_connection_key) == act)
 			pthread_setspecific(actual_connection_key, all_connections);
+#endif
 		if (actual_connection == act)
 			actual_connection = all_connections;
 
@@ -199,7 +217,11 @@ ECPGsetconn(int lineno, const char *connection_name)
 	if (!ecpg_init(con, connection_name, lineno))
 		return false;
 
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_setspecific(actual_connection_key, con);
+#else
+	actual_connection = con;
+#endif
 	return true;
 }
 
@@ -264,8 +286,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	struct connection *this;
 	int			i,
 				connect_params = 0;
-	bool		alloc_failed = (sqlca == NULL);
-	char	   *dbname = name ? ecpg_strdup(name, lineno, &alloc_failed) : NULL,
+	char	   *dbname = name ? ecpg_strdup(name, lineno) : NULL,
 			   *host = NULL,
 			   *tmp,
 			   *port = NULL,
@@ -274,12 +295,11 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	const char **conn_keywords;
 	const char **conn_values;
 
-	if (alloc_failed)
+	if (sqlca == NULL)
 	{
 		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
 				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
-		if (dbname)
-			ecpg_free(dbname);
+		ecpg_free(dbname);
 		return false;
 	}
 
@@ -304,14 +324,16 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		if (envname)
 		{
 			ecpg_free(dbname);
-			dbname = ecpg_strdup(envname, lineno, &alloc_failed);
+			dbname = ecpg_strdup(envname, lineno);
 		}
 	}
 
 	if (dbname == NULL && connection_name == NULL)
 		connection_name = "DEFAULT";
 
+#if ENABLE_THREAD_SAFETY
 	ecpg_pthreads_init();
+#endif
 
 	/* check if the identifier is unique */
 	if (ecpg_get_connection(connection_name))
@@ -356,7 +378,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 				tmp = strrchr(dbname + offset, '?');
 				if (tmp != NULL)	/* options given */
 				{
-					options = ecpg_strdup(tmp + 1, lineno, &alloc_failed);
+					options = ecpg_strdup(tmp + 1, lineno);
 					*tmp = '\0';
 				}
 
@@ -365,7 +387,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 				{
 					if (tmp[1] != '\0') /* non-empty database name */
 					{
-						realname = ecpg_strdup(tmp + 1, lineno, &alloc_failed);
+						realname = ecpg_strdup(tmp + 1, lineno);
 						connect_params++;
 					}
 					*tmp = '\0';
@@ -375,7 +397,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 				if (tmp != NULL)	/* port number given */
 				{
 					*tmp = '\0';
-					port = ecpg_strdup(tmp + 1, lineno, &alloc_failed);
+					port = ecpg_strdup(tmp + 1, lineno);
 					connect_params++;
 				}
 
@@ -409,7 +431,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 				{
 					if (*(dbname + offset) != '\0')
 					{
-						host = ecpg_strdup(dbname + offset, lineno, &alloc_failed);
+						host = ecpg_strdup(dbname + offset, lineno);
 						connect_params++;
 					}
 				}
@@ -421,7 +443,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 			tmp = strrchr(dbname, ':');
 			if (tmp != NULL)	/* port number given */
 			{
-				port = ecpg_strdup(tmp + 1, lineno, &alloc_failed);
+				port = ecpg_strdup(tmp + 1, lineno);
 				connect_params++;
 				*tmp = '\0';
 			}
@@ -429,14 +451,14 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 			tmp = strrchr(dbname, '@');
 			if (tmp != NULL)	/* host name given */
 			{
-				host = ecpg_strdup(tmp + 1, lineno, &alloc_failed);
+				host = ecpg_strdup(tmp + 1, lineno);
 				connect_params++;
 				*tmp = '\0';
 			}
 
 			if (strlen(dbname) > 0)
 			{
-				realname = ecpg_strdup(dbname, lineno, &alloc_failed);
+				realname = ecpg_strdup(dbname, lineno);
 				connect_params++;
 			}
 			else
@@ -467,18 +489,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	 */
 	conn_keywords = (const char **) ecpg_alloc((connect_params + 1) * sizeof(char *), lineno);
 	conn_values = (const char **) ecpg_alloc(connect_params * sizeof(char *), lineno);
-
-	/* Decide on a connection name */
-	if (connection_name != NULL || realname != NULL)
-	{
-		this->name = ecpg_strdup(connection_name ? connection_name : realname,
-								 lineno, &alloc_failed);
-	}
-	else
-		this->name = NULL;
-
-	/* Deal with any failed allocations above */
-	if (conn_keywords == NULL || conn_values == NULL || alloc_failed)
+	if (conn_keywords == NULL || conn_values == NULL)
 	{
 		if (host)
 			ecpg_free(host);
@@ -494,14 +505,14 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 			ecpg_free(conn_keywords);
 		if (conn_values)
 			ecpg_free(conn_values);
-		if (this->name)
-			ecpg_free(this->name);
 		free(this);
 		return false;
 	}
 
 	/* add connection to our list */
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_lock(&connections_mutex);
+#endif
 
 	/*
 	 * ... but first, make certain we have created ecpg_clocale.  Rely on
@@ -513,7 +524,9 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		ecpg_clocale = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
 		if (!ecpg_clocale)
 		{
+#ifdef ENABLE_THREAD_SAFETY
 			pthread_mutex_unlock(&connections_mutex);
+#endif
 			ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
 					   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
 			if (host)
@@ -530,13 +543,16 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 				ecpg_free(conn_keywords);
 			if (conn_values)
 				ecpg_free(conn_values);
-			if (this->name)
-				ecpg_free(this->name);
 			free(this);
 			return false;
 		}
 	}
 #endif
+
+	if (connection_name != NULL)
+		this->name = ecpg_strdup(connection_name, lineno);
+	else
+		this->name = ecpg_strdup(realname, lineno);
 
 	this->cache_head = NULL;
 	this->prep_stmts = NULL;
@@ -547,7 +563,9 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		this->next = all_connections;
 
 	all_connections = this;
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_setspecific(actual_connection_key, all_connections);
+#endif
 	actual_connection = all_connections;
 
 	ecpg_log("ECPGconnect: opening database %s on %s port %s %s%s %s%s\n",
@@ -596,10 +614,7 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		 * The options string contains "keyword=value" pairs separated by
 		 * '&'s.  We must break this up into keywords and values to pass to
 		 * libpq (it's okay to scribble on the options string).  We ignore
-		 * spaces just before each keyword or value.  (The preprocessor used
-		 * to add spaces around '&'s, making it necessary to ignore spaces
-		 * before keywords here.  While it no longer does that, we still must
-		 * skip spaces to support code compiled with older preprocessors.)
+		 * spaces just before each keyword or value.
 		 */
 		for (str = options; *str;)
 		{
@@ -668,7 +683,9 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		ecpg_log("ECPGconnect: %s", errmsg);
 
 		ecpg_finish(this);
+#ifdef ENABLE_THREAD_SAFETY
 		pthread_mutex_unlock(&connections_mutex);
+#endif
 
 		ecpg_raise(lineno, ECPG_CONNECT, ECPG_SQLSTATE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, db);
 		if (realname)
@@ -680,11 +697,13 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	if (realname)
 		ecpg_free(realname);
 
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&connections_mutex);
+#endif
 
 	this->autocommit = autocommit;
 
-	PQsetNoticeReceiver(this->connection, &ECPGnoticeReceiver, this);
+	PQsetNoticeReceiver(this->connection, &ECPGnoticeReceiver, (void *) this);
 
 	return true;
 }
@@ -702,7 +721,9 @@ ECPGdisconnect(int lineno, const char *connection_name)
 		return false;
 	}
 
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_lock(&connections_mutex);
+#endif
 
 	if (strcmp(connection_name, "ALL") == 0)
 	{
@@ -721,14 +742,18 @@ ECPGdisconnect(int lineno, const char *connection_name)
 
 		if (!ecpg_init(con, connection_name, lineno))
 		{
+#ifdef ENABLE_THREAD_SAFETY
 			pthread_mutex_unlock(&connections_mutex);
+#endif
 			return false;
 		}
 		else
 			ecpg_finish(con);
 	}
 
+#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&connections_mutex);
+#endif
 
 	return true;
 }

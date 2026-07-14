@@ -4,7 +4,7 @@
  *	  This file contains routines to support indexes defined on system
  *	  catalogs.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -201,7 +201,7 @@ CatalogTupleCheckConstraints(Relation heapRel, HeapTuple tup)
 	if (HeapTupleHasNulls(tup))
 	{
 		TupleDesc	tupdesc = RelationGetDescr(heapRel);
-		uint8	   *bp = tup->t_data->t_bits;
+		bits8	   *bp = tup->t_data->t_bits;
 
 		for (int attnum = 0; attnum < tupdesc->natts; attnum++)
 		{
@@ -310,7 +310,7 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
  * (Use CatalogTupleUpdateWithInfo in such cases.)
  */
 void
-CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
+CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
@@ -334,7 +334,7 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
  * so that callers needn't trouble over this ... but we don't do so today.
  */
 void
-CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTuple tup,
+CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
@@ -362,7 +362,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
  * it might be better to do something about caching CatalogIndexState.
  */
 void
-CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
+CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 {
 	simple_heap_delete(heapRel, tid);
 }

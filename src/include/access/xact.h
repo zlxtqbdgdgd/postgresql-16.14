@@ -4,7 +4,7 @@
  *	  postgres transaction system definitions
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xact.h
@@ -43,11 +43,10 @@ extern PGDLLIMPORT int XactIsoLevel;
 
 /*
  * We implement three isolation levels internally.
- * The weakest uses one snapshot per statement;
- * the two stronger levels use one snapshot per database transaction.
- * Serializable uses predicate locks in addition to the snapshot.
- * These macros can be used to determine which implementation to use
- * depending on the prevailing serialization level.
+ * The two stronger ones use one snapshot per database transaction;
+ * the others use one snapshot per statement.
+ * Serializable uses predicate locks in addition to snapshots.
+ * These macros should be used to check which isolation level is selected.
  */
 #define IsolationUsesXactSnapshot() (XactIsoLevel >= XACT_REPEATABLE_READ)
 #define IsolationIsSerializable() (XactIsoLevel == XACT_SERIALIZABLE)
@@ -73,8 +72,8 @@ typedef enum
 	SYNCHRONOUS_COMMIT_REMOTE_WRITE,	/* wait for local flush and remote
 										 * write */
 	SYNCHRONOUS_COMMIT_REMOTE_FLUSH,	/* wait for local and remote flush */
-	SYNCHRONOUS_COMMIT_REMOTE_APPLY,	/* wait for local and remote flush and
-										 * remote apply */
+	SYNCHRONOUS_COMMIT_REMOTE_APPLY /* wait for local and remote flush and
+									 * remote apply */
 }			SyncCommitLevel;
 
 /* Define the default setting for synchronous_commit */
@@ -133,7 +132,7 @@ typedef enum
 	XACT_EVENT_PREPARE,
 	XACT_EVENT_PRE_COMMIT,
 	XACT_EVENT_PARALLEL_PRE_COMMIT,
-	XACT_EVENT_PRE_PREPARE,
+	XACT_EVENT_PRE_PREPARE
 } XactEvent;
 
 typedef void (*XactCallback) (XactEvent event, void *arg);
@@ -143,7 +142,7 @@ typedef enum
 	SUBXACT_EVENT_START_SUB,
 	SUBXACT_EVENT_COMMIT_SUB,
 	SUBXACT_EVENT_ABORT_SUB,
-	SUBXACT_EVENT_PRE_COMMIT_SUB,
+	SUBXACT_EVENT_PRE_COMMIT_SUB
 } SubXactEvent;
 
 typedef void (*SubXactCallback) (SubXactEvent event, SubTransactionId mySubid,
@@ -284,13 +283,7 @@ typedef struct xl_xact_stats_item
 {
 	int			kind;
 	Oid			dboid;
-
-	/*
-	 * This stores the value of PgStat_HashKey.objid as two uint32 as all the
-	 * fields of xl_xact_xinfo should be multiples of size(int).
-	 */
-	uint32		objid_lo;
-	uint32		objid_hi;
+	Oid			objoid;
 } xl_xact_stats_item;
 
 typedef struct xl_xact_stats_items
@@ -459,7 +452,6 @@ extern TimestampTz GetCurrentTransactionStopTimestamp(void);
 extern void SetCurrentStatementStartTimestamp(void);
 extern int	GetCurrentTransactionNestLevel(void);
 extern bool TransactionIdIsCurrentTransactionId(TransactionId xid);
-extern int	GetTopReadOnlyTransactionNestLevel(void);
 extern void CommandCounterIncrement(void);
 extern void ForceSyncCommit(void);
 extern void StartTransactionCommand(void);
